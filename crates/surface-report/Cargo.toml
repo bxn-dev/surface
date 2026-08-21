@@ -1,0 +1,18 @@
+[package]
+name = "surface-report"
+description = "Report rendering for Surface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+surface-core.workspace = true
+
+[lints]
+workspace = true
