@@ -23,3 +23,7 @@ The primary TLS observation uses Rustls, Mozilla roots, SNI/identity validation,
 ## Deterministic reports
 
 Sorted vectors and ordered maps avoid hash-order instability. HTML is generated locally with explicit escaping and no script/template execution.
+
+## SQLite history is optional and immutable
+
+Local scans remain database-free by default. When persistence is requested, Surface uses bundled SQLite, committed numbered migrations, foreign keys, prepared statements, and transactions. It stores normalized query metadata plus the original complete report JSON. A database trigger rejects report-content updates; rescans always create new scan IDs.

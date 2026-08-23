@@ -276,7 +276,7 @@ fn severity_class(severity: Severity) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use surface_core::{normalize_target, ScanConfiguration, ScanReport};
+    use surface_core::{ScanConfiguration, ScanReport, normalize_target};
 
     use super::{render_html, render_json, render_terminal};
 

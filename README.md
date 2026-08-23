@@ -58,12 +58,16 @@ surface scan https://example.com/path --ports 80,443,8000-8100 --acknowledge-aut
 surface scan 127.0.0.1 --ports 1-1000 --global-timeout 30s
 surface scan example.com --format json --output report.json --acknowledge-authorization
 surface scan example.com --format html --output report.html --acknowledge-authorization
+surface scan 127.0.0.1 --persist --database ./surface.db
+surface history list --database ./surface.db
+surface history show <SCAN_ID> --database ./surface.db
+surface history prune --database ./surface.db --older-than 180d --dry-run
 surface completion bash > surface.bash
 ```
 
 Defaults: `--ports common`, `--concurrency 64`, `--connect-timeout 1500ms`, `--request-timeout 5s`, `--global-timeout 5m`.
 
-Logs use stderr; report data uses stdout or `--output`. `RUST_LOG` overrides the default log filter.
+Logs use stderr; report data uses stdout or `--output`. `RUST_LOG` overrides the default log filter. SQLite persistence is optional: ordinary one-shot scans do not open or require a database.
 
 ## Reports
 
@@ -104,7 +108,7 @@ flowchart TD
     K --> N[HTML]
 ```
 
-`surface-core` owns observations/orchestration, `surface-report` owns presentation, and `surface-cli` owns process behavior. See [`docs/architecture.md`](docs/architecture.md).
+`surface-core` owns observations/orchestration, `surface-report` owns presentation, `surface-storage` owns optional SQLite history, and `surface-cli` owns process behavior. See [`docs/architecture.md`](docs/architecture.md) and [`docs/database-schema.md`](docs/database-schema.md).
 
 ## Limitations
 

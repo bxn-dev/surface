@@ -1,6 +1,6 @@
 [package]
-name = "surface-cli"
-description = "Command-line interface for Surface"
+name = "surface-storage"
+description = "SQLite persistence for Surface scan history"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,23 +10,16 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[[bin]]
-name = "surface"
-path = "src/main.rs"
-
 [dependencies]
-clap.workspace = true
-clap_complete.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 surface-core.workspace = true
-surface-report.workspace = true
-surface-storage.workspace = true
 time.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.20"
 
 [lints]
 workspace = true

@@ -10,8 +10,10 @@ use surface_core::{
     ScanConfiguration, ScanReport, ScanStatus, Severity, normalize_target, parse_ports, run_scan,
 };
 use surface_report::{render_html, render_json, render_terminal};
+use surface_storage::{HistoryFilter, RetentionPolicy, Storage};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 // Rust guideline compliant 2026-02-21
 
@@ -34,6 +36,11 @@ struct Cli {
 enum Command {
     /// Runs an authorized external exposure assessment.
     Scan(ScanArgs),
+    /// Lists, retrieves, deletes, or prunes persisted scans.
+    History {
+        #[command(subcommand)]
+        command: HistoryCommand,
+    },
     /// Prints the Surface version.
     Version,
     /// Generates a shell-completion script on stdout.
@@ -91,6 +98,104 @@ struct ScanArgs {
     /// Confirms authorization to actively assess the target.
     #[arg(long)]
     acknowledge_authorization: bool,
+    /// `SQLite` database path used when persistence is enabled.
+    #[arg(long, requires = "persist")]
+    database: Option<PathBuf>,
+    /// Persists the complete immutable report after scanning.
+    #[arg(long)]
+    persist: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum HistoryCommand {
+    /// Lists persisted scans newest first.
+    List {
+        /// `SQLite` database path.
+        #[arg(long)]
+        database: PathBuf,
+        /// Exact normalized target filter.
+        #[arg(long)]
+        target: Option<String>,
+        /// Exact scan status filter.
+        #[arg(long)]
+        status: Option<String>,
+        /// Minimum finding severity filter.
+        #[arg(long, value_enum)]
+        severity: Option<SeverityFilter>,
+        /// Include scans started at or after this Unix timestamp.
+        #[arg(long)]
+        started_after: Option<i64>,
+        /// Include scans started at or before this Unix timestamp.
+        #[arg(long)]
+        started_before: Option<i64>,
+        /// Maximum records returned.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Zero-based record offset.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+        /// Emits machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Shows one complete persisted report.
+    Show {
+        /// Persisted scan identifier.
+        scan_id: Uuid,
+        /// `SQLite` database path.
+        #[arg(long)]
+        database: PathBuf,
+        /// Report format.
+        #[arg(long, value_enum, default_value_t = ReportFormat::Json)]
+        format: ReportFormat,
+    },
+    /// Deletes one persisted report and dependent metadata.
+    Delete {
+        /// Persisted scan identifier.
+        scan_id: Uuid,
+        /// `SQLite` database path.
+        #[arg(long)]
+        database: PathBuf,
+    },
+    /// Applies retention to persisted reports.
+    Prune {
+        /// `SQLite` database path.
+        #[arg(long)]
+        database: PathBuf,
+        /// Retains this many newest scans for each target.
+        #[arg(long)]
+        keep_last: Option<u32>,
+        /// Deletes scans older than this duration, such as 180d.
+        #[arg(long, value_parser = parse_retention_duration)]
+        older_than: Option<time::Duration>,
+        /// Preserves scans containing high or critical findings.
+        #[arg(long)]
+        preserve_high: bool,
+        /// Reports candidates without deleting them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SeverityFilter {
+    Info,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl From<SeverityFilter> for Severity {
+    fn from(value: SeverityFilter) -> Self {
+        match value {
+            SeverityFilter::Info => Self::Info,
+            SeverityFilter::Low => Self::Low,
+            SeverityFilter::Medium => Self::Medium,
+            SeverityFilter::High => Self::High,
+            SeverityFilter::Critical => Self::Critical,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -150,6 +255,7 @@ async fn main() -> ExitCode {
 async fn run(command: Command) -> Result<(), AppError> {
     match command {
         Command::Scan(arguments) => run_scan_command(arguments).await,
+        Command::History { command } => run_history_command(command),
         Command::Version => {
             println!("surface {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -205,6 +311,15 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
     });
     let report = run_scan(target, configuration, cancellation).await;
     signal_task.abort();
+    if arguments.persist {
+        let database = arguments.database.as_ref().ok_or_else(|| {
+            AppError::new("--database is required with --persist", EXIT_INVALID_INPUT)
+        })?;
+        let mut storage = open_storage(database)?;
+        storage
+            .persist_report(&report, "cli")
+            .map_err(|error| AppError::new(error.to_string(), EXIT_SCAN_FAILED))?;
+    }
     tracing::info!(
         name: "surface.scan.completed",
         scan_id = %report.scan_id,
@@ -239,6 +354,134 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
         return Err(error);
     }
     Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match keeps each history subcommand's linear CLI behavior together"
+)]
+fn run_history_command(command: HistoryCommand) -> Result<(), AppError> {
+    match command {
+        HistoryCommand::List {
+            database,
+            target,
+            status,
+            severity,
+            started_after,
+            started_before,
+            limit,
+            offset,
+            json,
+        } => {
+            let storage = open_storage(&database)?;
+            let history = storage
+                .history(&HistoryFilter {
+                    target,
+                    status,
+                    minimum_severity: severity.map(Into::into),
+                    started_after,
+                    started_before,
+                    offset,
+                    limit,
+                })
+                .map_err(|error| AppError::new(error.to_string(), EXIT_SCAN_FAILED))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&history).map_err(|error| AppError::new(
+                        format!("could not serialize history: {error}"),
+                        EXIT_SCAN_FAILED,
+                    ))?
+                );
+            } else {
+                for scan in history {
+                    println!(
+                        "{}  {}  {}  {}  high={} critical={}",
+                        scan.scan_id,
+                        scan.started_at,
+                        scan.status,
+                        scan.normalized_target,
+                        scan.high_findings,
+                        scan.critical_findings
+                    );
+                }
+            }
+            Ok(())
+        }
+        HistoryCommand::Show {
+            scan_id,
+            database,
+            format,
+        } => {
+            let storage = open_storage(&database)?;
+            let report = storage
+                .report(scan_id)
+                .map_err(|error| AppError::new(error.to_string(), EXIT_SCAN_FAILED))?
+                .ok_or_else(|| {
+                    AppError::new(format!("scan {scan_id} was not found"), EXIT_INVALID_INPUT)
+                })?;
+            let rendered = match format {
+                ReportFormat::Terminal => render_terminal(&report),
+                ReportFormat::Json => render_json(&report).map_err(|error| {
+                    AppError::new(
+                        format!("could not serialize report: {error}"),
+                        EXIT_SCAN_FAILED,
+                    )
+                })?,
+                ReportFormat::Html => render_html(&report),
+            };
+            print!("{rendered}");
+            Ok(())
+        }
+        HistoryCommand::Delete { scan_id, database } => {
+            let mut storage = open_storage(&database)?;
+            if !storage
+                .delete_scan(scan_id)
+                .map_err(|error| AppError::new(error.to_string(), EXIT_SCAN_FAILED))?
+            {
+                return Err(AppError::new(
+                    format!("scan {scan_id} was not found"),
+                    EXIT_INVALID_INPUT,
+                ));
+            }
+            println!("deleted {scan_id}");
+            Ok(())
+        }
+        HistoryCommand::Prune {
+            database,
+            keep_last,
+            older_than,
+            preserve_high,
+            dry_run,
+        } => {
+            let mut storage = open_storage(&database)?;
+            let result = storage
+                .prune(&RetentionPolicy {
+                    keep_last,
+                    older_than,
+                    preserve_high,
+                    dry_run,
+                })
+                .map_err(|error| AppError::new(error.to_string(), EXIT_INVALID_INPUT))?;
+            for scan_id in &result.scan_ids {
+                println!("{scan_id}");
+            }
+            eprintln!(
+                "surface: {} {} scan(s)",
+                if result.deleted {
+                    "deleted"
+                } else {
+                    "would delete"
+                },
+                result.scan_ids.len()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn open_storage(path: &PathBuf) -> Result<Storage, AppError> {
+    Storage::open(path).map_err(|error| AppError::new(error.to_string(), EXIT_SCAN_FAILED))
 }
 
 fn report_exit_error(report: &ScanReport) -> Option<AppError> {
@@ -298,6 +541,19 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     Ok(Duration::from_millis(milliseconds))
 }
 
+fn parse_retention_duration(value: &str) -> Result<time::Duration, String> {
+    let days = value
+        .strip_suffix('d')
+        .ok_or_else(|| "retention duration must end in d".to_owned())?
+        .parse::<i64>()
+        .map_err(|_| "retention duration must contain a positive integer".to_owned())?;
+    let seconds = days
+        .checked_mul(86_400)
+        .filter(|_| days > 0)
+        .ok_or_else(|| "retention duration must be positive and within range".to_owned())?;
+    Ok(time::Duration::seconds(seconds))
+}
+
 fn duration_millis(duration: Duration) -> Result<u64, AppError> {
     u64::try_from(duration.as_millis())
         .map_err(|_| AppError::new("duration is too large", EXIT_INVALID_INPUT))
@@ -311,7 +567,7 @@ mod tests {
 
     use super::{
         Cli, Command, EXIT_AUTHORIZATION_REQUIRED, EXIT_INVALID_INPUT, EXIT_SCAN_FAILED,
-        parse_duration, report_exit_error, run,
+        parse_duration, parse_retention_duration, report_exit_error, run,
     };
 
     #[test]
@@ -337,6 +593,7 @@ mod tests {
         assert_eq!(parse_duration("5s"), Ok(Duration::from_secs(5)));
         assert!(parse_duration("0s").is_err());
         assert!(parse_duration("1h").is_err());
+        assert!(parse_retention_duration("9223372036854775807d").is_err());
     }
 
     #[tokio::test]

@@ -24,3 +24,5 @@ Top-level fields:
 | `message` | Human-readable lifecycle summary |
 
 No field contains ANSI escape sequences. Target-controlled banners, headers, bodies, errors, and HTML fields are capped or sanitized. Additive fields may appear within schema `0.1.x`; incompatible changes require a schema-version change.
+
+Optional SQLite history stores this complete JSON unchanged alongside normalized query metadata. Retrieval returns the original report schema version; persistence does not reinterpret or update historical content.

@@ -6,6 +6,9 @@ All notable changes are documented here.
 
 ### Added
 
+- Optional SQLite-backed immutable scan persistence with versioned migrations.
+- Scan-history list, show, delete, and dry-run retention commands.
+- Queryable scan/finding metadata and auditable transactional deletion.
 - Cargo workspace with separated core, reporting, and CLI crates.
 - Authorization-gated domain, URL, IPv4, and IPv6 scanning.
 - Passive DNS and conservative mail-domain interpretation.

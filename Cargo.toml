@@ -3,6 +3,7 @@ members = [
     "crates/surface-cli",
     "crates/surface-core",
     "crates/surface-report",
+    "crates/surface-storage",
 ]
 resolver = "2"
 
@@ -23,6 +24,7 @@ futures = "0.3"
 hickory-proto = "0.26.1"
 hickory-resolver = "0.26.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -37,6 +39,7 @@ webpki-roots = "1.0"
 x509-parser = "0.18"
 surface-core = { version = "0.1.0", path = "crates/surface-core" }
 surface-report = { version = "0.1.0", path = "crates/surface-report" }
+surface-storage = { version = "0.1.0", path = "crates/surface-storage" }
 url = { version = "2.5", features = ["serde"] }
 
 [workspace.lints.rust]

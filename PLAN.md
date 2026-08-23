@@ -9,3 +9,36 @@
 - [x] Phase 6 — final hardening, release gates, and review
 
 Automated tests use only deterministic data and loopback fixture servers. No test or CI job accesses public scan targets.
+
+## Verified baseline — 2026-08-23
+
+Phase 0–6 behavior and 30 tests were present. The pre-change quality gate produced:
+
+- `cargo fmt --all --check` — **failed**: import ordering in `crates/surface-report/src/lib.rs:279`.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — passed.
+- `cargo test --workspace --all-features` — passed: 30 tests.
+- `cargo doc --workspace --no-deps` — passed.
+- `cargo deny check` — passed with existing duplicate-dependency warnings.
+- `cargo build --release` — passed.
+
+The reported Phase 6 completion was therefore not fully reproducible because formatting failed. Phase 7 applies `cargo fmt` and retains the other verified behavior.
+
+## Post-MVP phases
+
+- [x] Phase 7 — SQLite persistence, immutable report history, retrieval, deletion, retention, and audit foundation
+- [ ] Phase 8 — deterministic diffs, safe probes, exposure score, SARIF, and CycloneDX
+- [ ] Phase 9 — API, web, authentication, tenancy, authorization, and audit access
+- [ ] Phase 10 — durable jobs, schedules, notifications, and hosted egress policy
+- [ ] Phase 11 — passive intelligence, supplied subdomains/DKIM, CVE correlation, and network metadata
+- [ ] Phase 12 — metrics, signing, deployment, backup/restore, and final hardening
+
+## Phase 7 verified — 2026-08-23
+
+- Migration: `migrations/0001_scan_history.sql`.
+- Storage: complete immutable report JSON plus indexed scan/finding metadata, foreign keys, transactional writes/deletes, future-schema rejection, restrictive Unix permissions, and deletion audit events.
+- CLI: opt-in `scan --persist --database`, plus `history list/show/delete/prune`; ordinary one-shot scans remain database-free.
+- Retention: age, per-target count, high/critical preservation, deterministic ordering, and dry-run.
+- Tests: 35 passed, including temporary-database migration, round-trip, future-schema, retention-overflow, deletion/audit, and foreign-key behavior.
+- Full gate: format, strict Clippy, workspace tests, docs, `cargo deny`, and release build passed. `cargo deny` retains pre-existing duplicate-version warnings.
+- Local smoke tests: persistence/history round-trip passed; database mode was `0600`; one-shot scan created no database.
+- Review: all medium findings were fixed; no blocking findings remain.
