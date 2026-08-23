@@ -11,8 +11,10 @@ use uuid::Uuid;
 
 // Rust guideline compliant 2026-02-21
 
-const MIGRATIONS: &[(i64, &str)] =
-    &[(1, include_str!("../../../migrations/0001_scan_history.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../../../migrations/0001_scan_history.sql")),
+    (2, include_str!("../../../migrations/0002_identity_tenancy.sql")),
+];
 const DEFAULT_PAGE_SIZE: u32 = 50;
 const MAX_PAGE_SIZE: u32 = 500;
 
@@ -596,7 +598,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0)
             ),
-            Ok(1)
+            Ok(2)
         );
         let report = report("example.com");
         storage
@@ -631,7 +633,7 @@ mod tests {
                     version INTEGER PRIMARY KEY NOT NULL,
                     applied_at INTEGER NOT NULL
                  ) STRICT;
-                 INSERT INTO surface_schema_migrations VALUES (2, 0);",
+                 INSERT INTO surface_schema_migrations VALUES (3, 0);",
             )
             .unwrap_or_else(|error| panic!("{error}"));
         drop(connection);
