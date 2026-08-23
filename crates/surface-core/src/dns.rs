@@ -138,6 +138,16 @@ pub async fn analyze_dns(
     ipv4_only: bool,
     ipv6_only: bool,
 ) -> Result<DnsObservation, String> {
+    analyze_dns_with_policy(target, query_timeout, ipv4_only, ipv6_only, true).await
+}
+
+pub(crate) async fn analyze_dns_with_policy(
+    target: &NormalizedTarget,
+    query_timeout: Duration,
+    ipv4_only: bool,
+    ipv6_only: bool,
+    fetch_mta_sts_policy: bool,
+) -> Result<DnsObservation, String> {
     if let Some(ip) = target.explicit_ip {
         return Ok(explicit_ip_observation(target, ip));
     }
@@ -217,7 +227,7 @@ pub async fn analyze_dns(
     records.sort_by_key(record_sort_key);
     let resolved_hosts = resolved_hosts(hostname, &records);
     let mut mail = interpret_mail(&records, &dmarc_records, mta_sts, tls_rpt);
-    if !mail.mta_sts.is_empty() {
+    if fetch_mta_sts_policy && !mail.mta_sts.is_empty() {
         mail.mta_sts_policy_available = check_mta_sts_policy(hostname, query_timeout).await;
     }
     Ok(DnsObservation {
@@ -260,6 +270,21 @@ async fn lookup(
             true,
         )),
     }
+}
+
+/// Looks up bounded TXT values for an explicitly supplied DNS name.
+///
+/// # Errors
+///
+/// Returns an error when the system resolver cannot be initialized.
+pub async fn lookup_txt(name: &str, query_timeout: Duration) -> Result<Vec<String>, String> {
+    let resolver = TokioResolver::builder_tokio()
+        .map_err(|error| format!("could not initialize system DNS resolver: {error}"))?
+        .build()
+        .map_err(|error| format!("could not build system DNS resolver: {error}"))?;
+    let mut values = Vec::new();
+    lookup_txt_values(&resolver, name, query_timeout, &mut values).await;
+    Ok(values)
 }
 
 async fn lookup_txt_values(

@@ -7,13 +7,17 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use clap_complete::Shell;
 use surface_core::{
-    ScanConfiguration, ScanReport, ScanStatus, Severity, normalize_target, parse_ports, run_scan,
+    ScanConfiguration, ScanReport, ScanStatus, Severity, analyze_intelligence, normalize_target,
+    parse_bundle, parse_ports, run_scan,
 };
 use surface_report::{
-    diff_reports, render_cyclonedx, render_diff_html, render_diff_json, render_diff_terminal,
-    render_html, render_json, render_sarif, render_terminal,
+    decode_key, diff_reports, render_cyclonedx, render_diff_html, render_diff_json,
+    render_diff_terminal, render_html, render_json, render_sarif, render_terminal, sign_bytes,
+    verify_bytes,
 };
-use surface_storage::{HistoryFilter, RetentionPolicy, Storage};
+use surface_storage::{
+    HistoryFilter, RetentionPolicy, Storage, backup_database, restore_database, verify_database,
+};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -45,6 +49,16 @@ enum Command {
     History {
         #[command(subcommand)]
         command: HistoryCommand,
+    },
+    /// Signs or verifies exact report bytes.
+    Report {
+        #[command(subcommand)]
+        command: ReportCommand,
+    },
+    /// Backs up, verifies, or restores a Surface database.
+    Database {
+        #[command(subcommand)]
+        command: DatabaseCommand,
     },
     /// Prints the Surface version.
     Version,
@@ -109,6 +123,15 @@ struct ScanArgs {
     /// Persists the complete immutable report after scanning.
     #[arg(long)]
     persist: bool,
+    /// Passively observes an explicitly supplied child subdomain (repeatable).
+    #[arg(long = "subdomain")]
+    subdomains: Vec<String>,
+    /// Queries an explicitly supplied DKIM selector (repeatable).
+    #[arg(long = "dkim-selector")]
+    dkim_selectors: Vec<String>,
+    /// Optional bounded offline network/CVE intelligence bundle.
+    #[arg(long)]
+    intelligence_bundle: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -126,6 +149,49 @@ struct DiffArgs {
     /// Writes the diff to a file instead of stdout.
     #[arg(long)]
     output: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ReportCommand {
+    /// Creates a detached Ed25519 signature.
+    Sign {
+        report: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+    },
+    /// Verifies a detached Ed25519 signature.
+    Verify {
+        report: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        public_key: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DatabaseCommand {
+    /// Creates an integrity-checked online backup.
+    Backup {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Runs integrity and schema checks.
+    Verify {
+        #[arg(long)]
+        database: PathBuf,
+    },
+    /// Atomically restores a verified backup. The server must be stopped.
+    Restore {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -288,6 +354,8 @@ async fn run(command: Command) -> Result<(), AppError> {
         Command::Scan(arguments) => run_scan_command(arguments).await,
         Command::Diff(arguments) => run_diff_command(arguments).await,
         Command::History { command } => run_history_command(command),
+        Command::Report { command } => run_report_command(command).await,
+        Command::Database { command } => run_database_command(command),
         Command::Version => {
             println!("surface {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -299,6 +367,10 @@ async fn run(command: Command) -> Result<(), AppError> {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear CLI orchestration preserves authorization, cancellation, intelligence, and output ordering"
+)]
 async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
     let target = normalize_target(&arguments.target)
         .map_err(|error| AppError::new(error.to_string(), EXIT_INVALID_INPUT))?;
@@ -341,8 +413,35 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
             signal_cancellation.cancel();
         }
     });
-    let report = run_scan(target, configuration, cancellation).await;
+    let mut report = run_scan(target, configuration, cancellation).await;
     signal_task.abort();
+    if !arguments.subdomains.is_empty()
+        || !arguments.dkim_selectors.is_empty()
+        || arguments.intelligence_bundle.is_some()
+    {
+        let bundle = if let Some(path) = &arguments.intelligence_bundle {
+            let bytes = tokio::fs::read(path).await.map_err(|error| {
+                AppError::new(
+                    format!("could not read '{}': {error}", path.display()),
+                    EXIT_INVALID_INPUT,
+                )
+            })?;
+            Some(parse_bundle(&bytes).map_err(|error| AppError::new(error, EXIT_INVALID_INPUT))?)
+        } else {
+            None
+        };
+        report.intelligence = Some(
+            analyze_intelligence(
+                &report,
+                &arguments.subdomains,
+                &arguments.dkim_selectors,
+                bundle.as_ref(),
+                arguments.request_timeout,
+            )
+            .await
+            .map_err(|error| AppError::new(error, EXIT_INVALID_INPUT))?,
+        );
+    }
     if arguments.persist {
         let database = arguments.database.as_ref().ok_or_else(|| {
             AppError::new("--database is required with --persist", EXIT_INVALID_INPUT)
@@ -376,6 +475,110 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
     if let Some(error) = report_exit_error(&report) {
         return Err(error);
     }
+    Ok(())
+}
+
+async fn run_report_command(command: ReportCommand) -> Result<(), AppError> {
+    match command {
+        ReportCommand::Sign {
+            report,
+            key,
+            signature,
+        } => {
+            ensure_private_key_permissions(&key)?;
+            let report_bytes = read_bounded(&report, 16 * 1024 * 1024).await?;
+            let key_bytes = read_bounded(&key, 4_096).await?;
+            let key = decode_key::<32>(&key_bytes).ok_or_else(|| {
+                AppError::new(
+                    "private key must be 32 raw bytes encoded as hexadecimal",
+                    EXIT_INVALID_INPUT,
+                )
+            })?;
+            let envelope = sign_bytes(&report_bytes, &key)
+                .map_err(|error| AppError::new(error.to_string(), EXIT_SCAN_FAILED))?;
+            tokio::fs::write(&signature, envelope)
+                .await
+                .map_err(|error| {
+                    AppError::new(
+                        format!("could not write '{}': {error}", signature.display()),
+                        EXIT_SCAN_FAILED,
+                    )
+                })
+        }
+        ReportCommand::Verify {
+            report,
+            signature,
+            public_key,
+        } => {
+            let report_bytes = read_bounded(&report, 16 * 1024 * 1024).await?;
+            let envelope = read_bounded(&signature, 64 * 1024).await?;
+            let key_bytes = read_bounded(&public_key, 4_096).await?;
+            let key = decode_key::<32>(&key_bytes).ok_or_else(|| {
+                AppError::new(
+                    "public key must be 32 raw bytes encoded as hexadecimal",
+                    EXIT_INVALID_INPUT,
+                )
+            })?;
+            verify_bytes(&report_bytes, &envelope, &key)
+                .map_err(|error| AppError::new(error.to_string(), EXIT_SCAN_FAILED))?;
+            println!("signature valid");
+            Ok(())
+        }
+    }
+}
+
+fn run_database_command(command: DatabaseCommand) -> Result<(), AppError> {
+    match command {
+        DatabaseCommand::Backup { database, output } => backup_database(&database, &output),
+        DatabaseCommand::Verify { database } => verify_database(&database),
+        DatabaseCommand::Restore { database, input } => restore_database(&database, &input),
+    }
+    .map_err(|error| AppError::new(error.to_string(), EXIT_SCAN_FAILED))
+}
+
+async fn read_bounded(path: &PathBuf, maximum: u64) -> Result<Vec<u8>, AppError> {
+    let metadata = tokio::fs::metadata(path).await.map_err(|error| {
+        AppError::new(
+            format!("could not inspect '{}': {error}", path.display()),
+            EXIT_INVALID_INPUT,
+        )
+    })?;
+    if metadata.len() > maximum {
+        return Err(AppError::new(
+            format!("'{}' exceeds the {} byte limit", path.display(), maximum),
+            EXIT_INVALID_INPUT,
+        ));
+    }
+    tokio::fs::read(path).await.map_err(|error| {
+        AppError::new(
+            format!("could not read '{}': {error}", path.display()),
+            EXIT_INVALID_INPUT,
+        )
+    })
+}
+
+#[cfg(unix)]
+fn ensure_private_key_permissions(path: &PathBuf) -> Result<(), AppError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(path)
+        .map_err(|error| {
+            AppError::new(
+                format!("could not inspect '{}': {error}", path.display()),
+                EXIT_INVALID_INPUT,
+            )
+        })?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        return Err(AppError::new(
+            "private key permissions must not grant group or other access",
+            EXIT_INVALID_INPUT,
+        ));
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn ensure_private_key_permissions(_path: &PathBuf) -> Result<(), AppError> {
     Ok(())
 }
 

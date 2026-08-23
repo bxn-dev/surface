@@ -28,8 +28,9 @@ flowchart TD
 
 - `surface-core` — typed target/configuration, observations, bounded Tokio orchestration, errors, and deterministic findings. It has no terminal rendering.
 - `surface-report` — pure terminal/JSON/HTML, SARIF/CycloneDX, and semantic-diff rendering. HTML escapes all target-controlled data and loads no remote resources.
-- `surface-cli` — Clap arguments, authorization policy, tracing setup, Ctrl+C cancellation, files/stdout, persistence opt-in, and exit codes.
-- `surface-storage` — versioned SQLite migrations, immutable serialized reports, normalized history metadata, retention, and deletion audit records.
+- `surface-cli` — Clap arguments, authorization policy, tracing setup, Ctrl+C cancellation, files/stdout, persistence, intelligence, signing, recovery, and exit codes.
+- `surface-storage` — versioned SQLite migrations, immutable reports, tenant identity, audit, leased jobs, schedules, notification state, retention, and verified recovery.
+- `surface-server` — Axum API/minimal web UI, Argon2id/session/API-token authentication, centralized role checks, workers, signed webhooks, and fixed-cardinality metrics.
 
 `surface-core` remains independent. `surface-report` and `surface-storage` consume its report model; `surface-cli` orchestrates both. No dependency cycle exists.
 
@@ -40,3 +41,7 @@ Only explicit IPs and primary-host A/AAAA addresses become active scan targets. 
 Persistence is opt-in. A one-shot scan opens no database unless `--persist --database PATH` is supplied. Report serialization and normalized finding writes share one transaction. Historical report JSON cannot be updated; deletion cascades dependent metadata and records an audit event in the same transaction.
 
 Service probes are selected by a centralized port-to-behavior registry. Payloads are fixed, read-only discovery commands; banner bytes, endpoint count, time, and concurrency remain bounded. Diffing and scoring are pure functions over completed report data and perform no network I/O.
+
+Hosted jobs require tenant target attestations and re-run core egress validation after DNS resolution. Any non-global or mixed global/non-global destination fails closed. HTTP remains address-pinned and same-origin; webhook delivery independently requires HTTPS, globally routable DNS, no redirects, fixed payloads, signatures, timeouts, leases, and capped attempts.
+
+Supplied subdomains and DKIM selectors are passive and bounded. CVE/network metadata comes only from a validated offline bundle; candidates are correlations, never exploit confirmation. Metrics run on a separate loopback listener and contain no tenant/target labels.

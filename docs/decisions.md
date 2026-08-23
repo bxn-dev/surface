@@ -36,6 +36,22 @@ The score is a deterministic projection of stable finding severity and target id
 
 SARIF and CycloneDX are generated directly from the complete report with `serde_json`; no format-specific dependency or parallel data model is maintained. The Surface JSON report remains the lossless source of truth.
 
+## Hosted execution reuses core scanning
+
+The hosted API adds tenancy and durable leases but invokes the same scan engine. A hosted-only core entry point fails closed for explicit or resolved non-global addresses, preventing request-layer validation bypass. Target authorization attestations are durable tenant state.
+
+## Authentication uses opaque revocable credentials
+
+Passwords use Argon2id with random salts. Session and API credentials are random 256-bit values stored only as SHA-256 hashes. Cookie mutations require exact-origin plus per-session CSRF; bearer tokens require stored scopes. Role authorization is centralized.
+
+## Passive intelligence is operator supplied
+
+Subdomains and DKIM selectors are explicit bounded inputs. Network/CVE metadata is a local versioned JSON bundle, avoiding third-party credentials, nondeterministic APIs, and public-network tests. CVE output is labeled as correlation candidates and does not alter score model 1.0.
+
+## Recovery and signatures preserve immutable reports
+
+Detached Ed25519 signatures cover exact bytes. SQLite backup/restore operates on verified database snapshots and never updates historical `report_json`.
+
 ## SQLite history is optional and immutable
 
 Local scans remain database-free by default. When persistence is requested, Surface uses bundled SQLite, committed numbered migrations, foreign keys, prepared statements, and transactions. It stores normalized query metadata plus the original complete report JSON. A database trigger rejects report-content updates; rescans always create new scan IDs.

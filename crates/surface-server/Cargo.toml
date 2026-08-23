@@ -1,6 +1,6 @@
 [package]
-name = "surface-core"
-description = "Core domain models and scanning logic for Surface"
+name = "surface-server"
+description = "Authenticated hosted API and worker for Surface"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,25 +11,30 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-futures.workspace = true
-hickory-proto.workspace = true
-hickory-resolver.workspace = true
+argon2.workspace = true
+axum.workspace = true
+clap.workspace = true
+hmac.workspace = true
+rand.workspace = true
 reqwest.workspace = true
-rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+surface-core.workspace = true
+surface-report.workspace = true
+surface-storage.workspace = true
 time.workspace = true
 tokio.workspace = true
-tokio-rustls.workspace = true
 tokio-util.workspace = true
-url.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
-webpki-roots.workspace = true
-x509-parser.workspace = true
+url.workspace = true
 
 [dev-dependencies]
-rcgen = "0.14"
+http-body-util = "0.1"
+tempfile = "3.20"
 
 [lints]
 workspace = true

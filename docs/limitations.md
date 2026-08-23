@@ -7,10 +7,14 @@
 - Surface does not crawl, brute-force directories, authenticate, fuzz, exploit, deliver payloads, evade controls, or test denial of service.
 - Surface does not provide complete vulnerability coverage or infer CVEs solely from banners.
 - DNSSEC is not cryptographically validated and is never reported as validated.
-- DKIM availability cannot be determined generically without an explicitly supplied selector, which v0.1.0 does not accept.
+- DKIM is queried only for explicitly supplied validated selectors; unqueried selectors and general DKIM availability remain unknown.
 - MTA-STS/TLS-RPT/SPF/DMARC record presence does not prove secure mail delivery.
 - The validating TLS handshake cannot retain an invalid leaf certificate when Rustls rejects it; the validation error remains visible.
 - HTTPS/header analysis uses a native HTTP client and does not execute JavaScript.
 - The exposure score reflects only generated findings. Missing observations never deduct points; compare scores only when coverage and score-model versions are compatible.
 - SARIF and CycloneDX are lossy integration projections; use Surface JSON for complete observations and errors.
+- Offline CVE matches require exact recognized product/version evidence and remain candidates, not confirmed exploitable vulnerabilities. Bundle freshness and completeness are operator responsibilities.
+- Hosted mode is a hardened single-host SQLite deployment, not a horizontally distributed control plane. Restore requires stopping the server.
+- Hosted scans do not fetch MTA-STS policy documents; DNS TXT observations remain available without creating a delegated-subdomain SSRF path.
+- Webhook secrets, signing keys, and environment secrets require separate protected backup and rotation.
 - A clean report or score of 100 does not prove that a target is secure.

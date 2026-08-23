@@ -2,6 +2,7 @@
 
 mod diff;
 mod exports;
+mod signing;
 
 use std::fmt::Write;
 
@@ -14,6 +15,7 @@ pub use diff::{
 };
 #[doc(inline)]
 pub use exports::{render_cyclonedx, render_sarif};
+pub use signing::{SignatureEnvelope, VerificationError, decode_key, sign_bytes, verify_bytes};
 
 // Rust guideline compliant 2026-02-21
 
@@ -301,7 +303,9 @@ fn clean_terminal(value: &str) -> String {
         .collect()
 }
 
-fn escape_html(value: &str) -> String {
+/// Escapes target-controlled text for HTML text and attribute contexts.
+#[must_use]
+pub fn escape_html(value: &str) -> String {
     value
         .chars()
         .filter(|character| !character.is_control())
@@ -359,7 +363,7 @@ mod tests {
         assert!(render_terminal(&report).contains("Status: NotStarted"));
         let json = render_json(&report).unwrap_or_default();
         assert!(json.contains("\"status\": \"not_started\""));
-        assert!(json.contains("\"schema_version\": \"0.1.1\""));
+        assert!(json.contains("\"schema_version\": \"0.1.2\""));
     }
 
     #[test]

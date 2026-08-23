@@ -6,6 +6,10 @@ All notable changes are documented here.
 
 ### Added
 
+- Authenticated tenant-scoped hosted API and minimal web UI with Argon2id, opaque sessions/API tokens, centralized roles, CSRF/origin checks, and audit access.
+- Durable idempotent scan jobs, expiring worker leases, fixed-interval schedules, signed HTTPS webhooks, and hosted non-global egress rejection.
+- Explicit passive subdomain/DKIM observations plus validated offline network metadata and conservative CVE candidates in report schema `0.1.2`.
+- Fixed-cardinality loopback metrics, exact-byte detached Ed25519 signatures, verified atomic SQLite backup/restore, and hardened systemd/Caddy deployment examples.
 - Deterministic semantic scan diffs for report files and persisted scan IDs, with terminal, JSON, and escaped HTML output.
 - Versioned exposure scoring with stable deductions and explicit incomplete-scan limitations.
 - SARIF 2.1.0 and CycloneDX 1.6 JSON exports.

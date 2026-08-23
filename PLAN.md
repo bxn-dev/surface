@@ -27,10 +27,10 @@ The reported Phase 6 completion was therefore not fully reproducible because for
 
 - [x] Phase 7 — SQLite persistence, immutable report history, retrieval, deletion, retention, and audit foundation
 - [x] Phase 8 — deterministic diffs, safe probes, exposure score, SARIF, and CycloneDX
-- [ ] Phase 9 — API, web, authentication, tenancy, authorization, and audit access
-- [ ] Phase 10 — durable jobs, schedules, notifications, and hosted egress policy
-- [ ] Phase 11 — passive intelligence, supplied subdomains/DKIM, CVE correlation, and network metadata
-- [ ] Phase 12 — metrics, signing, deployment, backup/restore, and final hardening
+- [x] Phase 9 — API, web, authentication, tenancy, authorization, and audit access
+- [x] Phase 10 — durable jobs, schedules, notifications, and hosted egress policy
+- [x] Phase 11 — passive intelligence, supplied subdomains/DKIM, CVE correlation, and network metadata
+- [x] Phase 12 — metrics, signing, deployment, backup/restore, and final hardening
 
 ## Phase 7 verified — 2026-08-23
 
@@ -51,3 +51,11 @@ The reported Phase 6 completion was therefore not fully reproducible because for
 - Full gate: format, strict Clippy, workspace tests, warning-free docs, `cargo deny`, and release build passed. `cargo deny` retains pre-existing duplicate-version warnings.
 - Local smoke tests: persistence/history round-trip passed; database mode was `0600`; one-shot scan created no database.
 - Review: all medium findings were fixed; no blocking findings remain.
+
+## Phases 9–12 verified — 2026-08-23
+
+- Hosted control plane: tenant-scoped storage/API/web, Argon2id passwords, hashed opaque sessions/API tokens, CSRF/origin checks, centralized roles, immutable tenant ownership, target attestations, and admin audit access.
+- Durable execution: idempotent jobs, transactional expiring leases, fixed-interval schedules, signed HTTPS notification deliveries, graceful cancellation, and core-enforced hosted global-address policy.
+- Intelligence: schema `0.1.2`, bounded supplied child-subdomain and DKIM observations, longest-prefix offline network metadata, and exact-version CVE candidates without score changes or exploit probes.
+- Operations: separate fixed-cardinality loopback metrics, exact-byte detached Ed25519 signing, integrity-checked atomic SQLite backup/restore, and hardened systemd/Caddy deployment examples.
+- Tests: 57 passed using deterministic data, temporary SQLite, and loopback-only fixtures.

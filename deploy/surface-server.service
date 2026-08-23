@@ -1,0 +1,31 @@
+[Unit]
+Description=Surface exposure management server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=surface
+Group=surface
+EnvironmentFile=/etc/surface/server.env
+ExecStart=/usr/local/bin/surface-server serve --database /var/lib/surface/surface.db --bind 127.0.0.1:8080 --metrics-bind 127.0.0.1:9090 --public-origin ${SURFACE_PUBLIC_ORIGIN}
+WorkingDirectory=/var/lib/surface
+StateDirectory=surface
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/surface
+
+[Install]
+WantedBy=multi-user.target

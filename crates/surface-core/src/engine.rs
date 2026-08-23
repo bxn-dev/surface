@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     NormalizedTarget, ScanConfiguration, ScanError, ScanErrorKind, ScanReport, ScanStage,
-    ScanStatus, analyze_dns, analyze_http, analyze_tls, calculate_exposure, detect_services,
-    generate_findings, scan_ports,
+    ScanStatus, analyze_http, analyze_tls, calculate_exposure, detect_services, generate_findings,
+    scan_ports,
 };
 
 // Rust guideline compliant 2026-02-21
@@ -18,17 +18,49 @@ const MAX_ACTIVE_ENDPOINTS: usize = 64;
 
 /// Runs implemented passive DNS and TCP stages.
 #[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear stages preserve partial observations and deadlines"
-)]
 pub async fn run_scan(
     target: NormalizedTarget,
     configuration: ScanConfiguration,
     cancellation: CancellationToken,
 ) -> ScanReport {
+    run_scan_inner(target, configuration, cancellation, false).await
+}
+
+/// Runs a scan with hosted egress restrictions enforced inside the scan engine.
+#[must_use]
+pub async fn run_hosted_scan(
+    target: NormalizedTarget,
+    configuration: ScanConfiguration,
+    cancellation: CancellationToken,
+) -> ScanReport {
+    run_scan_inner(target, configuration, cancellation, true).await
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear stages preserve partial observations and deadlines"
+)]
+async fn run_scan_inner(
+    target: NormalizedTarget,
+    configuration: ScanConfiguration,
+    cancellation: CancellationToken,
+    hosted: bool,
+) -> ScanReport {
     let deadline = Instant::now() + Duration::from_millis(configuration.global_timeout_ms);
     let mut report = ScanReport::not_started(target, configuration);
+    if hosted
+        && report
+            .target
+            .explicit_ip
+            .is_some_and(|address| !crate::is_global_unicast(address))
+    {
+        reject_before_scan(
+            &mut report,
+            ScanErrorKind::Authorization,
+            "hosted scans reject non-global destination addresses",
+        );
+        return report;
+    }
     if incompatible_address_family(&report) {
         reject_before_scan(
             &mut report,
@@ -52,11 +84,12 @@ pub async fn run_scan(
     "Scan started; unimplemented stages remain explicitly marked.".clone_into(&mut report.message);
 
     let dns_timeout = Duration::from_millis(report.configuration.request_timeout_ms);
-    let dns_future = analyze_dns(
+    let dns_future = crate::dns::analyze_dns_with_policy(
         &report.target,
         dns_timeout,
         report.configuration.ipv4_only,
         report.configuration.ipv6_only,
+        !hosted,
     );
     let dns = tokio::select! {
         () = cancellation.cancelled() => {
@@ -84,6 +117,18 @@ pub async fn run_scan(
     }
 
     let addresses = scan_addresses(&report);
+    if hosted
+        && addresses
+            .iter()
+            .any(|address| !crate::is_global_unicast(*address))
+    {
+        reject_before_scan(
+            &mut report,
+            ScanErrorKind::Authorization,
+            "hosted scans reject DNS answers containing non-global addresses",
+        );
+        return report;
+    }
     if !report.configuration.authorization_acknowledged
         && addresses.iter().any(|address| !address.is_loopback())
     {

@@ -1,10 +1,12 @@
 //! Core models and input parsing for Surface scans.
 
 mod dns;
+mod egress;
 mod engine;
 mod exposure;
 mod findings;
 mod http;
+mod intelligence;
 mod ports;
 mod scanner;
 mod service;
@@ -18,10 +20,12 @@ use uuid::Uuid;
 #[doc(inline)]
 pub use dns::{
     AddressSource, DmarcObservation, DnsObservation, DnsRecord, MailObservation, ResolvedHost,
-    SpfObservation, analyze_dns, interpret_mail,
+    SpfObservation, analyze_dns, interpret_mail, lookup_txt,
 };
 #[doc(inline)]
-pub use engine::run_scan;
+pub use egress::is_global_unicast;
+#[doc(inline)]
+pub use engine::{run_hosted_scan, run_scan};
 #[doc(inline)]
 pub use exposure::{
     EXPOSURE_MODEL_VERSION, ExposureScore, ScoreClassification, ScoreDeduction, calculate_exposure,
@@ -32,6 +36,11 @@ pub use findings::{
 };
 #[doc(inline)]
 pub use http::{CookieObservation, HttpObservation, RedirectObservation, analyze_http};
+#[doc(inline)]
+pub use intelligence::{
+    CveCandidate, DkimObservation, IntelligenceBundle, IntelligenceObservation, NetworkEntry,
+    NetworkMetadata, SubdomainObservation, VulnerabilityEntry, analyze_intelligence, parse_bundle,
+};
 #[doc(inline)]
 pub use ports::{PortSelection, PortSpecError, parse_ports};
 #[doc(inline)]
@@ -204,6 +213,9 @@ pub struct ScanReport {
     /// Versioned explainable exposure score when findings were generated.
     #[serde(default)]
     pub exposure_score: Option<ExposureScore>,
+    /// Optional explicitly supplied passive and offline intelligence.
+    #[serde(default)]
+    pub intelligence: Option<IntelligenceObservation>,
     /// Partial errors retained across stages.
     pub errors: Vec<ScanError>,
     /// Human-readable explanation of the lifecycle state.
@@ -224,7 +236,7 @@ impl ScanReport {
         ];
 
         Self {
-            schema_version: "0.1.1".to_owned(),
+            schema_version: "0.1.2".to_owned(),
             scanner_version: env!("CARGO_PKG_VERSION").to_owned(),
             scan_id: Uuid::new_v4(),
             started_at: OffsetDateTime::now_utc(),
@@ -246,6 +258,7 @@ impl ScanReport {
             tls: Vec::new(),
             findings: Vec::new(),
             exposure_score: None,
+            intelligence: None,
             errors: Vec::new(),
             message:
                 "Surface repository initialized. Scanning functionality is not implemented yet."

@@ -1,6 +1,6 @@
 # Report schema
 
-Surface JSON reports use schema version `0.1.1`. Reports from `0.1.0` remain readable because the added score is optional during deserialization.
+Surface JSON reports use schema version `0.1.2`. Reports from `0.1.0` and `0.1.1` remain readable because score and intelligence fields are additive and default when absent.
 
 Top-level fields:
 
@@ -22,6 +22,7 @@ Top-level fields:
 | `findings` | Stable evidence-backed interpretations sorted by severity and ID |
 | `errors` | Recoverable and fatal stage errors |
 | `exposure_score` | Versioned deterministic score, deductions, classification, and completeness flag |
+| `intelligence` | Optional explicitly supplied passive subdomain/DKIM and offline network/CVE correlations |
 | `message` | Human-readable lifecycle summary |
 
 No field contains ANSI escape sequences. Target-controlled banners, headers, bodies, errors, and HTML fields are capped or sanitized. Additive fields may appear within schema `0.1.x`; incompatible changes require a schema-version change.
@@ -31,3 +32,5 @@ Optional SQLite history stores this complete JSON unchanged alongside normalized
 `surface diff` accepts compatible `0.1.x` reports. It compares typed network, service, certificate, DNS/mail, finding, score, and completeness data while ignoring execution IDs, timestamps, latency, and transient error text. Reports with incompatible schema or score-model versions produce explicit warnings rather than fabricated comparisons.
 
 SARIF 2.1.0 and CycloneDX 1.6 are integration projections, not replacements for the complete Surface JSON report. Unknown observations and partial status remain represented conservatively.
+
+Detached signatures sign exact report bytes and therefore do not change this schema. Reformatting otherwise equivalent JSON invalidates its signature by design.

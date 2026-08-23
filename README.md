@@ -39,6 +39,9 @@ Example addresses are documentation-only; tests and CI never scan public infrast
 - evidence-backed findings separated from raw observations
 - deterministic terminal, versioned JSON, self-contained escaped HTML, SARIF 2.1.0, and CycloneDX 1.6 reports
 - deterministic file/history diffs and versioned exposure scoring
+- authenticated tenant-scoped hosted API with durable leased jobs, fixed-interval schedules, and signed HTTPS webhooks
+- hosted SSRF/egress restrictions, supplied passive subdomain/DKIM observations, and offline network/CVE correlation
+- detached Ed25519 report signatures, bounded metrics, and verified SQLite backup/restore
 
 No raw packets, stealth, brute force, exploitation, crawling, directory enumeration, authentication, rate-limit bypass, or unrelated-host discovery is implemented.
 
@@ -66,6 +69,11 @@ surface scan 127.0.0.1 --persist --database ./surface.db
 surface history list --database ./surface.db
 surface history show <SCAN_ID> --database ./surface.db
 surface history prune --database ./surface.db --older-than 180d --dry-run
+surface scan example.com --subdomain www.example.com --dkim-selector selector1 --intelligence-bundle intelligence.json --acknowledge-authorization
+surface report sign report.json --key private-key.hex --signature report.sig.json
+surface report verify report.json --signature report.sig.json --public-key public-key.hex
+surface database backup --database ./surface.db --output ./surface.backup.db
+surface database verify --database ./surface.backup.db
 surface completion bash > surface.bash
 ```
 
@@ -114,7 +122,7 @@ flowchart TD
     K --> N[HTML]
 ```
 
-`surface-core` owns observations/orchestration, `surface-report` owns presentation, `surface-storage` owns optional SQLite history, and `surface-cli` owns process behavior. See [`docs/architecture.md`](docs/architecture.md) and [`docs/database-schema.md`](docs/database-schema.md).
+`surface-core` owns observations/orchestration and egress policy, `surface-report` owns presentation/signing, `surface-storage` owns SQLite history/tenancy/jobs/recovery, `surface-cli` owns local process behavior, and `surface-server` owns the authenticated hosted composition. See [`docs/architecture.md`](docs/architecture.md), [`docs/database-schema.md`](docs/database-schema.md), and [`deploy/README.md`](deploy/README.md).
 
 ## Limitations
 
@@ -135,9 +143,13 @@ cargo build --release
 
 Tests bind only local fixture servers and do not require public internet access. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
+## Hosted service
+
+Bootstrap with `SURFACE_BOOTSTRAP_PASSWORD` and `surface-server bootstrap-admin`, then run `surface-server serve`. The API and web listener defaults to loopback port 8080; metrics use a separate loopback listener on port 9090. A TLS reverse proxy is required outside localhost. See [`deploy/README.md`](deploy/README.md).
+
 ## Roadmap
 
-Next: an SSRF-hardened optional hosted interface, scheduling, notifications, and multi-user hardening. No offensive features are planned.
+Phases 0–12 are complete. Future work remains additive and will not introduce offensive scanning features.
 
 ## License
 

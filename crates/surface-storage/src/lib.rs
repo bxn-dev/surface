@@ -1,5 +1,17 @@
 //! Persists immutable Surface reports and queryable scan history in `SQLite`.
 
+mod backup;
+mod identity;
+mod jobs;
+mod scheduling;
+
+pub use backup::{backup_database, restore_database, verify_database};
+pub use identity::{
+    ActorContext, AuditEvent, AuditFilter, AuthenticatedActor, Role, TenantId, UserRecord,
+};
+pub use jobs::{JobState, ScanJob};
+pub use scheduling::NotificationDelivery;
+
 use std::fmt;
 use std::path::Path;
 
@@ -13,7 +25,14 @@ use uuid::Uuid;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../../../migrations/0001_scan_history.sql")),
-    (2, include_str!("../../../migrations/0002_identity_tenancy.sql")),
+    (
+        2,
+        include_str!("../../../migrations/0002_identity_tenancy.sql"),
+    ),
+    (
+        3,
+        include_str!("../../../migrations/0003_jobs_schedules_notifications.sql"),
+    ),
 ];
 const DEFAULT_PAGE_SIZE: u32 = 50;
 const MAX_PAGE_SIZE: u32 = 500;
@@ -152,6 +171,15 @@ impl Storage {
     ///
     /// Returns an error for serialization failures or duplicate scan identifiers.
     pub fn persist_report(&mut self, report: &ScanReport, origin: &str) -> Result<(), Error> {
+        self.persist_report_for_tenant("local", report, origin)
+    }
+
+    fn persist_report_for_tenant(
+        &mut self,
+        tenant_id: &str,
+        report: &ScanReport,
+        origin: &str,
+    ) -> Result<(), Error> {
         let report_json = serde_json::to_string(report)
             .map_err(|error| Error::with_source("could not serialize scan report", error))?;
         let normalized_target = normalized_target(report);
@@ -165,8 +193,9 @@ impl Storage {
                     scan_id, original_target, normalized_target, scanner_version,
                     report_schema_version, started_at, completed_at, status, interrupted,
                     finding_info_count, finding_low_count, finding_medium_count,
-                    finding_high_count, finding_critical_count, report_json, origin, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    finding_high_count, finding_critical_count, report_json, origin, created_at,
+                    tenant_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 params![
                     report.scan_id.to_string(),
                     report.target.original,
@@ -181,6 +210,7 @@ impl Storage {
                     report_json,
                     origin,
                     OffsetDateTime::now_utc().unix_timestamp(),
+                    tenant_id,
                 ],
             )
             .map_err(|error| Error::with_source("could not persist scan report", error))?;
@@ -598,7 +628,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0)
             ),
-            Ok(2)
+            Ok(3)
         );
         let report = report("example.com");
         storage
@@ -633,7 +663,7 @@ mod tests {
                     version INTEGER PRIMARY KEY NOT NULL,
                     applied_at INTEGER NOT NULL
                  ) STRICT;
-                 INSERT INTO surface_schema_migrations VALUES (3, 0);",
+                 INSERT INTO surface_schema_migrations VALUES (4, 0);",
             )
             .unwrap_or_else(|error| panic!("{error}"));
         drop(connection);

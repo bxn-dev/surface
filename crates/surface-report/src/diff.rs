@@ -282,7 +282,7 @@ fn escape_html(value: &str) -> String {
 }
 
 fn ensure_schema_supported(version: &str) -> Result<(), DiffError> {
-    if matches!(version, "0.1.0" | "0.1.1") {
+    if matches!(version, "0.1.0" | "0.1.1" | "0.1.2") {
         Ok(())
     } else {
         Err(DiffError(format!(
@@ -401,6 +401,24 @@ fn dns_changes(old: &ScanReport, new: &ScanReport, target: &str) -> Vec<Change> 
             new_mail,
             target,
             "high",
+        ));
+    }
+    let old_intelligence = old
+        .intelligence
+        .as_ref()
+        .and_then(|value| serde_json::to_value(value).ok());
+    let new_intelligence = new
+        .intelligence
+        .as_ref()
+        .and_then(|value| serde_json::to_value(value).ok());
+    if old_intelligence != new_intelligence {
+        changes.push(change(
+            "passive_intelligence",
+            target,
+            old_intelligence,
+            new_intelligence,
+            target,
+            "medium",
         ));
     }
     changes.sort_by(|left, right| {
