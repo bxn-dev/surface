@@ -1751,6 +1751,7 @@ dependencies = [
 name = "surface-report"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "surface-core",
 ]

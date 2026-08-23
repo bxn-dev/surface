@@ -193,6 +193,28 @@ fn exposure_findings(
             FindingConfidence::High,
         ));
     }
+    for service in services.iter().filter(|service| {
+        service.service == ServiceKind::Smtp
+            && service.confidence == crate::DetectionConfidence::High
+            && service
+                .banner
+                .as_deref()
+                .is_some_and(|banner| banner.contains("250"))
+            && !service.protocol_details.contains_key("starttls")
+    }) {
+        findings.push(finding(
+            "MAIL-SMTP-STARTTLS-NOT-ADVERTISED",
+            "SMTP service did not advertise STARTTLS",
+            Severity::Medium,
+            FindingCategory::Mail,
+            &service.address.to_string(),
+            "A bounded EHLO exchange completed, but the observed capability list did not advertise STARTTLS.",
+            "SMTP EHLO capabilities",
+            service.banner.as_deref().unwrap_or("EHLO response received"),
+            Some("Review whether transport encryption should be offered on this SMTP endpoint."),
+            FindingConfidence::High,
+        ));
+    }
     let _ = target;
 }
 

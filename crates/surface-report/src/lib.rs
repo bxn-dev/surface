@@ -1,8 +1,19 @@
-//! Deterministic terminal, JSON, and self-contained HTML reports.
+//! Deterministic terminal, JSON, HTML, diff, and integration reports.
+
+mod diff;
+mod exports;
 
 use std::fmt::Write;
 
 use surface_core::{PortState, ScanReport, Severity};
+
+#[doc(inline)]
+pub use diff::{
+    Change, DIFF_SCHEMA_VERSION, DiffError, DiffSummary, ScanDiff, ScanReference, diff_reports,
+    render_diff_html, render_diff_json, render_diff_terminal,
+};
+#[doc(inline)]
+pub use exports::{render_cyclonedx, render_sarif};
 
 // Rust guideline compliant 2026-02-21
 
@@ -104,6 +115,28 @@ pub fn render_terminal(report: &ScanReport) -> String {
         }
     }
 
+    if let Some(score) = &report.exposure_score {
+        let _ = writeln!(
+            output,
+            "\nSurface Exposure Score: {}/100 ({:?}, model {})",
+            score.value, score.classification, score.model_version
+        );
+        if score.incomplete {
+            let _ = writeln!(
+                output,
+                "  Incomplete scan: score interpretation is limited."
+            );
+        }
+        for deduction in &score.deductions {
+            let _ = writeln!(
+                output,
+                "  -{}  {}",
+                deduction.points,
+                clean_terminal(&deduction.reason)
+            );
+        }
+    }
+
     let _ = writeln!(output, "\nSummary");
     for severity in [
         Severity::Critical,
@@ -138,7 +171,8 @@ pub fn render_json(report: &ScanReport) -> Result<String, serde_json::Error> {
 #[must_use]
 #[expect(
     clippy::format_collect,
-    reason = "small bounded report fragments favor clear escaped templates"
+    clippy::too_many_lines,
+    reason = "small bounded report fragments favor one auditable escaped template"
 )]
 pub fn render_html(report: &ScanReport) -> String {
     let mut findings = String::new();
@@ -210,9 +244,31 @@ pub fn render_html(report: &ScanReport) -> String {
             )
         })
         .collect::<String>();
+    let score = report.exposure_score.as_ref().map_or_else(
+        || "<p>Score unavailable.</p>".to_owned(),
+        |score| {
+            let deductions = score
+                .deductions
+                .iter()
+                .map(|deduction| {
+                    format!(
+                        "<li>-{}: {}</li>",
+                        deduction.points,
+                        escape_html(&deduction.reason)
+                    )
+                })
+                .collect::<String>();
+            format!(
+                "<p><strong>{}/100</strong> ({:?}, model {})</p><ul>{deductions}</ul>",
+                score.value,
+                score.classification,
+                escape_html(&score.model_version)
+            )
+        },
+    );
 
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Surface report</title><style>:root{{color-scheme:light dark}}body{{font:16px system-ui;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.5}}code{{overflow-wrap:anywhere}}table{{border-collapse:collapse;width:100%}}th,td{{padding:.4rem;border-bottom:1px solid #888;text-align:left}}.finding{{border-left:.4rem solid #888;padding:.2rem 1rem;margin:1rem 0}}.high,.critical{{border-color:#c62828}}.medium{{border-color:#ef6c00}}.low{{border-color:#f9a825}}@media print{{:root{{color-scheme:light}}body{{margin:0;max-width:none}}}}</style></head><body><main><h1>Surface {}</h1><dl><dt>Target</dt><dd><code>{}</code></dd><dt>Scan ID</dt><dd><code>{}</code></dd><dt>Started</dt><dd>{}</dd><dt>Completed</dt><dd>{}</dd><dt>Status</dt><dd>{:?}</dd></dl><h2>DNS</h2>{}<h2>Hosts and open ports</h2>{}<h2>Findings</h2>{}<h2>Scan limitations</h2><p>Surface analyzes externally observable services and security-related configuration. It performs no active exploitation. Timeouts and a clean report do not prove security.</p><footer>Surface {} · schema {}</footer></main></body></html>\n",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Surface report</title><style>:root{{color-scheme:light dark}}body{{font:16px system-ui;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.5}}code{{overflow-wrap:anywhere}}table{{border-collapse:collapse;width:100%}}th,td{{padding:.4rem;border-bottom:1px solid #888;text-align:left}}.finding{{border-left:.4rem solid #888;padding:.2rem 1rem;margin:1rem 0}}.high,.critical{{border-color:#c62828}}.medium{{border-color:#ef6c00}}.low{{border-color:#f9a825}}@media print{{:root{{color-scheme:light}}body{{margin:0;max-width:none}}}}</style></head><body><main><h1>Surface {}</h1><dl><dt>Target</dt><dd><code>{}</code></dd><dt>Scan ID</dt><dd><code>{}</code></dd><dt>Started</dt><dd>{}</dd><dt>Completed</dt><dd>{}</dd><dt>Status</dt><dd>{:?}</dd></dl><h2>DNS</h2>{}<h2>Hosts and open ports</h2>{}<h2>Findings</h2>{}<h2>Surface Exposure Score</h2>{}<h2>Scan limitations</h2><p>Surface analyzes externally observable services and security-related configuration. It performs no active exploitation. Timeouts and a clean report do not prove security.</p><footer>Surface {} · schema {}</footer></main></body></html>\n",
         escape_html(&report.scanner_version),
         escape_html(&report.target.original),
         escape_html(&report.scan_id.to_string()),
@@ -226,6 +282,7 @@ pub fn render_html(report: &ScanReport) -> String {
         dns,
         hosts,
         findings,
+        score,
         escape_html(&report.scanner_version),
         escape_html(&report.schema_version),
     )
@@ -302,7 +359,7 @@ mod tests {
         assert!(render_terminal(&report).contains("Status: NotStarted"));
         let json = render_json(&report).unwrap_or_default();
         assert!(json.contains("\"status\": \"not_started\""));
-        assert!(json.contains("\"schema_version\": \"0.1.0\""));
+        assert!(json.contains("\"schema_version\": \"0.1.1\""));
     }
 
     #[test]

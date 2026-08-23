@@ -9,7 +9,10 @@ use clap_complete::Shell;
 use surface_core::{
     ScanConfiguration, ScanReport, ScanStatus, Severity, normalize_target, parse_ports, run_scan,
 };
-use surface_report::{render_html, render_json, render_terminal};
+use surface_report::{
+    diff_reports, render_cyclonedx, render_diff_html, render_diff_json, render_diff_terminal,
+    render_html, render_json, render_sarif, render_terminal,
+};
 use surface_storage::{HistoryFilter, RetentionPolicy, Storage};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -36,6 +39,8 @@ struct Cli {
 enum Command {
     /// Runs an authorized external exposure assessment.
     Scan(ScanArgs),
+    /// Compares two report files or persisted scans.
+    Diff(DiffArgs),
     /// Lists, retrieves, deletes, or prunes persisted scans.
     History {
         #[command(subcommand)]
@@ -104,6 +109,23 @@ struct ScanArgs {
     /// Persists the complete immutable report after scanning.
     #[arg(long)]
     persist: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct DiffArgs {
+    /// Earlier report file or scan identifier.
+    old: String,
+    /// Later report file or scan identifier.
+    new: String,
+    /// Loads both arguments as scan identifiers from this `SQLite` database.
+    #[arg(long)]
+    database: Option<PathBuf>,
+    /// Diff output format.
+    #[arg(long, value_enum, default_value_t = DiffFormat::Terminal)]
+    format: DiffFormat,
+    /// Writes the diff to a file instead of stdout.
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -203,6 +225,15 @@ enum ReportFormat {
     Terminal,
     Json,
     Html,
+    Sarif,
+    CyclonedxJson,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DiffFormat {
+    Terminal,
+    Json,
+    Html,
 }
 
 #[derive(Debug)]
@@ -255,6 +286,7 @@ async fn main() -> ExitCode {
 async fn run(command: Command) -> Result<(), AppError> {
     match command {
         Command::Scan(arguments) => run_scan_command(arguments).await,
+        Command::Diff(arguments) => run_diff_command(arguments).await,
         Command::History { command } => run_history_command(command),
         Command::Version => {
             println!("surface {}", env!("CARGO_PKG_VERSION"));
@@ -327,16 +359,7 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
         finding_count = report.findings.len(),
         "scan completed"
     );
-    let rendered = match arguments.format {
-        ReportFormat::Terminal => render_terminal(&report),
-        ReportFormat::Json => render_json(&report).map_err(|error| {
-            AppError::new(
-                format!("could not serialize report: {error}"),
-                EXIT_SCAN_FAILED,
-            )
-        })?,
-        ReportFormat::Html => render_html(&report),
-    };
+    let rendered = render_report(&report, arguments.format)?;
 
     if let Some(path) = arguments.output {
         tokio::fs::write(&path, rendered).await.map_err(|error| {
@@ -420,16 +443,7 @@ fn run_history_command(command: HistoryCommand) -> Result<(), AppError> {
                 .ok_or_else(|| {
                     AppError::new(format!("scan {scan_id} was not found"), EXIT_INVALID_INPUT)
                 })?;
-            let rendered = match format {
-                ReportFormat::Terminal => render_terminal(&report),
-                ReportFormat::Json => render_json(&report).map_err(|error| {
-                    AppError::new(
-                        format!("could not serialize report: {error}"),
-                        EXIT_SCAN_FAILED,
-                    )
-                })?,
-                ReportFormat::Html => render_html(&report),
-            };
+            let rendered = render_report(&report, format)?;
             print!("{rendered}");
             Ok(())
         }
@@ -478,6 +492,101 @@ fn run_history_command(command: HistoryCommand) -> Result<(), AppError> {
             Ok(())
         }
     }
+}
+
+async fn run_diff_command(arguments: DiffArgs) -> Result<(), AppError> {
+    let (old, new) = if let Some(database) = &arguments.database {
+        let old_id = Uuid::parse_str(&arguments.old)
+            .map_err(|_| AppError::new("old scan ID is invalid", EXIT_INVALID_INPUT))?;
+        let new_id = Uuid::parse_str(&arguments.new)
+            .map_err(|_| AppError::new("new scan ID is invalid", EXIT_INVALID_INPUT))?;
+        let storage = open_storage(database)?;
+        let old = storage
+            .report(old_id)
+            .map_err(|error| AppError::new(error.to_string(), EXIT_SCAN_FAILED))?
+            .ok_or_else(|| {
+                AppError::new(format!("scan {old_id} was not found"), EXIT_INVALID_INPUT)
+            })?;
+        let new = storage
+            .report(new_id)
+            .map_err(|error| AppError::new(error.to_string(), EXIT_SCAN_FAILED))?
+            .ok_or_else(|| {
+                AppError::new(format!("scan {new_id} was not found"), EXIT_INVALID_INPUT)
+            })?;
+        (old, new)
+    } else {
+        (
+            load_report_file(PathBuf::from(&arguments.old)).await?,
+            load_report_file(PathBuf::from(&arguments.new)).await?,
+        )
+    };
+    let diff = diff_reports(&old, &new)
+        .map_err(|error| AppError::new(error.to_string(), EXIT_INVALID_INPUT))?;
+    let rendered = match arguments.format {
+        DiffFormat::Terminal => render_diff_terminal(&diff),
+        DiffFormat::Json => render_diff_json(&diff).map_err(|error| {
+            AppError::new(
+                format!("could not serialize diff: {error}"),
+                EXIT_SCAN_FAILED,
+            )
+        })?,
+        DiffFormat::Html => render_diff_html(&diff),
+    };
+    if let Some(path) = arguments.output {
+        tokio::fs::write(&path, rendered).await.map_err(|error| {
+            AppError::new(
+                format!("could not write '{}': {error}", path.display()),
+                EXIT_SCAN_FAILED,
+            )
+        })?;
+    } else {
+        print!("{rendered}");
+    }
+    Ok(())
+}
+
+async fn load_report_file(path: PathBuf) -> Result<ScanReport, AppError> {
+    const MAX_REPORT_BYTES: u64 = 16 * 1_024 * 1_024;
+    let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
+        AppError::new(
+            format!("could not inspect '{}': {error}", path.display()),
+            EXIT_SCAN_FAILED,
+        )
+    })?;
+    if metadata.len() > MAX_REPORT_BYTES {
+        return Err(AppError::new(
+            format!("report '{}' exceeds 16 MiB", path.display()),
+            EXIT_INVALID_INPUT,
+        ));
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|error| {
+        AppError::new(
+            format!("could not read '{}': {error}", path.display()),
+            EXIT_SCAN_FAILED,
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AppError::new(
+            format!("report '{}' is invalid: {error}", path.display()),
+            EXIT_INVALID_INPUT,
+        )
+    })
+}
+
+fn render_report(report: &ScanReport, format: ReportFormat) -> Result<String, AppError> {
+    match format {
+        ReportFormat::Terminal => Ok(render_terminal(report)),
+        ReportFormat::Json => render_json(report),
+        ReportFormat::Html => Ok(render_html(report)),
+        ReportFormat::Sarif => render_sarif(report),
+        ReportFormat::CyclonedxJson => render_cyclonedx(report),
+    }
+    .map_err(|error| {
+        AppError::new(
+            format!("could not serialize report: {error}"),
+            EXIT_SCAN_FAILED,
+        )
+    })
 }
 
 fn open_storage(path: &PathBuf) -> Result<Storage, AppError> {
@@ -585,6 +694,30 @@ mod tests {
         .unwrap_or_else(|error| panic!("{error}"));
 
         assert!(matches!(cli.command, Command::Scan(_)));
+    }
+
+    #[test]
+    fn parses_diff_and_integration_formats() {
+        for format in ["sarif", "cyclonedx-json"] {
+            let cli = Cli::try_parse_from(["surface", "scan", "127.0.0.1", "--format", format])
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert!(matches!(cli.command, Command::Scan(_)));
+        }
+        let files = Cli::try_parse_from([
+            "surface", "diff", "old.json", "new.json", "--format", "json",
+        ])
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(matches!(files.command, Command::Diff(_)));
+        let database = Cli::try_parse_from([
+            "surface",
+            "diff",
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            "--database",
+            "surface.db",
+        ])
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(matches!(database.command, Command::Diff(_)));
     }
 
     #[test]

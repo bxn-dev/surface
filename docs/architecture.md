@@ -18,12 +18,16 @@ flowchart TD
     K --> M[JSON]
     K --> N[Escaped HTML]
     K --> O[Optional SQLite History]
+    K --> P[SARIF / CycloneDX]
+    K --> Q[Versioned Exposure Score]
+    O --> R[Semantic Diff]
+    K --> R
 ```
 
 ## Crates
 
 - `surface-core` — typed target/configuration, observations, bounded Tokio orchestration, errors, and deterministic findings. It has no terminal rendering.
-- `surface-report` — pure terminal/JSON/HTML rendering. HTML escapes all target-controlled data and loads no remote resources.
+- `surface-report` — pure terminal/JSON/HTML, SARIF/CycloneDX, and semantic-diff rendering. HTML escapes all target-controlled data and loads no remote resources.
 - `surface-cli` — Clap arguments, authorization policy, tracing setup, Ctrl+C cancellation, files/stdout, persistence opt-in, and exit codes.
 - `surface-storage` — versioned SQLite migrations, immutable serialized reports, normalized history metadata, retention, and deletion audit records.
 
@@ -34,3 +38,5 @@ flowchart TD
 Only explicit IPs and primary-host A/AAAA addresses become active scan targets. MX, NS, CNAME, TXT, redirects to other hosts, and page links never expand scan scope. TCP uses ordinary `connect`; every active stage has a timeout and bounded concurrency. Completed observations survive recoverable stage errors and cancellation.
 
 Persistence is opt-in. A one-shot scan opens no database unless `--persist --database PATH` is supplied. Report serialization and normalized finding writes share one transaction. Historical report JSON cannot be updated; deletion cascades dependent metadata and records an audit event in the same transaction.
+
+Service probes are selected by a centralized port-to-behavior registry. Payloads are fixed, read-only discovery commands; banner bytes, endpoint count, time, and concurrency remain bounded. Diffing and scoring are pure functions over completed report data and perform no network I/O.

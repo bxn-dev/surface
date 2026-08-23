@@ -33,11 +33,12 @@ Example addresses are documentation-only; tests and CI never scan public infrast
 - conservative SPF, DMARC, MTA-STS, and TLS-RPT interpretation
 - bounded Tokio TCP connect scanning with per-operation/global timeouts
 - graceful Ctrl+C cancellation with partial reports
-- safe HTTP, HTTPS, SSH, SMTP, and capped banner identification
+- centralized bounded probes for HTTP, SSH, SMTP, FTP, IMAP, POP3, Redis, MySQL, and TLS service hints
 - bounded HTTP redirects/bodies, selected headers, cookie flags, title and well-known files
 - validating Rustls TLS handshakes and certificate metadata
 - evidence-backed findings separated from raw observations
-- deterministic terminal, versioned JSON, and self-contained escaped HTML reports
+- deterministic terminal, versioned JSON, self-contained escaped HTML, SARIF 2.1.0, and CycloneDX 1.6 reports
+- deterministic file/history diffs and versioned exposure scoring
 
 No raw packets, stealth, brute force, exploitation, crawling, directory enumeration, authentication, rate-limit bypass, or unrelated-host discovery is implemented.
 
@@ -58,6 +59,9 @@ surface scan https://example.com/path --ports 80,443,8000-8100 --acknowledge-aut
 surface scan 127.0.0.1 --ports 1-1000 --global-timeout 30s
 surface scan example.com --format json --output report.json --acknowledge-authorization
 surface scan example.com --format html --output report.html --acknowledge-authorization
+surface scan example.com --format sarif --output report.sarif.json --acknowledge-authorization
+surface diff old.json new.json --format html --output diff.html
+surface diff <OLD_SCAN_ID> <NEW_SCAN_ID> --database ./surface.db
 surface scan 127.0.0.1 --persist --database ./surface.db
 surface history list --database ./surface.db
 surface history show <SCAN_ID> --database ./surface.db
@@ -72,10 +76,12 @@ Logs use stderr; report data uses stdout or `--output`. `RUST_LOG` overrides the
 ## Reports
 
 - **terminal** — concise observations, open ports, findings, and counts
-- **json** — schema `0.1.0`, complete structured observations/findings/errors
+- **json** — schema `0.1.1`, complete structured observations/findings/errors/score
 - **html** — responsive, print-friendly, self-contained, no remote assets or scripts
+- **sarif** — SARIF 2.1.0 findings for code-scanning integrations
+- **cyclonedx-json** — CycloneDX 1.6 observed-service inventory and vulnerabilities
 
-See [`docs/report-schema.md`](docs/report-schema.md).
+See [`docs/report-schema.md`](docs/report-schema.md) and [`docs/scoring.md`](docs/scoring.md).
 
 ## Exit codes
 
@@ -131,7 +137,7 @@ Tests bind only local fixture servers and do not require public internet access.
 
 ## Roadmap
 
-After a stable CLI release: local SQLite history/report comparison, certificate/port change detection, additional safe probes, SARIF, then an SSRF-hardened optional hosted interface. No offensive features are planned.
+Next: an SSRF-hardened optional hosted interface, scheduling, notifications, and multi-user hardening. No offensive features are planned.
 
 ## License
 

@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     NormalizedTarget, ScanConfiguration, ScanError, ScanErrorKind, ScanReport, ScanStage,
-    ScanStatus, analyze_dns, analyze_http, analyze_tls, detect_services, generate_findings,
-    scan_ports,
+    ScanStatus, analyze_dns, analyze_http, analyze_tls, calculate_exposure, detect_services,
+    generate_findings, scan_ports,
 };
 
 // Rust guideline compliant 2026-02-21
@@ -210,12 +210,12 @@ pub async fn run_scan(
         }
     }
 
-    complete_findings(&mut report);
     report.status = if report.errors.is_empty() {
         ScanStatus::Completed
     } else {
         ScanStatus::Partial
     };
+    complete_findings(&mut report);
     "Surface analyzed externally observable services and security-related configuration."
         .clone_into(&mut report.message);
     report.completed_at = Some(time::OffsetDateTime::now_utc());
@@ -256,6 +256,7 @@ fn complete_findings(report: &mut ScanReport) {
         &report.tls,
         time::OffsetDateTime::now_utc(),
     );
+    report.exposure_score = Some(calculate_exposure(report));
 }
 
 fn scan_addresses(report: &ScanReport) -> Vec<IpAddr> {

@@ -26,7 +26,7 @@ The reported Phase 6 completion was therefore not fully reproducible because for
 ## Post-MVP phases
 
 - [x] Phase 7 — SQLite persistence, immutable report history, retrieval, deletion, retention, and audit foundation
-- [ ] Phase 8 — deterministic diffs, safe probes, exposure score, SARIF, and CycloneDX
+- [x] Phase 8 — deterministic diffs, safe probes, exposure score, SARIF, and CycloneDX
 - [ ] Phase 9 — API, web, authentication, tenancy, authorization, and audit access
 - [ ] Phase 10 — durable jobs, schedules, notifications, and hosted egress policy
 - [ ] Phase 11 — passive intelligence, supplied subdomains/DKIM, CVE correlation, and network metadata
@@ -40,5 +40,14 @@ The reported Phase 6 completion was therefore not fully reproducible because for
 - Retention: age, per-target count, high/critical preservation, deterministic ordering, and dry-run.
 - Tests: 35 passed, including temporary-database migration, round-trip, future-schema, retention-overflow, deletion/audit, and foreign-key behavior.
 - Full gate: format, strict Clippy, workspace tests, docs, `cargo deny`, and release build passed. `cargo deny` retains pre-existing duplicate-version warnings.
+
+## Phase 8 verified — 2026-08-23
+
+- Diff: deterministic typed comparisons for network, services/HTTP, certificates, DNS/mail, findings, score, and completeness from files or persisted scan IDs; terminal, JSON, and escaped HTML output.
+- Probes: centralized bounded behavior registry with passive or fixed read-only discovery for FTP, SMTP, POP3, IMAP, Redis, MySQL, HTTP, SSH, and TLS-wrapped service hints.
+- Score: additive report schema `0.1.1`, exposure model `1.0`, stable deduplicated deductions, explicit incomplete state, terminal/HTML/JSON rendering, and documented rubric.
+- Integrations: deterministic SARIF 2.1.0 findings and CycloneDX 1.6 observed-service inventory/vulnerabilities.
+- Tests: 44 passed, including score stability/clamping, semantic-noise suppression, export ordering, CLI parsing, storage regressions, and local-only scanner fixtures.
+- Full gate: format, strict Clippy, workspace tests, warning-free docs, `cargo deny`, and release build passed. `cargo deny` retains pre-existing duplicate-version warnings.
 - Local smoke tests: persistence/history round-trip passed; database mode was `0600`; one-shot scan created no database.
 - Review: all medium findings were fixed; no blocking findings remain.

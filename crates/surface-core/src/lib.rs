@@ -2,6 +2,7 @@
 
 mod dns;
 mod engine;
+mod exposure;
 mod findings;
 mod http;
 mod ports;
@@ -21,6 +22,10 @@ pub use dns::{
 };
 #[doc(inline)]
 pub use engine::run_scan;
+#[doc(inline)]
+pub use exposure::{
+    EXPOSURE_MODEL_VERSION, ExposureScore, ScoreClassification, ScoreDeduction, calculate_exposure,
+};
 #[doc(inline)]
 pub use findings::{
     Evidence, Finding, FindingCategory, FindingConfidence, Severity, generate_findings,
@@ -196,6 +201,9 @@ pub struct ScanReport {
     pub tls: Vec<TlsObservation>,
     /// Evidence-backed interpreted findings.
     pub findings: Vec<Finding>,
+    /// Versioned explainable exposure score when findings were generated.
+    #[serde(default)]
+    pub exposure_score: Option<ExposureScore>,
     /// Partial errors retained across stages.
     pub errors: Vec<ScanError>,
     /// Human-readable explanation of the lifecycle state.
@@ -216,7 +224,7 @@ impl ScanReport {
         ];
 
         Self {
-            schema_version: "0.1.0".to_owned(),
+            schema_version: "0.1.1".to_owned(),
             scanner_version: env!("CARGO_PKG_VERSION").to_owned(),
             scan_id: Uuid::new_v4(),
             started_at: OffsetDateTime::now_utc(),
@@ -237,6 +245,7 @@ impl ScanReport {
             http: Vec::new(),
             tls: Vec::new(),
             findings: Vec::new(),
+            exposure_score: None,
             errors: Vec::new(),
             message:
                 "Surface repository initialized. Scanning functionality is not implemented yet."
