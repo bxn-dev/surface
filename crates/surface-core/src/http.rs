@@ -109,8 +109,9 @@ pub async fn analyze_http(
     cancellation: &CancellationToken,
 ) -> Vec<HttpObservation> {
     let candidates = services.iter().filter(|service| {
-        matches!(service.service, ServiceKind::Http | ServiceKind::Https)
-            || matches!(service.address.port(), 80 | 443 | 8000 | 8080 | 8443)
+        service.transport == crate::TransportProtocol::Tcp
+            && (matches!(service.service, ServiceKind::Http | ServiceKind::Https)
+                || matches!(service.address.port(), 80 | 443 | 8000 | 8080 | 8443))
     });
     let mut observations = stream::iter(candidates)
         .map(|service| inspect(target, service, request_timeout, cancellation.clone()))
@@ -473,6 +474,7 @@ mod tests {
         });
         let target = normalize_target("localhost").unwrap_or_else(|error| panic!("{error}"));
         let service = ServiceObservation {
+            transport: crate::TransportProtocol::Tcp,
             address,
             service: ServiceKind::Http,
             confidence: DetectionConfidence::High,
@@ -518,6 +520,7 @@ mod tests {
             trigger.cancel();
         });
         let service = ServiceObservation {
+            transport: crate::TransportProtocol::Tcp,
             address,
             service: ServiceKind::Http,
             confidence: DetectionConfidence::High,

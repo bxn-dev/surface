@@ -32,6 +32,15 @@ impl NormalizedTarget {
         self.explicit_ip.is_some_and(|ip| ip.is_loopback())
             || self.hostname.as_deref() == Some("localhost")
     }
+
+    /// Returns the canonical target identity.
+    #[must_use]
+    pub fn identity(&self) -> String {
+        self.hostname
+            .clone()
+            .or_else(|| self.explicit_ip.map(|ip| ip.to_string()))
+            .unwrap_or_else(|| self.original.clone())
+    }
 }
 
 /// Describes invalid target input.

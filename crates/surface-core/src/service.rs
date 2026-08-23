@@ -1,6 +1,7 @@
 //! Safe, bounded service identification.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -11,12 +12,12 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use crate::{HostObservation, PortState};
+use crate::{HostObservation, PortState, TransportProtocol};
 
 // Rust guideline compliant 2026-02-21
 
 const MAX_BANNER_BYTES: usize = 1_024;
-const MAX_SERVICE_ENDPOINTS: usize = 64;
+const MAX_SERVICE_ENDPOINTS: usize = 256;
 
 /// Identified application protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,24 +31,106 @@ pub enum ServiceKind {
     Ssh,
     /// Simple Mail Transfer Protocol.
     Smtp,
+    /// Message submission over implicit TLS.
+    Smtps,
     /// File Transfer Protocol.
     Ftp,
     /// Internet Message Access Protocol.
     Imap,
+    /// Internet Message Access Protocol over implicit TLS.
+    Imaps,
     /// Post Office Protocol version 3.
     Pop3,
+    /// Post Office Protocol version 3 over implicit TLS.
+    Pop3s,
+    /// Domain Name System.
+    Dns,
     /// Redis serialization protocol.
     Redis,
-    /// MySQL-compatible server greeting.
+    /// `MySQL`-compatible server greeting.
     Mysql,
-    /// PostgreSQL-compatible endpoint hint.
+    /// `PostgreSQL`-compatible endpoint hint.
     Postgresql,
     /// Message Queuing Telemetry Transport endpoint hint.
     Mqtt,
+    /// Microsoft SQL Server.
+    Mssql,
+    /// Oracle database listener.
+    Oracle,
+    /// `MongoDB` database.
+    Mongodb,
+    /// `Memcached` cache server.
+    Memcached,
+    /// `Elasticsearch` HTTP API.
+    Elasticsearch,
+    /// `RabbitMQ` message broker.
+    Rabbitmq,
+    /// Apache Kafka broker.
+    Kafka,
+    /// Apache Cassandra native protocol.
+    Cassandra,
+    /// `ClickHouse` database.
+    Clickhouse,
+    /// `Neo4j` Bolt protocol.
+    Neo4j,
+    /// Server Message Block.
+    Smb,
+    /// Network File System.
+    Nfs,
+    /// Remote Desktop Protocol.
+    Rdp,
+    /// Virtual Network Computing.
+    Vnc,
+    /// `Docker` remote API.
+    Docker,
+    /// `Kubernetes` API.
+    Kubernetes,
+    /// `Prometheus` metrics service.
+    Prometheus,
+    /// `Grafana` web service.
+    Grafana,
+    /// `WireGuard`-compatible UDP endpoint hint.
+    Wireguard,
+    /// Session Traversal Utilities for NAT or TURN.
+    StunTurn,
+    /// `NetBird` self-hosted endpoint hint.
+    Netbird,
+    /// `Minecraft` Java Edition server.
+    MinecraftJava,
+    /// `Minecraft` Bedrock Edition server.
+    MinecraftBedrock,
+    /// `Terraria` server.
+    Terraria,
+    /// `Valheim` server.
+    Valheim,
+    /// `Factorio` server.
+    Factorio,
+    /// Source Engine query endpoint.
+    SourceEngine,
     /// Generic TLS-wrapped service.
     Tls,
     /// No reliable protocol identification.
     Unknown,
+}
+
+impl fmt::Display for ServiceKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Smtps => "SMTPS",
+            Self::Imaps => "IMAPS",
+            Self::Pop3s => "POP3S",
+            Self::Dns => "DNS",
+            Self::Mssql => "MSSQL",
+            Self::Smb => "SMB",
+            Self::Nfs => "NFS",
+            Self::Rdp => "RDP",
+            Self::Vnc => "VNC",
+            Self::StunTurn => "STUN/TURN",
+            Self::SourceEngine => "Source Engine",
+            other => return write!(formatter, "{other:?}"),
+        };
+        formatter.write_str(name)
+    }
 }
 
 /// Confidence in protocol identification.
@@ -65,6 +148,9 @@ pub enum DetectionConfidence {
 /// Bounded service evidence for an open socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceObservation {
+    /// Observed network transport.
+    #[serde(default)]
+    pub transport: TransportProtocol,
     /// Open socket address.
     pub address: SocketAddr,
     /// Identified protocol.
@@ -86,17 +172,19 @@ pub async fn detect_services(
     probe_timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Vec<ServiceObservation> {
-    let addresses = hosts
+    let tcp_addresses = hosts
         .iter()
         .flat_map(|host| {
             host.ports
                 .iter()
-                .filter(|port| port.state == PortState::Open)
+                .filter(|port| {
+                    port.transport == TransportProtocol::Tcp && port.state == PortState::Open
+                })
                 .map(|port| port.address)
         })
-        .take(MAX_SERVICE_ENDPOINTS);
+        .collect::<Vec<_>>();
     let host = hostname.unwrap_or("localhost").to_owned();
-    let mut observations = stream::iter(addresses)
+    let mut observations = stream::iter(tcp_addresses.iter().copied().take(MAX_SERVICE_ENDPOINTS))
         .map(|address| probe(address, host.clone(), probe_timeout, cancellation.clone()))
         .buffer_unordered(concurrency.max(1))
         .collect::<Vec<_>>()
@@ -104,7 +192,42 @@ pub async fn detect_services(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    observations.sort_by_key(|observation| observation.address);
+    observations.extend(
+        tcp_addresses
+            .iter()
+            .copied()
+            .skip(MAX_SERVICE_ENDPOINTS)
+            .filter_map(|address| {
+                let observation = hint_observation(address);
+                (observation.service != ServiceKind::Unknown).then_some(observation)
+            }),
+    );
+    observations.extend(hosts.iter().flat_map(|host| {
+        host.ports.iter().filter_map(|port| {
+            if port.transport != TransportProtocol::Udp
+                || !matches!(port.state, PortState::Open | PortState::OpenFiltered)
+            {
+                return None;
+            }
+            let service = hinted_service(TransportProtocol::Udp, port.address.port());
+            (port.state == PortState::Open || service != ServiceKind::Unknown).then_some(
+                ServiceObservation {
+                    transport: TransportProtocol::Udp,
+                    address: port.address,
+                    service,
+                    confidence: if port.state == PortState::Open && service != ServiceKind::Unknown
+                    {
+                        DetectionConfidence::Medium
+                    } else {
+                        DetectionConfidence::Low
+                    },
+                    banner: None,
+                    protocol_details: BTreeMap::new(),
+                },
+            )
+        })
+    }));
+    observations.sort_by_key(|observation| (observation.address, observation.transport));
     observations
 }
 
@@ -156,6 +279,7 @@ async fn probe_inner(address: SocketAddr, hostname: &str) -> Option<ServiceObser
         BTreeMap::new()
     };
     Some(ServiceObservation {
+        transport: TransportProtocol::Tcp,
         address,
         service,
         confidence,
@@ -197,21 +321,9 @@ fn smtp_details(banner: &str) -> BTreeMap<String, String> {
 }
 
 fn hint_observation(address: SocketAddr) -> ServiceObservation {
-    let service = match address.port() {
-        21 => ServiceKind::Ftp,
-        25 | 587 => ServiceKind::Smtp,
-        80 | 8000 | 8080 | 8888 => ServiceKind::Http,
-        110 => ServiceKind::Pop3,
-        143 => ServiceKind::Imap,
-        443 | 8443 => ServiceKind::Https,
-        465 | 993 | 995 => ServiceKind::Tls,
-        1883 | 8883 => ServiceKind::Mqtt,
-        3306 => ServiceKind::Mysql,
-        5432 => ServiceKind::Postgresql,
-        6379 => ServiceKind::Redis,
-        _ => ServiceKind::Unknown,
-    };
+    let service = hinted_service(TransportProtocol::Tcp, address.port());
     ServiceObservation {
+        transport: TransportProtocol::Tcp,
         address,
         service,
         confidence: DetectionConfidence::Low,
@@ -240,12 +352,64 @@ fn classify_banner(banner: &str, port: u16) -> (ServiceKind, DetectionConfidence
         (ServiceKind::Mysql, DetectionConfidence::Medium)
     } else if matches!(port, 25 | 587) {
         (ServiceKind::Smtp, DetectionConfidence::Low)
-    } else if matches!(port, 443 | 8443) {
-        (ServiceKind::Https, DetectionConfidence::Low)
-    } else if matches!(port, 465 | 993 | 995) {
-        (ServiceKind::Tls, DetectionConfidence::Low)
     } else {
-        (ServiceKind::Unknown, DetectionConfidence::Low)
+        (
+            hinted_service(TransportProtocol::Tcp, port),
+            DetectionConfidence::Low,
+        )
+    }
+}
+
+// Curated from the IANA Service Name and Transport Protocol Port Number Registry,
+// the Wikipedia TCP/UDP port list retrieved 2026-08-23, and official vendor
+// documentation for NetBird, WireGuard, and game servers. These are unverified
+// hints only; protocol responses determine medium or high confidence.
+const fn hinted_service(transport: TransportProtocol, port: u16) -> ServiceKind {
+    match (transport, port) {
+        (TransportProtocol::Tcp, 21) => ServiceKind::Ftp,
+        (TransportProtocol::Tcp, 25 | 587) => ServiceKind::Smtp,
+        (TransportProtocol::Tcp | TransportProtocol::Udp, 53) => ServiceKind::Dns,
+        (TransportProtocol::Tcp, 80 | 8000 | 8080 | 8888) => ServiceKind::Http,
+        (TransportProtocol::Tcp, 110) => ServiceKind::Pop3,
+        (TransportProtocol::Tcp, 143) => ServiceKind::Imap,
+        (TransportProtocol::Tcp, 443 | 8443) => ServiceKind::Https,
+        (TransportProtocol::Tcp, 445) => ServiceKind::Smb,
+        (TransportProtocol::Tcp, 465) => ServiceKind::Smtps,
+        (TransportProtocol::Tcp, 993) => ServiceKind::Imaps,
+        (TransportProtocol::Tcp, 995) => ServiceKind::Pop3s,
+        (TransportProtocol::Tcp, 1433) => ServiceKind::Mssql,
+        (TransportProtocol::Tcp, 1521 | 2483 | 2484) => ServiceKind::Oracle,
+        (TransportProtocol::Tcp, 1883 | 8883) => ServiceKind::Mqtt,
+        (TransportProtocol::Tcp | TransportProtocol::Udp, 2049) => ServiceKind::Nfs,
+        (TransportProtocol::Tcp, 2375 | 2376) => ServiceKind::Docker,
+        (TransportProtocol::Tcp, 3306 | 33060) => ServiceKind::Mysql,
+        (TransportProtocol::Tcp | TransportProtocol::Udp, 3389) => ServiceKind::Rdp,
+        (TransportProtocol::Tcp, 5432) => ServiceKind::Postgresql,
+        (TransportProtocol::Tcp, 5671 | 5672 | 15671 | 15672) => ServiceKind::Rabbitmq,
+        (TransportProtocol::Tcp, 5900) => ServiceKind::Vnc,
+        (TransportProtocol::Tcp, 6379) => ServiceKind::Redis,
+        (TransportProtocol::Tcp, 6443) => ServiceKind::Kubernetes,
+        (TransportProtocol::Tcp, 7474 | 7687) => ServiceKind::Neo4j,
+        (TransportProtocol::Tcp | TransportProtocol::Udp, 7777) => ServiceKind::Terraria,
+        (TransportProtocol::Tcp, 8123 | 9000) => ServiceKind::Clickhouse,
+        (TransportProtocol::Tcp, 9090 | 9100) => ServiceKind::Prometheus,
+        (TransportProtocol::Tcp, 9092) => ServiceKind::Kafka,
+        (TransportProtocol::Tcp, 9042) => ServiceKind::Cassandra,
+        (TransportProtocol::Tcp, 9200 | 9300) => ServiceKind::Elasticsearch,
+        (TransportProtocol::Tcp | TransportProtocol::Udp, 11211) => ServiceKind::Memcached,
+        (TransportProtocol::Tcp | TransportProtocol::Udp, 19132 | 19133) => {
+            ServiceKind::MinecraftBedrock
+        }
+        (TransportProtocol::Udp, 2456..=2458) => ServiceKind::Valheim,
+        (TransportProtocol::Tcp, 25565) => ServiceKind::MinecraftJava,
+        (TransportProtocol::Udp, 27015) => ServiceKind::SourceEngine,
+        (TransportProtocol::Tcp, 27017) => ServiceKind::Mongodb,
+        (TransportProtocol::Udp, 34197) => ServiceKind::Factorio,
+        (TransportProtocol::Udp, 3478) => ServiceKind::StunTurn,
+        (TransportProtocol::Tcp, 3000) => ServiceKind::Grafana,
+        (TransportProtocol::Tcp, 33073 | 33080) => ServiceKind::Netbird,
+        (TransportProtocol::Udp, 51820) => ServiceKind::Wireguard,
+        _ => ServiceKind::Unknown,
     }
 }
 
@@ -270,8 +434,8 @@ pub fn sanitize_banner(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DetectionConfidence, ProbeBehavior, ServiceKind, classify_banner, probe_behavior,
-        sanitize_banner, smtp_details,
+        DetectionConfidence, ProbeBehavior, ServiceKind, classify_banner, hinted_service,
+        probe_behavior, sanitize_banner, smtp_details,
     };
 
     #[test]
@@ -304,6 +468,23 @@ mod tests {
             ProbeBehavior::Request(b"*1\r\n$4\r\nPING\r\n")
         ));
         assert!(matches!(probe_behavior(993), ProbeBehavior::TlsOnly));
+        assert_eq!(
+            hinted_service(crate::TransportProtocol::Tcp, 465),
+            ServiceKind::Smtps
+        );
+        assert_eq!(ServiceKind::Smtps.to_string(), "SMTPS");
+        assert_eq!(
+            hinted_service(crate::TransportProtocol::Tcp, 993),
+            ServiceKind::Imaps
+        );
+        assert_eq!(
+            hinted_service(crate::TransportProtocol::Udp, 51820),
+            ServiceKind::Wireguard
+        );
+        assert_eq!(
+            hinted_service(crate::TransportProtocol::Udp, 19132),
+            ServiceKind::MinecraftBedrock
+        );
         assert_eq!(classify_banner("220 FTP ready", 21).0, ServiceKind::Ftp);
         assert_eq!(
             classify_banner("+OK capability list", 110).0,

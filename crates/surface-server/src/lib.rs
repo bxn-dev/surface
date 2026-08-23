@@ -31,6 +31,10 @@ use uuid::Uuid;
 
 const SESSION_COOKIE: &str = "surface_session";
 const MAX_PAGE: u32 = 200;
+/// Two-hour upper bound keeps complete scans finite.
+const MAX_HOSTED_GLOBAL_TIMEOUT_MS: u64 = 7_200_000;
+/// Maximum scan duration plus a minute for persistence and queue bookkeeping.
+const SCAN_JOB_LEASE_SECONDS: i64 = 7_260;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -226,7 +230,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/audit", get(audit))
         .route("/", get(web_index))
         .route("/web/scans", get(web_scans))
-        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)
 }
 
@@ -595,7 +599,7 @@ pub async fn run_worker(state: AppState, worker_id: String, cancellation: Cancel
         let job = state.storage.lock().ok().and_then(|mut storage| {
             let _ = storage.materialize_due_schedules(now);
             storage
-                .claim_scan_job(&worker_id, now, 1_200)
+                .claim_scan_job(&worker_id, now, SCAN_JOB_LEASE_SECONDS)
                 .ok()
                 .flatten()
         });
@@ -768,16 +772,19 @@ fn normalized_target(target: &NormalizedTarget) -> String {
 }
 
 fn validate_hosted_configuration(configuration: &ScanConfiguration) -> Result<(), ApiError> {
-    if configuration.ports.is_empty()
-        || configuration.ports.len() > 1_024
+    if (configuration.ports.is_empty() && configuration.udp_ports.is_empty())
+        || configuration.ports.len() > 65_535
+        || configuration.udp_ports.len() > 65_535
+        || configuration.ports.contains(&0)
+        || configuration.udp_ports.contains(&0)
         || configuration.concurrency == 0
-        || configuration.concurrency > 64
+        || configuration.concurrency > 512
         || configuration.connect_timeout_ms == 0
         || configuration.connect_timeout_ms > 10_000
         || configuration.request_timeout_ms == 0
         || configuration.request_timeout_ms > 30_000
         || configuration.global_timeout_ms == 0
-        || configuration.global_timeout_ms > 900_000
+        || configuration.global_timeout_ms > MAX_HOSTED_GLOBAL_TIMEOUT_MS
     {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -962,10 +969,9 @@ const fn internal() -> ApiError {
 #[cfg(test)]
 mod tests {
     use axum::{
-        body::Body,
+        body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
-    use http_body_util::BodyExt as _;
     use surface_core::{ScanConfiguration, ScanReport, normalize_target};
     use surface_storage::{ActorContext, Role, Storage};
     use tempfile::tempdir;
@@ -979,6 +985,7 @@ mod tests {
             normalize_target("example.com").unwrap_or_else(|error| panic!("{error}")),
             ScanConfiguration {
                 ports: vec![443],
+                udp_ports: Vec::new(),
                 concurrency: 1,
                 connect_timeout_ms: 100,
                 request_timeout_ms: 100,
@@ -1007,12 +1014,9 @@ mod tests {
             .and_then(|value| value.split(';').next())
             .unwrap_or_else(|| panic!("session cookie required"))
             .to_owned();
-        let body = response
-            .into_body()
-            .collect()
+        let body = to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap_or_else(|error| panic!("{error}"))
-            .to_bytes();
+            .unwrap_or_else(|error| panic!("{error}"));
         let login = serde_json::from_slice(&body).unwrap_or_else(|error| panic!("{error}"));
         (cookie, login)
     }

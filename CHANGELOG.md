@@ -4,6 +4,13 @@ All notable changes are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Added bounded TCP and UDP scanning across `1-65535`, transport-aware reports, truthful UDP `open|filtered` states, and curated service hints for infrastructure, databases, VPNs, and game servers.
+- Added precise encrypted-service names such as SMTPS, IMAPS, and POP3S; bumped report and crate versions to `0.3.0`.
+- Removed redundant scan-stage implementation flags in report schema `0.2.0`.
+- Consolidated target identity, HTML escaping, service mapping, and change sorting.
+
 ### Added
 
 - Authenticated tenant-scoped hosted API and minimal web UI with Argon2id, opaque sessions/API tokens, centralized roles, CSRF/origin checks, and audit access.

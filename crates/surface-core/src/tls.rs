@@ -80,7 +80,11 @@ pub async fn analyze_tls(
         .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let connector = TlsConnector::from(Arc::new(config));
-    let mut observations = stream::iter(services.iter().map(|service| service.address))
+    let addresses = services
+        .iter()
+        .filter(|service| service.transport == crate::TransportProtocol::Tcp)
+        .map(|service| service.address);
+    let mut observations = stream::iter(addresses)
         .map(|address| {
             inspect(
                 connector.clone(),
@@ -263,6 +267,7 @@ mod tests {
             let _ = acceptor.accept(stream).await;
         });
         let service = ServiceObservation {
+            transport: crate::TransportProtocol::Tcp,
             address,
             service: ServiceKind::Https,
             confidence: DetectionConfidence::High,

@@ -42,9 +42,11 @@ pub use intelligence::{
     NetworkMetadata, SubdomainObservation, VulnerabilityEntry, analyze_intelligence, parse_bundle,
 };
 #[doc(inline)]
-pub use ports::{PortSelection, PortSpecError, parse_ports};
+pub use ports::{PortSelection, PortSpecError, parse_ports, parse_udp_ports};
 #[doc(inline)]
-pub use scanner::{HostObservation, PortObservation, PortState, scan_ports};
+pub use scanner::{
+    HostObservation, PortObservation, PortState, TransportProtocol, scan_ports, scan_udp_ports,
+};
 #[doc(inline)]
 pub use service::{
     DetectionConfidence, ServiceKind, ServiceObservation, detect_services, sanitize_banner,
@@ -78,7 +80,7 @@ pub enum ScanStatus {
 pub enum ScanStage {
     /// Passive DNS collection.
     Dns,
-    /// TCP connect scanning.
+    /// TCP connect and UDP response scanning.
     Ports,
     /// Safe service identification.
     Services,
@@ -147,21 +149,15 @@ impl ScanError {
     }
 }
 
-/// Records implementation state without fabricating observations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StageState {
-    /// Planned stage.
-    pub stage: ScanStage,
-    /// Whether this release implements the stage.
-    pub implemented: bool,
-}
-
 /// Captures effective Phase 1 scan settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanConfiguration {
     /// Sorted TCP ports selected by the user.
     pub ports: Vec<u16>,
-    /// Maximum simultaneous TCP connections.
+    /// Sorted UDP ports selected by the user.
+    #[serde(default)]
+    pub udp_ports: Vec<u16>,
+    /// Maximum simultaneous network probes.
     pub concurrency: usize,
     /// Per-connection timeout in milliseconds.
     pub connect_timeout_ms: u64,
@@ -196,8 +192,6 @@ pub struct ScanReport {
     pub configuration: ScanConfiguration,
     /// Current scan lifecycle state.
     pub status: ScanStatus,
-    /// Explicit state for each future stage.
-    pub stages: Vec<StageState>,
     /// Passive DNS observations when that stage ran.
     pub dns: Option<DnsObservation>,
     /// Deterministic TCP observations by address.
@@ -226,17 +220,8 @@ impl ScanReport {
     /// Creates a report that explicitly records no scanning activity.
     #[must_use]
     pub fn not_started(target: NormalizedTarget, configuration: ScanConfiguration) -> Self {
-        const STAGES: [ScanStage; 6] = [
-            ScanStage::Dns,
-            ScanStage::Ports,
-            ScanStage::Services,
-            ScanStage::Http,
-            ScanStage::Tls,
-            ScanStage::Findings,
-        ];
-
         Self {
-            schema_version: "0.1.2".to_owned(),
+            schema_version: "0.3.0".to_owned(),
             scanner_version: env!("CARGO_PKG_VERSION").to_owned(),
             scan_id: Uuid::new_v4(),
             started_at: OffsetDateTime::now_utc(),
@@ -244,13 +229,6 @@ impl ScanReport {
             target,
             configuration,
             status: ScanStatus::NotStarted,
-            stages: STAGES
-                .into_iter()
-                .map(|stage| StageState {
-                    stage,
-                    implemented: true,
-                })
-                .collect(),
             dns: None,
             hosts: Vec::new(),
             services: Vec::new(),
@@ -260,9 +238,7 @@ impl ScanReport {
             exposure_score: None,
             intelligence: None,
             errors: Vec::new(),
-            message:
-                "Surface repository initialized. Scanning functionality is not implemented yet."
-                    .to_owned(),
+            message: "Scan has not started.".to_owned(),
         }
     }
 }
@@ -278,6 +254,7 @@ mod tests {
             target,
             ScanConfiguration {
                 ports: vec![80, 443],
+                udp_ports: vec![53],
                 concurrency: 64,
                 connect_timeout_ms: 1_500,
                 request_timeout_ms: 5_000,
@@ -289,8 +266,7 @@ mod tests {
         );
 
         assert_eq!(report.status, ScanStatus::NotStarted);
-        assert!(report.stages.iter().any(|stage| stage.implemented));
         assert!(report.dns.is_none());
-        assert!(report.message.contains("not implemented"));
+        assert_eq!(report.message, "Scan has not started.");
     }
 }

@@ -127,8 +127,8 @@ const fn classification(value: u8) -> ScoreClassification {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Finding, FindingCategory, FindingConfidence, ScanConfiguration, ScanReport, ScanStatus,
-        Severity, normalize_target,
+        normalize_target, Finding, FindingCategory, FindingConfidence, ScanConfiguration,
+        ScanReport, ScanStatus, Severity,
     };
 
     use super::calculate_exposure;
@@ -138,6 +138,7 @@ mod tests {
             normalize_target("example.com").unwrap_or_else(|error| panic!("{error}")),
             ScanConfiguration {
                 ports: vec![443],
+                udp_ports: Vec::new(),
                 concurrency: 1,
                 connect_timeout_ms: 100,
                 request_timeout_ms: 100,

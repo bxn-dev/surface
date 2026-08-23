@@ -1,6 +1,6 @@
 # Report schema
 
-Surface JSON reports use schema version `0.1.2`. Reports from `0.1.0` and `0.1.1` remain readable because score and intelligence fields are additive and default when absent.
+Surface JSON reports use schema version `0.3.0`. Reports from `0.1.x` and `0.2.0` remain readable. Version `0.3.0` adds UDP selections and transport-aware port and service observations.
 
 Top-level fields:
 
@@ -11,12 +11,11 @@ Top-level fields:
 | `scan_id` | UUID identifying this execution |
 | `started_at`, `completed_at` | UTC execution timestamps |
 | `target` | Original and normalized target metadata |
-| `configuration` | Effective ports, timeouts, concurrency, address-family and authorization settings |
+| `configuration` | Effective TCP/UDP ports, timeouts, concurrency, address-family and authorization settings |
 | `status` | `not_started`, `completed`, `partial`, `interrupted`, or `failed` |
-| `stages` | Explicit implementation state |
 | `dns` | Raw DNS, primary-host addresses, passive mail interpretation, and DNS errors |
-| `hosts` | Sorted TCP observations including conservative states |
-| `services` | Sanitized/capped protocol evidence |
+| `hosts` | Sorted transport-aware observations; UDP silence is `open_filtered`, never `open` |
+| `services` | Sanitized/capped protocol evidence and explicitly low-confidence port hints |
 | `http` | Bounded redirects, headers, cookies without values, metadata, and endpoint errors |
 | `tls` | Validating handshake, negotiated protocol, and parsed leaf-certificate metadata |
 | `findings` | Stable evidence-backed interpretations sorted by severity and ID |

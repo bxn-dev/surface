@@ -153,13 +153,14 @@ fn exposure_findings(
     services: &[ServiceObservation],
     findings: &mut Vec<Finding>,
 ) {
-    const DATABASE_PORTS: &[u16] = &[1433, 1521, 3306, 5432, 6379, 9200, 11211, 27017];
+    const DATABASE_PORTS: &[u16] = &[
+        1433, 1521, 2483, 2484, 3306, 5432, 6379, 7474, 7687, 8123, 9000, 9042, 9200, 11211, 27017,
+        33060,
+    ];
     for host in hosts {
-        for port in host
-            .ports
-            .iter()
-            .filter(|port| port.state == PortState::Open)
-        {
+        for port in host.ports.iter().filter(|port| {
+            port.transport == crate::TransportProtocol::Tcp && port.state == PortState::Open
+        }) {
             if DATABASE_PORTS.contains(&port.address.port()) {
                 findings.push(finding(
                     "NET-DATABASE-EXPOSED",
@@ -407,7 +408,7 @@ fn finding(
 
 #[cfg(test)]
 mod tests {
-    use super::{Severity, generate_findings};
+    use super::{generate_findings, Severity};
     use crate::{
         AddressSource, DnsObservation, DnsRecord, MailObservation, ResolvedHost, SpfObservation,
     };

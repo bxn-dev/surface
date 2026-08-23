@@ -10,14 +10,16 @@ Surface is **not** a complete vulnerability scanner, penetration-testing framewo
 ## Example
 
 ```text
-Surface 0.1.0
+Surface 0.3.0
 Target: example.com
 Status: Completed
 
 Hosts
   203.0.113.10
     80/tcp  open  Http
-    443/tcp open  Https
+    443/tcp  open  Https
+    465/tcp  open  SMTPS
+    51820/udp open|filtered Wireguard
 
 Findings
   MEDIUM   HSTS header missing — example.com
@@ -31,9 +33,9 @@ Example addresses are documentation-only; tests and CI never scan public infrast
 - IDNA-aware domain, URL, IPv4, and IPv6 normalization
 - A, AAAA, CNAME, NS, MX, TXT, and CAA observations
 - conservative SPF, DMARC, MTA-STS, and TLS-RPT interpretation
-- bounded Tokio TCP connect scanning with per-operation/global timeouts
+- bounded Tokio TCP connect and UDP response scanning across selectable or complete port ranges
 - graceful Ctrl+C cancellation with partial reports
-- centralized bounded probes for HTTP, SSH, SMTP, FTP, IMAP, POP3, Redis, MySQL, and TLS service hints
+- centralized bounded probes and curated service hints for web, mail, databases, VPNs, infrastructure, and game servers
 - bounded HTTP redirects/bodies, selected headers, cookie flags, title and well-known files
 - validating Rustls TLS handshakes and certificate metadata
 - evidence-backed findings separated from raw observations
@@ -59,7 +61,8 @@ cargo build --release
 ```bash
 surface scan example.com --acknowledge-authorization
 surface scan https://example.com/path --ports 80,443,8000-8100 --acknowledge-authorization
-surface scan 127.0.0.1 --ports 1-1000 --global-timeout 30s
+surface scan 127.0.0.1 --ports 1-1000 --udp-ports 1-1000 --global-timeout 30s
+surface scan 127.0.0.1 --ports all --udp-ports all --concurrency 512 --global-timeout 120m
 surface scan example.com --format json --output report.json --acknowledge-authorization
 surface scan example.com --format html --output report.html --acknowledge-authorization
 surface scan example.com --format sarif --output report.sarif.json --acknowledge-authorization
@@ -77,14 +80,16 @@ surface database verify --database ./surface.backup.db
 surface completion bash > surface.bash
 ```
 
-Defaults: `--ports common`, `--concurrency 64`, `--connect-timeout 1500ms`, `--request-timeout 5s`, `--global-timeout 5m`.
+Defaults: `--ports common`, `--udp-ports common`, `--concurrency 64`, `--connect-timeout 1500ms`, `--request-timeout 5s`, `--global-timeout 5m`.
+
+UDP silence is reported as `open|filtered`, never as definitively open. Port-based service names are low-confidence hints until a protocol response confirms them.
 
 Logs use stderr; report data uses stdout or `--output`. `RUST_LOG` overrides the default log filter. SQLite persistence is optional: ordinary one-shot scans do not open or require a database.
 
 ## Reports
 
 - **terminal** — concise observations, open ports, findings, and counts
-- **json** — schema `0.1.1`, complete structured observations/findings/errors/score
+- **json** — schema `0.3.0`, complete transport-aware observations/findings/errors/score
 - **html** — responsive, print-friendly, self-contained, no remote assets or scripts
 - **sarif** — SARIF 2.1.0 findings for code-scanning integrations
 - **cyclonedx-json** — CycloneDX 1.6 observed-service inventory and vulnerabilities

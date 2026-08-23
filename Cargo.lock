@@ -2067,7 +2067,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surface-cli"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2085,7 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "surface-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "futures",
  "hickory-proto",
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "surface-report"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
  "serde",
@@ -2119,13 +2119,12 @@ dependencies = [
 
 [[package]]
 name = "surface-server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "axum",
  "clap",
  "hmac",
- "http-body-util",
  "rand 0.9.5",
  "reqwest",
  "serde",
@@ -2147,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "surface-storage"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde",

@@ -1,10 +1,10 @@
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use surface_core::ScanReport;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::{Error, HistoryFilter, ScanSummary, Storage, scan_summary};
+use super::{scan_summary, Error, HistoryFilter, ScanSummary, Storage};
 
 const MAX_AUDIT_PAGE: u32 = 500;
 
@@ -214,14 +214,6 @@ impl Storage {
             )
             .map_err(|error| Error::with_source("could not create session", error))?;
         Ok(session_id)
-    }
-
-    pub fn authenticate_session(
-        &self,
-        token_hash: &[u8],
-        now: i64,
-    ) -> Result<Option<AuthenticatedActor>, Error> {
-        self.authenticate_session_with_csrf(token_hash, None, now)
     }
 
     pub fn authenticate_session_with_csrf(
@@ -542,7 +534,7 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
-    use surface_core::{ScanConfiguration, ScanReport, normalize_target};
+    use surface_core::{normalize_target, ScanConfiguration, ScanReport};
     use tempfile::tempdir;
 
     use super::{ActorContext, AuditFilter, AuthenticatedActor, Role, TenantId};
@@ -553,6 +545,7 @@ mod tests {
             normalize_target(target).unwrap_or_else(|error| panic!("{error}")),
             ScanConfiguration {
                 ports: vec![443],
+                udp_ports: Vec::new(),
                 concurrency: 1,
                 connect_timeout_ms: 100,
                 request_timeout_ms: 100,
@@ -588,18 +581,14 @@ mod tests {
         storage
             .create_session(&actor, &[1; 32], &[2; 32], i64::MAX)
             .unwrap_or_else(|error| panic!("{error}"));
-        assert!(
-            storage
-                .authenticate_session(&[1; 32], 0)
-                .unwrap_or_default()
-                .is_some()
-        );
-        assert!(
-            storage
-                .authenticate_session(&[1; 32], i64::MAX)
-                .unwrap_or_default()
-                .is_none()
-        );
+        assert!(storage
+            .authenticate_session_with_csrf(&[1; 32], None, 0)
+            .unwrap_or_default()
+            .is_some());
+        assert!(storage
+            .authenticate_session_with_csrf(&[1; 32], None, i64::MAX)
+            .unwrap_or_default()
+            .is_none());
         assert!(storage.delete_session(&[1; 32]).unwrap_or(false));
     }
 
@@ -624,18 +613,14 @@ mod tests {
         storage
             .persist_report_for(&actor, &report, "api")
             .unwrap_or_else(|error| panic!("{error}"));
-        assert!(
-            storage
-                .report_for(&tenant, report.scan_id)
-                .unwrap_or_default()
-                .is_some()
-        );
-        assert!(
-            storage
-                .report_for(&other, report.scan_id)
-                .unwrap_or_default()
-                .is_none()
-        );
+        assert!(storage
+            .report_for(&tenant, report.scan_id)
+            .unwrap_or_default()
+            .is_some());
+        assert!(storage
+            .report_for(&other, report.scan_id)
+            .unwrap_or_default()
+            .is_none());
         assert_eq!(
             storage
                 .history_for(&tenant, &HistoryFilter::default())
@@ -643,28 +628,22 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
-            storage
-                .history_for(&other, &HistoryFilter::default())
-                .unwrap_or_default()
-                .is_empty()
-        );
-        assert!(
-            !storage
-                .delete_scan_for(
-                    &ActorContext {
-                        tenant_id: other.clone(),
-                        ..actor.clone()
-                    },
-                    report.scan_id
-                )
-                .unwrap_or(true)
-        );
-        assert!(
-            storage
-                .delete_scan_for(&actor, report.scan_id)
-                .unwrap_or(false)
-        );
+        assert!(storage
+            .history_for(&other, &HistoryFilter::default())
+            .unwrap_or_default()
+            .is_empty());
+        assert!(!storage
+            .delete_scan_for(
+                &ActorContext {
+                    tenant_id: other.clone(),
+                    ..actor.clone()
+                },
+                report.scan_id
+            )
+            .unwrap_or(true));
+        assert!(storage
+            .delete_scan_for(&actor, report.scan_id)
+            .unwrap_or(false));
         assert_eq!(
             storage
                 .audit_events_for(&tenant, &AuditFilter::default())

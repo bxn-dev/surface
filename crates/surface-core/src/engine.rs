@@ -7,16 +7,16 @@ use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    NormalizedTarget, ScanConfiguration, ScanError, ScanErrorKind, ScanReport, ScanStage,
-    ScanStatus, analyze_http, analyze_tls, calculate_exposure, detect_services, generate_findings,
-    scan_ports,
+    HostObservation, NormalizedTarget, ScanConfiguration, ScanError, ScanErrorKind, ScanReport,
+    ScanStage, ScanStatus, analyze_http, analyze_tls, calculate_exposure, detect_services,
+    generate_findings, scan_ports, scan_udp_ports,
 };
 
 // Rust guideline compliant 2026-02-21
 
-const MAX_ACTIVE_ENDPOINTS: usize = 64;
+const MAX_ACTIVE_ENDPOINTS: usize = 256;
 
-/// Runs implemented passive DNS and TCP stages.
+/// Runs implemented passive DNS, TCP, and UDP stages.
 #[must_use]
 pub async fn run_scan(
     target: NormalizedTarget,
@@ -81,7 +81,7 @@ async fn run_scan_inner(
         );
         return report;
     }
-    "Scan started; unimplemented stages remain explicitly marked.".clone_into(&mut report.message);
+    "Scan started.".clone_into(&mut report.message);
 
     let dns_timeout = Duration::from_millis(report.configuration.request_timeout_ms);
     let dns_future = crate::dns::analyze_dns_with_policy(
@@ -148,16 +148,29 @@ async fn run_scan_inner(
         return report;
     }
 
-    let ports_future = scan_ports(
-        &addresses,
-        &report.configuration.ports,
-        report.configuration.concurrency,
-        Duration::from_millis(report.configuration.connect_timeout_ms),
-        &cancellation,
-    );
+    let probe_concurrency = report.configuration.concurrency.div_ceil(2).max(1);
+    let ports_future = async {
+        let (tcp, udp) = tokio::join!(
+            scan_ports(
+                &addresses,
+                &report.configuration.ports,
+                probe_concurrency,
+                Duration::from_millis(report.configuration.connect_timeout_ms),
+                &cancellation,
+            ),
+            scan_udp_ports(
+                &addresses,
+                &report.configuration.udp_ports,
+                probe_concurrency,
+                Duration::from_millis(report.configuration.connect_timeout_ms),
+                &cancellation,
+            )
+        );
+        merge_hosts(tcp, udp)
+    };
     let hosts = tokio::select! {
         () = cancellation.cancelled() => {
-            interrupt(&mut report, "scan interrupted during TCP connect scanning");
+            interrupt(&mut report, "scan interrupted during port scanning");
             return report;
         }
         result = timeout_at(deadline, ports_future) => result,
@@ -165,10 +178,7 @@ async fn run_scan_inner(
     if let Ok(hosts) = hosts {
         report.hosts = hosts;
     } else {
-        fail_timeout(
-            &mut report,
-            "global timeout expired during TCP connect scanning",
-        );
+        fail_timeout(&mut report, "global timeout expired during port scanning");
         return report;
     }
 
@@ -183,7 +193,7 @@ async fn run_scan_inner(
             ScanStage::Services,
             report.target.hostname.clone(),
             ScanErrorKind::Other,
-            format!("active endpoint analysis truncated at {MAX_ACTIVE_ENDPOINTS}"),
+            format!("active protocol probing truncated at {MAX_ACTIVE_ENDPOINTS} endpoints"),
             true,
         ));
     }
@@ -265,6 +275,20 @@ async fn run_scan_inner(
         .clone_into(&mut report.message);
     report.completed_at = Some(time::OffsetDateTime::now_utc());
     report
+}
+
+fn merge_hosts(mut tcp: Vec<HostObservation>, udp: Vec<HostObservation>) -> Vec<HostObservation> {
+    for udp_host in udp {
+        if let Some(host) = tcp.iter_mut().find(|host| host.ip == udp_host.ip) {
+            host.ports.extend(udp_host.ports);
+            host.ports
+                .sort_by_key(|port| (port.address.port(), port.transport));
+        } else {
+            tcp.push(udp_host);
+        }
+    }
+    tcp.sort_by_key(|host| host.ip);
+    tcp
 }
 
 fn incompatible_address_family(report: &ScanReport) -> bool {
@@ -356,6 +380,7 @@ mod tests {
             target,
             ScanConfiguration {
                 ports: vec![9],
+                udp_ports: Vec::new(),
                 concurrency: 1,
                 connect_timeout_ms: 100,
                 request_timeout_ms: 100,
@@ -382,6 +407,7 @@ mod tests {
             normalize_target("127.0.0.1").unwrap_or_else(|error| panic!("{error}")),
             ScanConfiguration {
                 ports: vec![9],
+                udp_ports: Vec::new(),
                 concurrency: 1,
                 connect_timeout_ms: 100,
                 request_timeout_ms: 100,
@@ -402,6 +428,7 @@ mod tests {
             normalize_target("192.0.2.1").unwrap_or_else(|error| panic!("{error}")),
             ScanConfiguration {
                 ports: vec![80],
+                udp_ports: Vec::new(),
                 concurrency: 1,
                 connect_timeout_ms: 100,
                 request_timeout_ms: 100,
@@ -423,6 +450,7 @@ mod tests {
             normalize_target("::1").unwrap_or_else(|error| panic!("{error}")),
             ScanConfiguration {
                 ports: vec![80],
+                udp_ports: Vec::new(),
                 concurrency: 1,
                 connect_timeout_ms: 100,
                 request_timeout_ms: 100,

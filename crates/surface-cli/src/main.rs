@@ -8,7 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use clap_complete::Shell;
 use surface_core::{
     ScanConfiguration, ScanReport, ScanStatus, Severity, analyze_intelligence, normalize_target,
-    parse_bundle, parse_ports, run_scan,
+    parse_bundle, parse_ports, parse_udp_ports, run_scan,
 };
 use surface_report::{
     decode_key, diff_reports, render_cyclonedx, render_diff_html, render_diff_json,
@@ -78,10 +78,13 @@ enum Command {
 struct ScanArgs {
     /// Domain, hostname, HTTP(S) URL, or IP address to assess.
     target: String,
-    /// Named preset, comma-separated ports, or inclusive ranges.
+    /// TCP preset (`common` or `all`), comma-separated ports, or ranges.
     #[arg(long, default_value = "common")]
     ports: String,
-    /// Maximum simultaneous TCP connections.
+    /// UDP preset (`common` or `all`), comma-separated ports, or ranges.
+    #[arg(long, default_value = "common")]
+    udp_ports: String,
+    /// Maximum simultaneous network probes.
     #[arg(long, default_value_t = 64)]
     concurrency: usize,
     /// Per-connection timeout, such as 1500ms or 2s.
@@ -390,6 +393,8 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
     }
     let ports = parse_ports(&arguments.ports)
         .map_err(|error| AppError::new(error.to_string(), EXIT_INVALID_INPUT))?;
+    let udp_ports = parse_udp_ports(&arguments.udp_ports)
+        .map_err(|error| AppError::new(error.to_string(), EXIT_INVALID_INPUT))?;
     if !target.is_local() && !arguments.acknowledge_authorization {
         return Err(AppError::new(
             "active scanning requires --acknowledge-authorization for non-loopback targets",
@@ -398,6 +403,7 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
     }
     let configuration = ScanConfiguration {
         ports: ports.as_slice().to_vec(),
+        udp_ports: udp_ports.as_slice().to_vec(),
         concurrency: arguments.concurrency,
         connect_timeout_ms: duration_millis(arguments.connect_timeout)?,
         request_timeout_ms: duration_millis(arguments.request_timeout)?,
@@ -962,6 +968,7 @@ mod tests {
             surface_core::normalize_target("127.0.0.1").unwrap_or_else(|error| panic!("{error}")),
             surface_core::ScanConfiguration {
                 ports: vec![80],
+                udp_ports: Vec::new(),
                 concurrency: 1,
                 connect_timeout_ms: 100,
                 request_timeout_ms: 100,

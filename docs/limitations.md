@@ -1,7 +1,8 @@
 # Limitations
 
 - A TCP timeout records only that the connection deadline elapsed; it does not prove firewall filtering.
-- Service identification uses safe banners, fixed read-only protocol discovery exchanges, TLS success, and port hints. Results can remain uncertain; MySQL, PostgreSQL, MQTT, and generic TLS hints do not prove product identity.
+- UDP is connectionless: a response proves reachability, an ICMP rejection can prove closure, but silence is reported as `open|filtered`. WireGuard intentionally ignores unauthenticated probes, so port 51820 can remain only a hint.
+- Service identification uses safe banners, fixed read-only protocol discovery exchanges, TLS success, and port hints. Port assignments—including Wikipedia/IANA/vendor-derived names—are candidates, not proof; shared and customized ports remain ambiguous.
 - CDN and reverse-proxy addresses may represent edge infrastructure rather than an origin server.
 - HTTP security-header and cookie recommendations depend on application context. Header presence alone does not prove quality.
 - Surface does not crawl, brute-force directories, authenticate, fuzz, exploit, deliver payloads, evade controls, or test denial of service.

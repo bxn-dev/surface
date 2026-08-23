@@ -399,7 +399,7 @@ mod tests {
 
     use crate::{
         DetectionConfidence, HostObservation, PortObservation, PortState, ScanConfiguration,
-        ScanReport, ServiceKind, ServiceObservation, normalize_target,
+        ScanReport, ServiceKind, ServiceObservation, TransportProtocol, normalize_target,
     };
 
     use super::{analyze_intelligence, correlate_cves, correlate_networks, parse_bundle};
@@ -409,6 +409,7 @@ mod tests {
             normalize_target("example.com").unwrap_or_else(|error| panic!("{error}")),
             ScanConfiguration {
                 ports: vec![22],
+                udp_ports: Vec::new(),
                 concurrency: 1,
                 connect_timeout_ms: 100,
                 request_timeout_ms: 100,
@@ -422,6 +423,7 @@ mod tests {
         report.hosts.push(HostObservation {
             ip: address.ip(),
             ports: vec![PortObservation {
+                transport: TransportProtocol::Tcp,
                 address,
                 state: PortState::Open,
                 latency_ms: None,
@@ -429,6 +431,7 @@ mod tests {
             }],
         });
         report.services.push(ServiceObservation {
+            transport: TransportProtocol::Tcp,
             address,
             service: ServiceKind::Ssh,
             confidence: DetectionConfidence::High,

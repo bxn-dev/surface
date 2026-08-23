@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags};
 use uuid::Uuid;
 
-use super::{Error, MIGRATIONS, secure_database};
+use super::{secure_database, Error, MIGRATIONS};
 
 /// Creates an integrity-checked, atomic `SQLite` backup.
 ///

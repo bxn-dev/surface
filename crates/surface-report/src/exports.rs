@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use surface_core::{Finding, ScanReport, Severity};
 
 // Rust guideline compliant 2026-02-21
@@ -101,11 +101,11 @@ pub fn render_sarif(report: &ScanReport) -> Result<String, serde_json::Error> {
 /// Returns an error if JSON serialization fails.
 pub fn render_cyclonedx(report: &ScanReport) -> Result<String, serde_json::Error> {
     let mut services = report.services.iter().collect::<Vec<_>>();
-    services.sort_by_key(|service| service.address);
+    services.sort_by_key(|service| (service.address, service.transport));
     let services = services
         .into_iter()
         .map(|service| {
-            let service_name = format!("{:?}", service.service).to_ascii_lowercase();
+            let service_name = service.service.to_string();
             let mut properties = vec![
                 property(
                     "surface:detection-confidence",
@@ -122,9 +122,9 @@ pub fn render_cyclonedx(report: &ScanReport) -> Result<String, serde_json::Error
                     .map(|(name, value)| property(&format!("surface:protocol:{name}"), value)),
             );
             json!({
-                "bom-ref": service_ref(service.address, &service_name),
+                "bom-ref": service_ref(service.address, service.transport.as_str(), &service_name),
                 "name": format!("Externally observed {service_name} service"),
-                "endpoints": [format!("tcp://{}", service.address)],
+                "endpoints": [format!("{}://{}", service.transport.as_str(), service.address)],
                 "authenticated": false,
                 "properties": properties,
             })
@@ -158,12 +158,7 @@ pub fn render_cyclonedx(report: &ScanReport) -> Result<String, serde_json::Error
             })
         })
         .collect::<Vec<_>>();
-    let target = report
-        .target
-        .hostname
-        .clone()
-        .or_else(|| report.target.explicit_ip.map(|ip| ip.to_string()))
-        .unwrap_or_else(|| report.target.original.clone());
+    let target = report.target.identity();
     let document = json!({
         "$schema": "https://cyclonedx.org/schema/bom-1.6.schema.json",
         "bomFormat": "CycloneDX",
@@ -214,8 +209,8 @@ fn synthetic_target_uri(report: &ScanReport, finding_target: &str) -> String {
     format!("surface://{host}/{context}")
 }
 
-fn service_ref(address: std::net::SocketAddr, service: &str) -> String {
-    format!("surface-service:{address}/{service}")
+fn service_ref(address: std::net::SocketAddr, transport: &str, service: &str) -> String {
+    format!("surface-service:{transport}:{address}/{service}")
 }
 
 fn property(name: &str, value: &str) -> Value {
@@ -254,8 +249,8 @@ const fn security_severity(severity: Severity) -> &'static str {
 mod tests {
     use serde_json::Value;
     use surface_core::{
-        Finding, FindingCategory, FindingConfidence, ScanConfiguration, ScanReport, Severity,
-        normalize_target,
+        normalize_target, Finding, FindingCategory, FindingConfidence, ScanConfiguration,
+        ScanReport, Severity,
     };
 
     use super::{render_cyclonedx, render_sarif};
@@ -265,6 +260,7 @@ mod tests {
             normalize_target("example.com").unwrap_or_else(|error| panic!("{error}")),
             ScanConfiguration {
                 ports: vec![443],
+                udp_ports: Vec::new(),
                 concurrency: 1,
                 connect_timeout_ms: 100,
                 request_timeout_ms: 100,

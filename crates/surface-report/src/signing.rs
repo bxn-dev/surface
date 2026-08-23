@@ -125,7 +125,7 @@ const fn digit(value: u8) -> Option<u8> {
 mod tests {
     use ed25519_dalek::SigningKey;
 
-    use super::{SignatureEnvelope, VerificationError, sign_bytes, verify_bytes};
+    use super::{sign_bytes, verify_bytes, SignatureEnvelope, VerificationError};
 
     #[test]
     fn exact_bytes_are_signed_and_changes_fail() {

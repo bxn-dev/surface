@@ -10,12 +10,12 @@ use surface_core::{PortState, ScanReport, Severity};
 
 #[doc(inline)]
 pub use diff::{
-    Change, DIFF_SCHEMA_VERSION, DiffError, DiffSummary, ScanDiff, ScanReference, diff_reports,
-    render_diff_html, render_diff_json, render_diff_terminal,
+    diff_reports, render_diff_html, render_diff_json, render_diff_terminal, Change, DiffError,
+    DiffSummary, ScanDiff, ScanReference, DIFF_SCHEMA_VERSION,
 };
 #[doc(inline)]
 pub use exports::{render_cyclonedx, render_sarif};
-pub use signing::{SignatureEnvelope, VerificationError, decode_key, sign_bytes, verify_bytes};
+pub use signing::{decode_key, sign_bytes, verify_bytes, SignatureEnvelope, VerificationError};
 
 // Rust guideline compliant 2026-02-21
 
@@ -49,19 +49,34 @@ pub fn render_terminal(report: &ScanReport) -> String {
         let _ = writeln!(output, "Hosts");
         for host in &report.hosts {
             let _ = writeln!(output, "  {}", host.ip);
-            for port in host
-                .ports
-                .iter()
-                .filter(|port| port.state == PortState::Open)
-            {
+            for port in host.ports.iter().filter(|port| {
+                port.state == PortState::Open
+                    || (port.state == PortState::OpenFiltered
+                        && report.services.iter().any(|service| {
+                            service.address == port.address && service.transport == port.transport
+                        }))
+            }) {
                 let service = report
                     .services
                     .iter()
-                    .find(|service| service.address == port.address)
-                    .map_or("unknown".to_owned(), |service| {
-                        format!("{:?}", service.service)
-                    });
-                let _ = writeln!(output, "    {}/tcp  open  {service}", port.address.port());
+                    .find(|service| {
+                        service.address == port.address && service.transport == port.transport
+                    })
+                    .map_or_else(
+                        || "unknown".to_owned(),
+                        |service| service.service.to_string(),
+                    );
+                let state = if port.state == PortState::Open {
+                    "open"
+                } else {
+                    "open|filtered"
+                };
+                let _ = writeln!(
+                    output,
+                    "    {}/{}  {state}  {service}",
+                    port.address.port(),
+                    port.transport.as_str()
+                );
             }
         }
         output.push('\n');
@@ -237,8 +252,26 @@ pub fn render_html(report: &ScanReport) -> String {
             let ports = host
                 .ports
                 .iter()
-                .filter(|port| port.state == PortState::Open)
-                .map(|port| format!("<li>{}/tcp open</li>", port.address.port()))
+                .filter(|port| {
+                    port.state == PortState::Open
+                        || (port.state == PortState::OpenFiltered
+                            && report.services.iter().any(|service| {
+                                service.address == port.address
+                                    && service.transport == port.transport
+                            }))
+                })
+                .map(|port| {
+                    let state = if port.state == PortState::Open {
+                        "open"
+                    } else {
+                        "open|filtered"
+                    };
+                    format!(
+                        "<li>{}/{} {state}</li>",
+                        port.address.port(),
+                        port.transport.as_str()
+                    )
+                })
                 .collect::<String>();
             format!(
                 "<article><h3>{}</h3><ul>{ports}</ul></article>",
@@ -337,7 +370,7 @@ fn severity_class(severity: Severity) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use surface_core::{ScanConfiguration, ScanReport, normalize_target};
+    use surface_core::{normalize_target, ScanConfiguration, ScanReport};
 
     use super::{render_html, render_json, render_terminal};
 
@@ -346,6 +379,7 @@ mod tests {
             normalize_target(target).unwrap_or_else(|error| panic!("{error}")),
             ScanConfiguration {
                 ports: vec![80],
+                udp_ports: Vec::new(),
                 concurrency: 64,
                 connect_timeout_ms: 1_500,
                 request_timeout_ms: 5_000,
@@ -363,7 +397,7 @@ mod tests {
         assert!(render_terminal(&report).contains("Status: NotStarted"));
         let json = render_json(&report).unwrap_or_default();
         assert!(json.contains("\"status\": \"not_started\""));
-        assert!(json.contains("\"schema_version\": \"0.1.2\""));
+        assert!(json.contains("\"schema_version\": \"0.3.0\""));
     }
 
     #[test]

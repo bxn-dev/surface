@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/bxn-dev/surface"
@@ -45,9 +45,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.0", features = ["serde", "v4"] }
 webpki-roots = "1.0"
 x509-parser = "0.18"
-surface-core = { version = "0.1.0", path = "crates/surface-core" }
-surface-report = { version = "0.1.0", path = "crates/surface-report" }
-surface-storage = { version = "0.1.0", path = "crates/surface-storage" }
+surface-core = { version = "0.3.0", path = "crates/surface-core" }
+surface-report = { version = "0.3.0", path = "crates/surface-report" }
+surface-storage = { version = "0.3.0", path = "crates/surface-storage" }
 url = { version = "2.5", features = ["serde"] }
 
 [workspace.lints.rust]

@@ -15,7 +15,7 @@ pub use scheduling::NotificationDelivery;
 use std::fmt;
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use surface_core::{ScanReport, ScanStatus, Severity};
 use time::{Duration, OffsetDateTime};
@@ -501,12 +501,7 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), Error> {
 }
 
 fn normalized_target(report: &ScanReport) -> String {
-    report
-        .target
-        .hostname
-        .clone()
-        .or_else(|| report.target.explicit_ip.map(|ip| ip.to_string()))
-        .unwrap_or_else(|| report.target.original.clone())
+    report.target.identity()
 }
 
 fn finding_counts(report: &ScanReport) -> [i64; 5] {
@@ -574,7 +569,7 @@ fn scan_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanSummary> {
 
 #[cfg(test)]
 mod tests {
-    use surface_core::{ScanConfiguration, ScanReport, ScanStatus, normalize_target};
+    use surface_core::{normalize_target, ScanConfiguration, ScanReport, ScanStatus};
     use tempfile::tempdir;
 
     use super::{HistoryFilter, RetentionPolicy, Storage};
@@ -584,6 +579,7 @@ mod tests {
             normalize_target(target).unwrap_or_else(|error| panic!("{error}")),
             ScanConfiguration {
                 ports: vec![80],
+                udp_ports: Vec::new(),
                 concurrency: 1,
                 connect_timeout_ms: 100,
                 request_timeout_ms: 100,
@@ -699,14 +695,12 @@ mod tests {
         let mut storage = Storage::open(directory.path().join("surface.db"))
             .unwrap_or_else(|error| panic!("{error}"));
 
-        assert!(
-            storage
-                .prune(&RetentionPolicy {
-                    older_than: Some(time::Duration::seconds(i64::MAX)),
-                    ..RetentionPolicy::default()
-                })
-                .is_err()
-        );
+        assert!(storage
+            .prune(&RetentionPolicy {
+                older_than: Some(time::Duration::seconds(i64::MAX)),
+                ..RetentionPolicy::default()
+            })
+            .is_err());
     }
 
     #[test]

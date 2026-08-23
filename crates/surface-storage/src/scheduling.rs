@@ -1,4 +1,4 @@
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use surface_core::ScanConfiguration;
 use time::OffsetDateTime;
@@ -332,6 +332,7 @@ mod tests {
     fn configuration() -> ScanConfiguration {
         ScanConfiguration {
             ports: vec![443],
+            udp_ports: Vec::new(),
             concurrency: 1,
             connect_timeout_ms: 100,
             request_timeout_ms: 100,
@@ -367,27 +368,19 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
-            storage
-                .materialize_due_schedules(10)
-                .unwrap_or_default()
-                .is_empty()
-        );
-        assert!(
-            storage
-                .claim_scan_job("worker", 10, 30)
-                .unwrap_or_default()
-                .is_some()
-        );
-        assert!(
-            storage
-                .create_notification_endpoint(&tenant, "http://127.0.0.1/hook", &[1; 32])
-                .is_err()
-        );
-        assert!(
-            storage
-                .create_notification_endpoint(&tenant, "https://example.com/hook", &[1; 31])
-                .is_err()
-        );
+        assert!(storage
+            .materialize_due_schedules(10)
+            .unwrap_or_default()
+            .is_empty());
+        assert!(storage
+            .claim_scan_job("worker", 10, 30)
+            .unwrap_or_default()
+            .is_some());
+        assert!(storage
+            .create_notification_endpoint(&tenant, "http://127.0.0.1/hook", &[1; 32])
+            .is_err());
+        assert!(storage
+            .create_notification_endpoint(&tenant, "https://example.com/hook", &[1; 31])
+            .is_err());
     }
 }

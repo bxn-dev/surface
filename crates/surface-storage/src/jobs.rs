@@ -1,4 +1,4 @@
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use surface_core::ScanConfiguration;
 use time::OffsetDateTime;
@@ -296,6 +296,7 @@ mod tests {
     fn configuration() -> ScanConfiguration {
         ScanConfiguration {
             ports: vec![443],
+            udp_ports: Vec::new(),
             concurrency: 1,
             connect_timeout_ms: 100,
             request_timeout_ms: 100,
@@ -340,21 +341,17 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"))
             .unwrap_or_else(|| panic!("job required"));
         assert_eq!(claimed.job_id, first);
-        assert!(
-            storage
-                .claim_scan_job("worker-b", 20, 30)
-                .unwrap_or_default()
-                .is_none()
-        );
+        assert!(storage
+            .claim_scan_job("worker-b", 20, 30)
+            .unwrap_or_default()
+            .is_none());
         let recovered = storage
             .claim_scan_job("worker-b", 41, 30)
             .unwrap_or_else(|error| panic!("{error}"))
             .unwrap_or_else(|| panic!("expired lease must recover"));
         assert_eq!(recovered.job_id, first);
-        assert!(
-            storage
-                .complete_scan_job(first, "worker-a", uuid::Uuid::new_v4(), 42)
-                .is_err()
-        );
+        assert!(storage
+            .complete_scan_job(first, "worker-a", uuid::Uuid::new_v4(), 42)
+            .is_err());
     }
 }

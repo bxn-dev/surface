@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use surface_core::{PortState, ScanReport};
 
+use super::escape_html;
+
 // Rust guideline compliant 2026-02-21
 
 /// Current scan-diff schema version.
@@ -106,8 +108,8 @@ impl std::error::Error for DiffError {}
 ///
 /// Returns an error when normalized targets or schema families differ.
 pub fn diff_reports(old: &ScanReport, new: &ScanReport) -> Result<ScanDiff, DiffError> {
-    let old_target = target_identity(old);
-    let new_target = target_identity(new);
+    let old_target = old.target.identity();
+    let new_target = new.target.identity();
     if old_target != new_target {
         return Err(DiffError(format!(
             "cannot compare different targets '{old_target}' and '{new_target}'"
@@ -269,20 +271,8 @@ pub fn render_diff_html(diff: &ScanDiff) -> String {
     )
 }
 
-fn escape_html(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect::<String>()
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
 fn ensure_schema_supported(version: &str) -> Result<(), DiffError> {
-    if matches!(version, "0.1.0" | "0.1.1" | "0.1.2") {
+    if matches!(version, "0.1.0" | "0.1.1" | "0.1.2" | "0.2.0" | "0.3.0") {
         Ok(())
     } else {
         Err(DiffError(format!(
@@ -300,15 +290,6 @@ fn reference(report: &ScanReport, target: String) -> ScanReference {
     }
 }
 
-fn target_identity(report: &ScanReport) -> String {
-    report
-        .target
-        .hostname
-        .clone()
-        .or_else(|| report.target.explicit_ip.map(|ip| ip.to_string()))
-        .unwrap_or_else(|| report.target.original.clone())
-}
-
 fn network_changes(old: &ScanReport, new: &ScanReport, target: &str) -> Vec<Change> {
     let old_ips = old.hosts.iter().map(|host| host.ip.to_string()).collect();
     let new_ips = new.hosts.iter().map(|host| host.ip.to_string()).collect();
@@ -320,41 +301,34 @@ fn network_changes(old: &ScanReport, new: &ScanReport, target: &str) -> Vec<Chan
         target,
         "medium",
     ));
-    changes.sort_by(|left, right| {
-        left.category
-            .cmp(&right.category)
-            .then(left.key.cmp(&right.key))
-    });
+    sort_changes(&mut changes);
     changes
 }
 
 fn service_changes(old: &ScanReport, new: &ScanReport, target: &str) -> Vec<Change> {
+    let service_map = |report: &ScanReport| {
+        report
+            .services
+            .iter()
+            .map(|service| {
+                let value = serde_json::json!({
+                    "transport": service.transport,
+                    "service": service.service,
+                    "confidence": service.confidence,
+                    "banner": service.banner,
+                    "protocol_details": service.protocol_details,
+                });
+                (
+                    format!("{:?}:{}", service.transport, service.address).to_ascii_lowercase(),
+                    value,
+                )
+            })
+            .collect()
+    };
     let mut changes = compare_maps(
         "service",
-        old.services
-            .iter()
-            .map(|service| {
-                let value = serde_json::json!({
-                    "service": service.service,
-                    "confidence": service.confidence,
-                    "banner": service.banner,
-                    "protocol_details": service.protocol_details,
-                });
-                (service.address.to_string(), value)
-            })
-            .collect(),
-        new.services
-            .iter()
-            .map(|service| {
-                let value = serde_json::json!({
-                    "service": service.service,
-                    "confidence": service.confidence,
-                    "banner": service.banner,
-                    "protocol_details": service.protocol_details,
-                });
-                (service.address.to_string(), value)
-            })
-            .collect(),
+        service_map(old),
+        service_map(new),
         target,
         "medium",
     );
@@ -365,11 +339,7 @@ fn service_changes(old: &ScanReport, new: &ScanReport, target: &str) -> Vec<Chan
         target,
         "medium",
     ));
-    changes.sort_by(|left, right| {
-        left.category
-            .cmp(&right.category)
-            .then(left.key.cmp(&right.key))
-    });
+    sort_changes(&mut changes);
     changes
 }
 
@@ -421,23 +391,21 @@ fn dns_changes(old: &ScanReport, new: &ScanReport, target: &str) -> Vec<Change> 
             "medium",
         ));
     }
-    changes.sort_by(|left, right| {
-        left.category
-            .cmp(&right.category)
-            .then(left.key.cmp(&right.key))
-    });
+    sort_changes(&mut changes);
     changes
+}
+
+fn sort_changes(changes: &mut [Change]) {
+    changes.sort_by(|left, right| (&left.category, &left.key).cmp(&(&right.category, &right.key)));
 }
 
 fn completeness_changes(old: &ScanReport, new: &ScanReport, target: &str) -> Vec<Change> {
     let old_value = serde_json::json!({
         "status": old.status,
-        "stages": old.stages,
         "error_kinds": old.errors.iter().filter_map(|error| json_key(&error.kind)).collect::<BTreeSet<_>>(),
     });
     let new_value = serde_json::json!({
         "status": new.status,
-        "stages": new.stages,
         "error_kinds": new.errors.iter().filter_map(|error| json_key(&error.kind)).collect::<BTreeSet<_>>(),
     });
     (old_value != new_value)
@@ -506,11 +474,12 @@ fn port_map(report: &ScanReport) -> BTreeMap<String, Value> {
         .flat_map(|host| &host.ports)
         .map(|port| {
             (
-                port.address.to_string(),
+                format!("{:?}:{}", port.transport, port.address).to_ascii_lowercase(),
                 Value::String(
                     match port.state {
                         PortState::Open => "open",
                         PortState::Closed => "closed",
+                        PortState::OpenFiltered => "open_filtered",
                         PortState::TimedOut => "timed_out",
                         PortState::Unreachable => "unreachable",
                         PortState::Error => "error",
@@ -690,9 +659,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use surface_core::{
-        Evidence, Finding, FindingCategory, FindingConfidence, HostObservation, PortObservation,
-        PortState, ScanConfiguration, ScanError, ScanErrorKind, ScanReport, ScanStage, ScanStatus,
-        Severity, normalize_target,
+        normalize_target, Evidence, Finding, FindingCategory, FindingConfidence, HostObservation,
+        PortObservation, PortState, ScanConfiguration, ScanError, ScanErrorKind, ScanReport,
+        ScanStage, ScanStatus, Severity, TransportProtocol,
     };
 
     use super::{diff_reports, render_diff_json};
@@ -702,6 +671,7 @@ mod tests {
             normalize_target("example.com").unwrap_or_else(|error| panic!("{error}")),
             ScanConfiguration {
                 ports: vec![80],
+                udp_ports: Vec::new(),
                 concurrency: 1,
                 connect_timeout_ms: 100,
                 request_timeout_ms: 100,
@@ -723,6 +693,7 @@ mod tests {
         old.hosts = vec![HostObservation {
             ip: address.ip(),
             ports: vec![PortObservation {
+                transport: TransportProtocol::Tcp,
                 address,
                 state: PortState::Closed,
                 latency_ms: Some(1),
@@ -732,6 +703,7 @@ mod tests {
         new.hosts = vec![HostObservation {
             ip: address.ip(),
             ports: vec![PortObservation {
+                transport: TransportProtocol::Tcp,
                 address,
                 state: PortState::Open,
                 latency_ms: Some(999),
