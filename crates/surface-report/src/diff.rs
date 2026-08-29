@@ -524,14 +524,19 @@ fn tls_map(report: &ScanReport) -> BTreeMap<String, Value> {
                 "certificate_trusted": tls.certificate_trusted,
                 "hostname_matches": tls.hostname_matches,
                 "protocol_version": tls.protocol_version,
+                "cipher_suite": tls.cipher_suite,
                 "alpn": tls.alpn,
+                "certificate_chain_length": tls.certificate_chain_length,
+                "leaf_certificate_sha256": tls.leaf_certificate_sha256,
                 "subject": tls.subject,
                 "issuer": tls.issuer,
                 "serial_number": tls.serial_number,
                 "valid_from_unix": tls.valid_from_unix,
                 "valid_until_unix": tls.valid_until_unix,
                 "subject_alt_names": tls.subject_alt_names,
+                "subject_alt_names_truncated": tls.subject_alt_names_truncated,
                 "public_key_algorithm": tls.public_key_algorithm,
+                "public_key_bits": tls.public_key_bits,
                 "signature_algorithm": tls.signature_algorithm,
             });
             (format!("{}|{}", tls.address, tls.server_name), value)
@@ -659,9 +664,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use surface_core::{
-        normalize_target, Evidence, Finding, FindingCategory, FindingConfidence, HostObservation,
-        PortObservation, PortState, ScanConfiguration, ScanError, ScanErrorKind, ScanReport,
-        ScanStage, ScanStatus, Severity, TransportProtocol,
+        Evidence, Finding, FindingCategory, FindingConfidence, HostObservation, PortObservation,
+        PortState, ScanConfiguration, ScanError, ScanErrorKind, ScanReport, ScanStage, ScanStatus,
+        Severity, TlsObservation, TransportProtocol, normalize_target,
     };
 
     use super::{diff_reports, render_diff_json};
@@ -758,6 +763,55 @@ mod tests {
         let diff = diff_reports(&old, &new).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(diff.finding_changes.len(), 1);
         assert!(diff.completeness_changes.is_empty());
+    }
+
+    #[test]
+    fn tls_evidence_changes_are_visible() {
+        let mut old = report();
+        let mut new = report();
+        let observation = TlsObservation {
+            address: "192.0.2.1:443"
+                .parse()
+                .unwrap_or_else(|error| panic!("{error}")),
+            server_name: "example.com".to_owned(),
+            handshake_succeeded: true,
+            certificate_trusted: Some(true),
+            hostname_matches: Some(true),
+            protocol_version: Some("TLSv1_3".to_owned()),
+            cipher_suite: Some("TLS13_AES_128_GCM_SHA256".to_owned()),
+            alpn: Some("h2".to_owned()),
+            certificate_chain_length: Some(2),
+            leaf_certificate_sha256: Some("old-fingerprint".to_owned()),
+            subject: Some("CN=example.com".to_owned()),
+            issuer: Some("CN=issuer".to_owned()),
+            serial_number: Some("01".to_owned()),
+            valid_from_unix: Some(1),
+            valid_until_unix: Some(2),
+            subject_alt_names: vec!["example.com".to_owned()],
+            subject_alt_names_truncated: false,
+            public_key_algorithm: Some("1.2.840.10045.2.1".to_owned()),
+            public_key_bits: Some(256),
+            signature_algorithm: Some("1.2.840.10045.4.3.2".to_owned()),
+            errors: Vec::new(),
+        };
+        old.tls.push(observation.clone());
+        let mut changed = observation;
+        changed.cipher_suite = Some("TLS13_AES_256_GCM_SHA384".to_owned());
+        changed.certificate_chain_length = Some(3);
+        changed.leaf_certificate_sha256 = Some("new-fingerprint".to_owned());
+        changed.public_key_bits = Some(384);
+        new.tls.push(changed);
+
+        let diff = diff_reports(&old, &new).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(diff.certificate_changes.len(), 1);
+        let new_value = diff.certificate_changes[0]
+            .new_value
+            .as_ref()
+            .unwrap_or_else(|| panic!("new TLS evidence missing"));
+        assert_eq!(new_value["cipher_suite"], "TLS13_AES_256_GCM_SHA384");
+        assert_eq!(new_value["certificate_chain_length"], 3);
+        assert_eq!(new_value["leaf_certificate_sha256"], "new-fingerprint");
+        assert_eq!(new_value["public_key_bits"], 384);
     }
 
     #[test]

@@ -18,6 +18,7 @@ All notable changes are documented here.
 
 ### Added
 
+- Additive successful-handshake TLS evidence for negotiated ciphers, peer-chain length, lowercase SHA-256 leaf fingerprints, reliably parsed public-key bits, and bounded normalized SANs; duplicate implicit-TLS endpoints now receive one attempt.
 - Default-on conservative dangling-CNAME indicators for at most 16 directly observed primary-chain destinations, with selected A/AAAA-only classification, no destination propagation, and a Medium finding only for conclusive NXDOMAIN.
 - Default-on conservative wildcard-DNS detection for hostname scans using exactly two UUID-v4 child probes, selected A/AAAA plus CNAME lookups, hashed answer summaries, non-retention, and an informational finding only for identical non-empty answers.
 - Exact-zone Hickory TCP AXFR checks from primary-host SOA/NS evidence, with strict endpoint/transfer bounds, counts-only non-retention, conservative outcomes, and a high-confidence finding only for complete allowed transfers.
