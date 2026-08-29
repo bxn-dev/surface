@@ -34,14 +34,15 @@ const MAX_ALGORITHM_NAMES: usize = 128;
 const SSH_MSG_KEXINIT: u8 = 20;
 pub(crate) const CLIENT_IDENTIFICATION: &[u8] = b"SSH-2.0-Surface_0.3\r\n";
 
-// Strong-first standards-track algorithms with one exact SHA-1/3DES legacy tail per category.
-// RFCs 8731, 5656, 8268, 9142, 8709, 8332, 4344, 6668, and 4253 define these names.
+// Strong-first standards-track algorithms followed by a bounded exact legacy tail.
+// RFCs 4253, 4345, 6151, 8332, 8758, and 9142 define or update these names.
 const KEX_ALGORITHMS: &[&str] = &[
     "curve25519-sha256",
     "ecdh-sha2-nistp256",
     "diffie-hellman-group16-sha512",
     "diffie-hellman-group14-sha256",
     "diffie-hellman-group14-sha1",
+    "diffie-hellman-group1-sha1",
 ];
 const HOST_KEY_ALGORITHMS: &[&str] = &[
     "ssh-ed25519",
@@ -49,9 +50,23 @@ const HOST_KEY_ALGORITHMS: &[&str] = &[
     "rsa-sha2-512",
     "rsa-sha2-256",
     "ssh-rsa",
+    "ssh-dss",
 ];
-const CIPHER_ALGORITHMS: &[&str] = &["aes256-ctr", "aes128-ctr", "3des-cbc"];
-const MAC_ALGORITHMS: &[&str] = &["hmac-sha2-512", "hmac-sha2-256", "hmac-sha1"];
+const CIPHER_ALGORITHMS: &[&str] = &[
+    "aes256-ctr",
+    "aes128-ctr",
+    "3des-cbc",
+    "arcfour",
+    "arcfour128",
+    "arcfour256",
+];
+const MAC_ALGORITHMS: &[&str] = &[
+    "hmac-sha2-512",
+    "hmac-sha2-256",
+    "hmac-sha1",
+    "hmac-md5",
+    "hmac-md5-96",
+];
 const COMPRESSION_ALGORITHMS: &[&str] = &["none"];
 const SSH_DETAIL_KEYS: &[&str] = &[
     "ssh_protocol",
@@ -642,10 +657,10 @@ mod tests {
     use uuid::{Uuid, Version};
 
     use super::{
-        CLIENT_IDENTIFICATION, Identification, KEX_ALGORITHMS, MAX_IDENTIFICATION_BYTES,
-        MAX_PACKET_LENGTH_FIELD_VALUE, MAX_PRE_BANNER_BYTES, SshAnalysisState, analyze_ssh,
-        inferred_details, parse_identification, parse_kexinit, read_identification,
-        read_server_kexinit,
+        CIPHER_ALGORITHMS, CLIENT_IDENTIFICATION, HOST_KEY_ALGORITHMS, Identification,
+        KEX_ALGORITHMS, MAC_ALGORITHMS, MAX_IDENTIFICATION_BYTES, MAX_PACKET_LENGTH_FIELD_VALUE,
+        MAX_PRE_BANNER_BYTES, SshAnalysisState, analyze_ssh, inferred_details,
+        parse_identification, parse_kexinit, read_identification, read_server_kexinit,
     };
     use crate::{DetectionConfidence, ServiceKind, ServiceObservation, TransportProtocol};
 
@@ -1073,6 +1088,76 @@ mod tests {
     }
 
     #[test]
+    fn legacy_fallbacks_are_offered_last_and_inferred_exactly() {
+        assert_eq!(
+            &KEX_ALGORITHMS[KEX_ALGORITHMS.len() - 2..],
+            ["diffie-hellman-group14-sha1", "diffie-hellman-group1-sha1"]
+        );
+        assert_eq!(
+            &HOST_KEY_ALGORITHMS[HOST_KEY_ALGORITHMS.len() - 2..],
+            ["ssh-rsa", "ssh-dss"]
+        );
+        assert_eq!(
+            &CIPHER_ALGORITHMS[CIPHER_ALGORITHMS.len() - 4..],
+            ["3des-cbc", "arcfour", "arcfour128", "arcfour256"]
+        );
+        assert_eq!(
+            &MAC_ALGORITHMS[MAC_ALGORITHMS.len() - 3..],
+            ["hmac-sha1", "hmac-md5", "hmac-md5-96"]
+        );
+
+        let cases = [
+            (0, "ssh_kex", "diffie-hellman-group14-sha1"),
+            (0, "ssh_kex", "diffie-hellman-group1-sha1"),
+            (1, "ssh_host_key_algorithm", "ssh-rsa"),
+            (1, "ssh_host_key_algorithm", "ssh-dss"),
+            (2, "ssh_cipher_c2s", "3des-cbc"),
+            (2, "ssh_cipher_c2s", "arcfour"),
+            (2, "ssh_cipher_c2s", "arcfour128"),
+            (2, "ssh_cipher_c2s", "arcfour256"),
+            (3, "ssh_cipher_s2c", "3des-cbc"),
+            (3, "ssh_cipher_s2c", "arcfour"),
+            (3, "ssh_cipher_s2c", "arcfour128"),
+            (3, "ssh_cipher_s2c", "arcfour256"),
+            (4, "ssh_mac_c2s", "hmac-sha1"),
+            (4, "ssh_mac_c2s", "hmac-md5"),
+            (4, "ssh_mac_c2s", "hmac-md5-96"),
+            (5, "ssh_mac_s2c", "hmac-sha1"),
+            (5, "ssh_mac_s2c", "hmac-md5"),
+            (5, "ssh_mac_s2c", "hmac-md5-96"),
+        ];
+        for (index, key, algorithm) in cases {
+            let mut lists = [
+                "curve25519-sha256",
+                "ssh-ed25519",
+                "aes128-ctr",
+                "aes128-ctr",
+                "hmac-sha2-256",
+                "hmac-sha2-256",
+                "none",
+                "none",
+                "",
+                "",
+            ];
+            lists[index] = algorithm;
+            let kexinit = parse_kexinit(&kex_payload(lists, 20, 0, 0, &[]))
+                .unwrap_or_else(|error| panic!("{}", error.0));
+            let details = inferred_details(
+                &Identification {
+                    protocol: "2.0",
+                    software: "legacy-fixture".to_owned(),
+                },
+                &kexinit,
+            );
+            assert_eq!(
+                details.get("ssh_analysis_status").map(String::as_str),
+                Some("complete_inferred")
+            );
+            assert_eq!(details.get(key).map(String::as_str), Some(algorithm));
+        }
+    }
+
+    #[test]
     fn no_common_required_algorithm_is_indeterminate() {
         let mut lists = VALID_LISTS;
         lists[0] = "unsupported-kex";
@@ -1094,15 +1179,15 @@ mod tests {
             Some("no common required algorithm: ssh_kex")
         );
         assert!(!details.contains_key("ssh_kex"));
-        assert_eq!(KEX_ALGORITHMS.last(), Some(&"diffie-hellman-group14-sha1"));
+        assert_eq!(KEX_ALGORITHMS.last(), Some(&"diffie-hellman-group1-sha1"));
 
         let legacy_lists = [
-            "diffie-hellman-group14-sha1",
-            "ssh-rsa",
-            "3des-cbc",
-            "3des-cbc",
-            "hmac-sha1",
-            "hmac-sha1",
+            "diffie-hellman-group1-sha1",
+            "ssh-dss",
+            "arcfour",
+            "arcfour128",
+            "hmac-md5",
+            "hmac-md5-96",
             "none",
             "none",
             "",
@@ -1123,19 +1208,19 @@ mod tests {
         );
         assert_eq!(
             details.get("ssh_kex").map(String::as_str),
-            Some("diffie-hellman-group14-sha1")
+            Some("diffie-hellman-group1-sha1")
         );
         assert_eq!(
             details.get("ssh_host_key_algorithm").map(String::as_str),
-            Some("ssh-rsa")
+            Some("ssh-dss")
         );
         assert_eq!(
             details.get("ssh_cipher_c2s").map(String::as_str),
-            Some("3des-cbc")
+            Some("arcfour")
         );
         assert_eq!(
             details.get("ssh_mac_s2c").map(String::as_str),
-            Some("hmac-sha1")
+            Some("hmac-md5-96")
         );
     }
 

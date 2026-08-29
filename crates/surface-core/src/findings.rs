@@ -1,5 +1,7 @@
 //! Deterministic interpretation of observations into evidence-backed findings.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -9,6 +11,22 @@ use crate::{
 };
 
 // Rust guideline compliant 2026-02-21
+
+/// RFC 3279 `rsaEncryption` public-key algorithm identifier.
+const RSA_ENCRYPTION_OID: &str = "1.2.840.113549.1.1.1";
+/// RFC 3279 SHA-1 certificate signature algorithm identifiers.
+const SHA1_SIGNATURE_OIDS: &[&str] = &[
+    "1.2.840.113549.1.1.5",
+    "1.2.840.10040.4.3",
+    "1.2.840.10045.4.1",
+];
+const NIST_SP_800_131A_REV2: &str = "https://doi.org/10.6028/NIST.SP.800-131Ar2";
+const RFC_3279: &str = "https://www.rfc-editor.org/rfc/rfc3279.html";
+const RFC_8996: &str = "https://www.rfc-editor.org/rfc/rfc8996.html";
+const RFC_4253: &str = "https://www.rfc-editor.org/rfc/rfc4253.html";
+const RFC_9142: &str = "https://www.rfc-editor.org/rfc/rfc9142.html";
+const RFC_8758: &str = "https://www.rfc-editor.org/rfc/rfc8758.html";
+const RFC_6151: &str = "https://www.rfc-editor.org/rfc/rfc6151.html";
 
 /// Finding severity ordered from informational to critical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -105,12 +123,32 @@ pub fn generate_findings(
     exposure_findings(target, hosts, services, &mut findings);
     http_findings(target, http, &mut findings);
     tls_findings(target, services, tls, now, &mut findings);
+    let mut seen = BTreeSet::new();
+    findings.retain(|finding| {
+        let evidence = finding
+            .evidence
+            .iter()
+            .map(|evidence| (evidence.location.clone(), evidence.observed.clone()))
+            .collect::<Vec<_>>();
+        seen.insert((finding.id.clone(), finding.target.clone(), evidence))
+    });
     findings.sort_by(|left, right| {
         right
             .severity
             .cmp(&left.severity)
             .then_with(|| left.id.cmp(&right.id))
             .then_with(|| left.target.cmp(&right.target))
+            .then_with(|| {
+                left.evidence
+                    .iter()
+                    .map(|evidence| (&evidence.location, &evidence.observed))
+                    .cmp(
+                        right
+                            .evidence
+                            .iter()
+                            .map(|evidence| (&evidence.location, &evidence.observed)),
+                    )
+            })
     });
     findings
 }
@@ -369,11 +407,23 @@ fn ssh_legacy_finding(service: &ServiceObservation) -> Option<Finding> {
     }
     let legacy = [
         ("ssh_kex", "diffie-hellman-group14-sha1"),
+        ("ssh_kex", "diffie-hellman-group1-sha1"),
         ("ssh_host_key_algorithm", "ssh-rsa"),
+        ("ssh_host_key_algorithm", "ssh-dss"),
         ("ssh_cipher_c2s", "3des-cbc"),
+        ("ssh_cipher_c2s", "arcfour"),
+        ("ssh_cipher_c2s", "arcfour128"),
+        ("ssh_cipher_c2s", "arcfour256"),
         ("ssh_cipher_s2c", "3des-cbc"),
+        ("ssh_cipher_s2c", "arcfour"),
+        ("ssh_cipher_s2c", "arcfour128"),
+        ("ssh_cipher_s2c", "arcfour256"),
         ("ssh_mac_c2s", "hmac-sha1"),
+        ("ssh_mac_c2s", "hmac-md5"),
+        ("ssh_mac_c2s", "hmac-md5-96"),
         ("ssh_mac_s2c", "hmac-sha1"),
+        ("ssh_mac_s2c", "hmac-md5"),
+        ("ssh_mac_s2c", "hmac-md5-96"),
     ]
     .into_iter()
     .filter(|(key, algorithm)| {
@@ -385,17 +435,26 @@ fn ssh_legacy_finding(service: &ServiceObservation) -> Option<Finding> {
     .map(|(key, algorithm)| format!("{key}={algorithm}"))
     .collect::<Vec<_>>();
     (!legacy.is_empty()).then(|| {
-        finding(
-            "NET-SSH-LEGACY-ALGORITHM",
-            "SSH KEXINIT inferred a legacy algorithm selection",
-            Severity::Medium,
-            FindingCategory::Network,
-            &service.address.to_string(),
-            "RFC 4253 client-first KEXINIT preference intersection inferred an offered SHA-1 or 3DES legacy selection. Surface closed after KEXINIT, so no key exchange or cryptographic negotiation completed, and this does not establish server preference.",
-            "SSH KEXINIT client-first preference intersection",
-            &legacy.join(", "),
-            Some("Disable obsolete SSH algorithms after confirming required client compatibility."),
-            FindingConfidence::Medium,
+        with_references(
+            finding(
+                "NET-SSH-LEGACY-ALGORITHM",
+                "SSH KEXINIT inferred a legacy algorithm selection",
+                Severity::Medium,
+                FindingCategory::Network,
+                &service.address.to_string(),
+                "RFC 4253 client-first KEXINIT preference intersection inferred the listed legacy selection before any completed key exchange. Surface closed after KEXINIT, so no cryptographic negotiation completed, and this does not establish server preference.",
+                "SSH KEXINIT client-first preference intersection",
+                &legacy.join(", "),
+                Some("Disable obsolete SSH algorithms after confirming required client compatibility."),
+                FindingConfidence::Medium,
+            ),
+            &[
+                RFC_4253,
+                RFC_9142,
+                RFC_8758,
+                RFC_6151,
+                NIST_SP_800_131A_REV2,
+            ],
         )
     })
 }
@@ -521,6 +580,7 @@ fn tls_findings(
                 FindingConfidence::Medium,
             ));
         }
+        tls_weakness_findings(target, observation, findings);
         let scan_time = now.unix_timestamp();
         if let Some(valid_from) = observation.valid_from_unix
             && valid_from > scan_time
@@ -570,6 +630,76 @@ fn tls_findings(
     }
 }
 
+fn tls_weakness_findings(target: &str, observation: &TlsObservation, findings: &mut Vec<Finding>) {
+    if observation.public_key_algorithm.as_deref() == Some(RSA_ENCRYPTION_OID)
+        && let Some(bits) = observation.public_key_bits
+        && bits != 0
+        && bits < 2048
+    {
+        findings.push(with_references(
+            finding(
+                "TLS-CERT-WEAK-RSA-KEY",
+                "TLS leaf certificate uses a weak RSA key",
+                Severity::Medium,
+                FindingCategory::Tls,
+                target,
+                "The parsed leaf SubjectPublicKeyInfo uses the exact rsaEncryption OID and reports an RSA modulus smaller than 2048 bits.",
+                &observation.address.to_string(),
+                &format!("public_key_algorithm={RSA_ENCRYPTION_OID}, public_key_bits={bits}"),
+                Some("Replace the leaf certificate with one using an RSA key of at least 2048 bits or an appropriate modern alternative."),
+                FindingConfidence::High,
+            ),
+            &[NIST_SP_800_131A_REV2, RFC_3279],
+        ));
+    }
+    if let Some(signature_algorithm) = observation.signature_algorithm.as_deref()
+        && SHA1_SIGNATURE_OIDS.contains(&signature_algorithm)
+    {
+        findings.push(with_references(
+            finding(
+                "TLS-CERT-SHA1-SIGNATURE",
+                "TLS leaf certificate uses a SHA-1 signature",
+                Severity::Medium,
+                FindingCategory::Tls,
+                target,
+                "The parsed leaf certificate signatureAlgorithm exactly identifies SHA-1 with RSA, DSA, or ECDSA.",
+                &observation.address.to_string(),
+                &format!("signature_algorithm={signature_algorithm}"),
+                Some("Replace the leaf certificate with one signed using SHA-256 or stronger."),
+                FindingConfidence::High,
+            ),
+            &[NIST_SP_800_131A_REV2, RFC_3279],
+        ));
+    }
+    if let Some(protocol_version @ ("TLSv1_0" | "TLSv1_1")) =
+        observation.protocol_version.as_deref()
+    {
+        findings.push(with_references(
+            finding(
+                "TLS-OBSOLETE-PROTOCOL",
+                "TLS endpoint negotiated an obsolete protocol",
+                Severity::Medium,
+                FindingCategory::Tls,
+                target,
+                "The directly observed negotiated protocol version is TLS 1.0 or TLS 1.1, which RFC 8996 deprecates.",
+                &observation.address.to_string(),
+                &format!("protocol_version={protocol_version}"),
+                Some("Disable TLS 1.0 and TLS 1.1; require TLS 1.2 or later."),
+                FindingConfidence::High,
+            ),
+            &[RFC_8996],
+        ));
+    }
+}
+
+fn with_references(mut finding: Finding, references: &[&str]) -> Finding {
+    finding.references = references
+        .iter()
+        .map(|reference| (*reference).to_owned())
+        .collect();
+    finding
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "finding fields remain explicit at each rule site"
@@ -605,6 +735,8 @@ fn finding(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{FindingConfidence, Severity, generate_findings};
     use crate::{
         AddressSource, AuthoritativeAxfrObservation, AxfrAttempt, AxfrOutcome, CnameHop,
@@ -614,6 +746,47 @@ mod tests {
         TlsObservation, TransportProtocol, WildcardDnsObservation, WildcardDnsRecordType,
         WildcardDnsStatus,
     };
+
+    fn rejected_tls_observation() -> TlsObservation {
+        TlsObservation {
+            address: "127.0.0.1:443"
+                .parse()
+                .unwrap_or_else(|error| panic!("{error}")),
+            server_name: "localhost".to_owned(),
+            handshake_succeeded: false,
+            certificate_trusted: None,
+            hostname_matches: None,
+            protocol_version: None,
+            cipher_suite: None,
+            alpn: None,
+            certificate_chain_length: Some(1),
+            leaf_certificate_sha256: Some("00".repeat(32)),
+            subject: Some("CN=localhost".to_owned()),
+            issuer: Some("CN=fixture issuer".to_owned()),
+            serial_number: Some("01".to_owned()),
+            valid_from_unix: None,
+            valid_until_unix: None,
+            subject_alt_names: vec!["localhost".to_owned()],
+            subject_alt_names_truncated: false,
+            public_key_algorithm: None,
+            public_key_bits: None,
+            signature_algorithm: None,
+            errors: vec!["certificate validation failed".to_owned()],
+        }
+    }
+
+    fn ssh_service(protocol_details: BTreeMap<String, String>) -> ServiceObservation {
+        ServiceObservation {
+            transport: TransportProtocol::Tcp,
+            address: "127.0.0.1:22"
+                .parse()
+                .unwrap_or_else(|error| panic!("{error}")),
+            service: ServiceKind::Ssh,
+            confidence: DetectionConfidence::High,
+            banner: Some("SSH-2.0-OpenSSH_7.2 CVE-2099-0001".to_owned()),
+            protocol_details,
+        }
+    }
 
     #[test]
     fn multiple_spf_records_generate_evidence() {
@@ -915,39 +1088,259 @@ mod tests {
     }
 
     #[test]
-    fn ssh_legacy_finding_requires_a_completed_inferred_selection() {
-        let address = "127.0.0.1:22"
-            .parse()
-            .unwrap_or_else(|error| panic!("{error}"));
-        let mut service = ServiceObservation {
-            transport: TransportProtocol::Tcp,
-            address,
-            service: ServiceKind::Ssh,
-            confidence: DetectionConfidence::High,
-            banner: Some("SSH-2.0-fixture".to_owned()),
-            protocol_details: std::collections::BTreeMap::from([
+    fn ssh_legacy_finding_requires_an_exact_completed_inferred_selection() {
+        let legacy_cases = [
+            ("ssh_kex", "diffie-hellman-group14-sha1"),
+            ("ssh_kex", "diffie-hellman-group1-sha1"),
+            ("ssh_host_key_algorithm", "ssh-rsa"),
+            ("ssh_host_key_algorithm", "ssh-dss"),
+            ("ssh_cipher_c2s", "3des-cbc"),
+            ("ssh_cipher_c2s", "arcfour"),
+            ("ssh_cipher_c2s", "arcfour128"),
+            ("ssh_cipher_c2s", "arcfour256"),
+            ("ssh_cipher_s2c", "3des-cbc"),
+            ("ssh_cipher_s2c", "arcfour"),
+            ("ssh_cipher_s2c", "arcfour128"),
+            ("ssh_cipher_s2c", "arcfour256"),
+            ("ssh_mac_c2s", "hmac-sha1"),
+            ("ssh_mac_c2s", "hmac-md5"),
+            ("ssh_mac_c2s", "hmac-md5-96"),
+            ("ssh_mac_s2c", "hmac-sha1"),
+            ("ssh_mac_s2c", "hmac-md5"),
+            ("ssh_mac_s2c", "hmac-md5-96"),
+        ];
+        for (field, algorithm) in legacy_cases {
+            let service = ssh_service(BTreeMap::from([
                 (
                     "ssh_analysis_status".to_owned(),
                     "complete_inferred".to_owned(),
                 ),
+                (field.to_owned(), algorithm.to_owned()),
+            ]));
+            let findings = generate_findings(
+                "localhost",
+                None,
+                &[],
+                std::slice::from_ref(&service),
+                &[],
+                &[],
+                time::OffsetDateTime::UNIX_EPOCH,
+            );
+            let legacy = findings
+                .iter()
+                .find(|finding| finding.id == "NET-SSH-LEGACY-ALGORITHM")
+                .unwrap_or_else(|| panic!("missing legacy finding for {field}={algorithm}"));
+            assert_eq!(legacy.severity, Severity::Medium);
+            assert_eq!(legacy.confidence, FindingConfidence::Medium);
+            assert_eq!(legacy.evidence[0].observed, format!("{field}={algorithm}"));
+            assert!(
+                legacy
+                    .description
+                    .contains("before any completed key exchange")
+            );
+            assert!(
+                legacy
+                    .description
+                    .contains("does not establish server preference")
+            );
+            assert!(
+                legacy
+                    .references
+                    .iter()
+                    .any(|reference| reference.contains("9142"))
+            );
+            assert!(findings.iter().all(|finding| !finding.id.contains("CVE")));
+        }
+    }
+
+    #[test]
+    fn ssh_legacy_finding_rejects_near_advertised_and_incomplete_evidence() {
+        let near_matches = [
+            ("ssh_kex", "diffie-hellman-group1-sha1@vendor"),
+            ("ssh_host_key_algorithm", "ssh-dss-cert-v01@openssh.com"),
+            ("ssh_cipher_c2s", "arcfour128x"),
+            ("ssh_mac_s2c", "hmac-md5-etm@openssh.com"),
+        ];
+        for (field, algorithm) in near_matches {
+            let service = ssh_service(BTreeMap::from([
+                (
+                    "ssh_analysis_status".to_owned(),
+                    "complete_inferred".to_owned(),
+                ),
+                (field.to_owned(), algorithm.to_owned()),
+            ]));
+            let findings = generate_findings(
+                "localhost",
+                None,
+                &[],
+                std::slice::from_ref(&service),
+                &[],
+                &[],
+                time::OffsetDateTime::UNIX_EPOCH,
+            );
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.id != "NET-SSH-LEGACY-ALGORITHM")
+            );
+        }
+
+        let negatives = [
+            BTreeMap::from([
+                (
+                    "ssh_analysis_status".to_owned(),
+                    "complete_inferred".to_owned(),
+                ),
+                ("ssh_kex".to_owned(), "curve25519-sha256".to_owned()),
+                (
+                    "ssh_server_kex_algorithms".to_owned(),
+                    "diffie-hellman-group1-sha1".to_owned(),
+                ),
+            ]),
+            BTreeMap::from([
+                ("ssh_analysis_status".to_owned(), "indeterminate".to_owned()),
+                (
+                    "ssh_skip_reason".to_owned(),
+                    "no common required algorithm: ssh_kex".to_owned(),
+                ),
                 (
                     "ssh_kex".to_owned(),
-                    "diffie-hellman-group14-sha1".to_owned(),
+                    "diffie-hellman-group1-sha1".to_owned(),
                 ),
-                ("ssh_host_key_algorithm".to_owned(), "ssh-rsa".to_owned()),
-                ("ssh_cipher_c2s".to_owned(), "3des-cbc".to_owned()),
-                ("ssh_cipher_s2c".to_owned(), "aes256-ctr".to_owned()),
-                ("ssh_mac_c2s".to_owned(), "hmac-sha1".to_owned()),
-                ("ssh_mac_s2c".to_owned(), "hmac-sha2-512".to_owned()),
             ]),
+            BTreeMap::from([("ssh_host_key_algorithm".to_owned(), "ssh-dss".to_owned())]),
+        ];
+        for details in negatives {
+            let service = ssh_service(details);
+            let findings = generate_findings(
+                "localhost",
+                None,
+                &[],
+                std::slice::from_ref(&service),
+                &[],
+                &[],
+                time::OffsetDateTime::UNIX_EPOCH,
+            );
+            assert_eq!(
+                findings
+                    .iter()
+                    .map(|finding| finding.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["NET-SSH-REACHABLE"]
+            );
+        }
+    }
+
+    #[test]
+    fn tls_weakness_findings_require_exact_direct_evidence() {
+        let findings_for = |observations: &[TlsObservation]| {
+            generate_findings(
+                "localhost",
+                None,
+                &[],
+                &[],
+                &[],
+                observations,
+                time::OffsetDateTime::UNIX_EPOCH,
+            )
         };
+
+        for bits in [1, 1024, 2047] {
+            let mut observation = rejected_tls_observation();
+            observation.public_key_algorithm = Some("1.2.840.113549.1.1.1".to_owned());
+            observation.public_key_bits = Some(bits);
+            let findings = findings_for(std::slice::from_ref(&observation));
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].id, "TLS-CERT-WEAK-RSA-KEY");
+            assert_eq!(findings[0].severity, Severity::Medium);
+            assert_eq!(findings[0].confidence, FindingConfidence::High);
+            assert_eq!(
+                findings[0].evidence[0].observed,
+                format!("public_key_algorithm=1.2.840.113549.1.1.1, public_key_bits={bits}")
+            );
+        }
+        for (algorithm, bits) in [
+            (Some("1.2.840.113549.1.1.1"), None),
+            (Some("1.2.840.113549.1.1.1"), Some(0)),
+            (Some("1.2.840.113549.1.1.1"), Some(2048)),
+            (Some("1.2.840.113549.1.1.1"), Some(4096)),
+            (Some("1.2.840.113549.1.1.10"), Some(1024)),
+            (Some("1.2.840.10045.2.1"), Some(256)),
+            (None, Some(1024)),
+        ] {
+            let mut observation = rejected_tls_observation();
+            observation.public_key_algorithm = algorithm.map(str::to_owned);
+            observation.public_key_bits = bits;
+            assert!(findings_for(&[observation]).is_empty());
+        }
+
+        for oid in [
+            "1.2.840.113549.1.1.5",
+            "1.2.840.10040.4.3",
+            "1.2.840.10045.4.1",
+        ] {
+            let mut observation = rejected_tls_observation();
+            observation.signature_algorithm = Some(oid.to_owned());
+            let findings = findings_for(&[observation]);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].id, "TLS-CERT-SHA1-SIGNATURE");
+            assert_eq!(findings[0].severity, Severity::Medium);
+            assert_eq!(findings[0].confidence, FindingConfidence::High);
+            assert_eq!(
+                findings[0].evidence[0].observed,
+                format!("signature_algorithm={oid}")
+            );
+        }
+        for oid in [
+            "1.2.840.113549.1.1.5.1",
+            "1.2.840.10040.4.30",
+            "1.2.840.10045.4.10",
+            "1.2.840.10045.4.3.2",
+            "sha1WithRSAEncryption",
+            "",
+        ] {
+            let mut observation = rejected_tls_observation();
+            observation.signature_algorithm = Some(oid.to_owned());
+            assert!(findings_for(&[observation]).is_empty());
+        }
+
+        for protocol in ["TLSv1_0", "TLSv1_1"] {
+            let mut json = serde_json::to_value(rejected_tls_observation())
+                .unwrap_or_else(|error| panic!("{error}"));
+            json["protocol_version"] = serde_json::Value::String(protocol.to_owned());
+            let imported: TlsObservation =
+                serde_json::from_value(json).unwrap_or_else(|error| panic!("{error}"));
+            let findings = findings_for(&[imported]);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].id, "TLS-OBSOLETE-PROTOCOL");
+            assert_eq!(findings[0].severity, Severity::Medium);
+            assert_eq!(findings[0].confidence, FindingConfidence::High);
+            assert_eq!(
+                findings[0].evidence[0].observed,
+                format!("protocol_version={protocol}")
+            );
+        }
+        for protocol in ["TLSv1_0 ", "tlsv1_0", "TLSv1.0", "TLSv1_2", "TLSv1_3", ""] {
+            let mut observation = rejected_tls_observation();
+            observation.protocol_version = Some(protocol.to_owned());
+            assert!(findings_for(&[observation]).is_empty());
+        }
+    }
+
+    #[test]
+    fn tls_weakness_findings_are_ordered_and_exactly_deduplicated() {
+        let mut observation = rejected_tls_observation();
+        observation.public_key_algorithm = Some("1.2.840.113549.1.1.1".to_owned());
+        observation.public_key_bits = Some(1024);
+        observation.signature_algorithm = Some("1.2.840.113549.1.1.5".to_owned());
+        observation.protocol_version = Some("TLSv1_0".to_owned());
         let findings = generate_findings(
             "localhost",
             None,
             &[],
-            std::slice::from_ref(&service),
             &[],
             &[],
+            &[observation.clone(), observation],
             time::OffsetDateTime::UNIX_EPOCH,
         );
         assert_eq!(
@@ -955,28 +1348,17 @@ mod tests {
                 .iter()
                 .map(|finding| finding.id.as_str())
                 .collect::<Vec<_>>(),
-            ["NET-SSH-LEGACY-ALGORITHM", "NET-SSH-REACHABLE"]
+            [
+                "TLS-CERT-SHA1-SIGNATURE",
+                "TLS-CERT-WEAK-RSA-KEY",
+                "TLS-OBSOLETE-PROTOCOL",
+            ]
         );
-        assert_eq!(findings[0].confidence, FindingConfidence::Medium);
-        assert!(findings[0].title.contains("inferred"));
-        assert!(findings[0].description.contains("preference intersection"));
-        assert!(findings[0].description.contains("no key exchange"));
-        assert!(findings[0].description.contains("negotiation completed"));
-
-        service
-            .protocol_details
-            .insert("ssh_analysis_status".to_owned(), "indeterminate".to_owned());
-        let findings = generate_findings(
-            "localhost",
-            None,
-            &[],
-            std::slice::from_ref(&service),
-            &[],
-            &[],
-            time::OffsetDateTime::UNIX_EPOCH,
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.confidence == FindingConfidence::High)
         );
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].id, "NET-SSH-REACHABLE");
     }
 
     #[test]
