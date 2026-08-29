@@ -330,6 +330,9 @@ fn exposure_findings(
             Some("Confirm that access controls and authentication policy match operational requirements."),
             FindingConfidence::High,
         ));
+        if let Some(legacy) = ssh_legacy_finding(service) {
+            findings.push(legacy);
+        }
     }
     for service in services.iter().filter(|service| {
         service.service == ServiceKind::Smtp
@@ -354,6 +357,47 @@ fn exposure_findings(
         ));
     }
     let _ = target;
+}
+
+fn ssh_legacy_finding(service: &ServiceObservation) -> Option<Finding> {
+    if service
+        .protocol_details
+        .get("ssh_analysis_status")
+        .is_none_or(|status| status != "complete_inferred")
+    {
+        return None;
+    }
+    let legacy = [
+        ("ssh_kex", "diffie-hellman-group14-sha1"),
+        ("ssh_host_key_algorithm", "ssh-rsa"),
+        ("ssh_cipher_c2s", "3des-cbc"),
+        ("ssh_cipher_s2c", "3des-cbc"),
+        ("ssh_mac_c2s", "hmac-sha1"),
+        ("ssh_mac_s2c", "hmac-sha1"),
+    ]
+    .into_iter()
+    .filter(|(key, algorithm)| {
+        service
+            .protocol_details
+            .get(*key)
+            .is_some_and(|selected| selected == algorithm)
+    })
+    .map(|(key, algorithm)| format!("{key}={algorithm}"))
+    .collect::<Vec<_>>();
+    (!legacy.is_empty()).then(|| {
+        finding(
+            "NET-SSH-LEGACY-ALGORITHM",
+            "SSH KEXINIT inferred a legacy algorithm selection",
+            Severity::Medium,
+            FindingCategory::Network,
+            &service.address.to_string(),
+            "RFC 4253 client-first KEXINIT preference intersection inferred an offered SHA-1 or 3DES legacy selection. Surface closed after KEXINIT, so no key exchange or cryptographic negotiation completed, and this does not establish server preference.",
+            "SSH KEXINIT client-first preference intersection",
+            &legacy.join(", "),
+            Some("Disable obsolete SSH algorithms after confirming required client compatibility."),
+            FindingConfidence::Medium,
+        )
+    })
 }
 
 fn http_findings(target: &str, observations: &[HttpObservation], findings: &mut Vec<Finding>) {
@@ -561,7 +605,7 @@ fn finding(
 
 #[cfg(test)]
 mod tests {
-    use super::{Severity, generate_findings};
+    use super::{FindingConfidence, Severity, generate_findings};
     use crate::{
         AddressSource, AuthoritativeAxfrObservation, AxfrAttempt, AxfrOutcome, CnameHop,
         DanglingCnameObservation, DanglingCnameStatus, DetectionConfidence, DnsObservation,
@@ -868,6 +912,71 @@ mod tests {
                 "unexpected finding for {outcome:?}"
             );
         }
+    }
+
+    #[test]
+    fn ssh_legacy_finding_requires_a_completed_inferred_selection() {
+        let address = "127.0.0.1:22"
+            .parse()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut service = ServiceObservation {
+            transport: TransportProtocol::Tcp,
+            address,
+            service: ServiceKind::Ssh,
+            confidence: DetectionConfidence::High,
+            banner: Some("SSH-2.0-fixture".to_owned()),
+            protocol_details: std::collections::BTreeMap::from([
+                (
+                    "ssh_analysis_status".to_owned(),
+                    "complete_inferred".to_owned(),
+                ),
+                (
+                    "ssh_kex".to_owned(),
+                    "diffie-hellman-group14-sha1".to_owned(),
+                ),
+                ("ssh_host_key_algorithm".to_owned(), "ssh-rsa".to_owned()),
+                ("ssh_cipher_c2s".to_owned(), "3des-cbc".to_owned()),
+                ("ssh_cipher_s2c".to_owned(), "aes256-ctr".to_owned()),
+                ("ssh_mac_c2s".to_owned(), "hmac-sha1".to_owned()),
+                ("ssh_mac_s2c".to_owned(), "hmac-sha2-512".to_owned()),
+            ]),
+        };
+        let findings = generate_findings(
+            "localhost",
+            None,
+            &[],
+            std::slice::from_ref(&service),
+            &[],
+            &[],
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.id.as_str())
+                .collect::<Vec<_>>(),
+            ["NET-SSH-LEGACY-ALGORITHM", "NET-SSH-REACHABLE"]
+        );
+        assert_eq!(findings[0].confidence, FindingConfidence::Medium);
+        assert!(findings[0].title.contains("inferred"));
+        assert!(findings[0].description.contains("preference intersection"));
+        assert!(findings[0].description.contains("no key exchange"));
+        assert!(findings[0].description.contains("negotiation completed"));
+
+        service
+            .protocol_details
+            .insert("ssh_analysis_status".to_owned(), "indeterminate".to_owned());
+        let findings = generate_findings(
+            "localhost",
+            None,
+            &[],
+            std::slice::from_ref(&service),
+            &[],
+            &[],
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "NET-SSH-REACHABLE");
     }
 
     #[test]

@@ -9,10 +9,12 @@ flowchart TD
     E --> F[Safe Service Detection]
     F --> G[Bounded HTTP Analysis]
     F --> H[Validating TLS Analysis]
+    F --> SSH[Bounded SSH Identification and KEXINIT Analysis]
     C --> I[Passive Mail Analysis]
     C --> S[Bounded CertSpotter CT Discovery]
     G --> J[Pure Finding Engine]
     H --> J
+    SSH --> J
     I --> J
     J --> K[Versioned ScanReport]
     S --> K
@@ -41,6 +43,6 @@ Only explicit IPs and resolver-returned A/AAAA addresses for the primary target 
 
 Persistence is opt-in. A one-shot scan opens no database unless `--persist --database PATH` is supplied. Report serialization and normalized finding writes share one transaction. Historical report JSON cannot be updated; deletion cascades dependent metadata and records an audit event in the same transaction.
 
-Service probes are selected by a centralized port-to-behavior registry. Payloads are fixed, read-only discovery commands; banner bytes, endpoint count, time, and concurrency remain bounded. Diffing and scoring are pure functions over completed report data and perform no network I/O.
+Service probes are selected by a centralized port-to-behavior registry. Payloads are fixed, read-only discovery commands; banner bytes, endpoint count, time, and concurrency remain bounded. During the Services stage, only already identified TCP SSH observations receive one reconnect per deduplicated `SocketAddr`, capped at 16 concurrent requests under the caller deadline, cancellation, and request timeout. The SSH path sends one identification and one unencrypted KEXINIT, parses one bounded server KEXINIT, stores sanitized/inferred details on the matching service, and closes before key exchange, NEWKEYS, host-key bytes, authentication, or channels. It cannot create or propagate endpoints. Diffing and scoring are pure functions over completed report data and perform no network I/O.
 
 HTTP remains address-pinned and same-origin. CertSpotter Certificate Transparency names, supplied subdomains, and DKIM selectors are passive and bounded; CT names are reported but never scanned automatically. CVE/network metadata comes only from a validated offline bundle; candidates are correlations, never exploit confirmation.

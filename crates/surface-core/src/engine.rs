@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 
+use crate::ssh::{SshAnalysisState, analyze_ssh};
 use crate::{
     AxfrOutcome, DanglingCnameStatus, DnssecObservation, DnssecStatus, HostObservation,
     NormalizedTarget, ScanConfiguration, ScanError, ScanErrorKind, ScanProgress, ScanReport,
@@ -550,10 +551,6 @@ async fn run_scan_inner(
     };
     if let Ok(services) = services {
         report.services = services;
-        progress(ScanProgress::Completed {
-            stage: ScanStage::Services,
-            observations: report.services.len(),
-        });
     } else {
         fail_timeout(
             &mut report,
@@ -562,6 +559,41 @@ async fn run_scan_inner(
             "global timeout expired during service detection",
         );
         return report;
+    }
+
+    match analyze_ssh(
+        &mut report.services,
+        report.configuration.concurrency.min(16),
+        Duration::from_millis(report.configuration.request_timeout_ms),
+        deadline,
+        &cancellation,
+    )
+    .await
+    {
+        SshAnalysisState::Completed => {
+            progress(ScanProgress::Completed {
+                stage: ScanStage::Services,
+                observations: report.services.len(),
+            });
+        }
+        SshAnalysisState::TimedOut => {
+            fail_timeout(
+                &mut report,
+                ScanStage::Services,
+                selection,
+                "global timeout expired during SSH analysis",
+            );
+            return report;
+        }
+        SshAnalysisState::Cancelled => {
+            interrupt(
+                &mut report,
+                ScanStage::Services,
+                selection,
+                "scan interrupted during SSH analysis",
+            );
+            return report;
+        }
     }
 
     if selection.http {
@@ -996,7 +1028,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use tokio::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::time::{Instant, timeout};
     use tokio_util::sync::CancellationToken;
 
     use super::{
@@ -1009,6 +1044,110 @@ mod tests {
         ScanStatus, SpfObservation, WildcardDnsObservation, WildcardDnsRecordType,
         WildcardDnsStatus, normalize_target,
     };
+
+    const ENGINE_SSH_LISTS: [&str; 10] = [
+        "curve25519-sha256",
+        "ssh-ed25519",
+        "aes256-ctr",
+        "aes256-ctr",
+        "hmac-sha2-512",
+        "hmac-sha2-512",
+        "none",
+        "none",
+        "",
+        "",
+    ];
+
+    fn engine_ssh_packet() -> Vec<u8> {
+        let mut payload = vec![20];
+        payload.extend_from_slice(&[9_u8; 16]);
+        for list in ENGINE_SSH_LISTS {
+            payload.extend_from_slice(
+                &u32::try_from(list.len())
+                    .unwrap_or_else(|error| panic!("{error}"))
+                    .to_be_bytes(),
+            );
+            payload.extend_from_slice(list.as_bytes());
+        }
+        payload.push(0);
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        let mut padding = 8 - ((5 + payload.len()) % 8);
+        if padding < 4 {
+            padding += 8;
+        }
+        let packet_length = 1 + payload.len() + padding;
+        let mut packet = Vec::new();
+        packet.extend_from_slice(
+            &u32::try_from(packet_length)
+                .unwrap_or_else(|error| panic!("{error}"))
+                .to_be_bytes(),
+        );
+        packet.push(u8::try_from(padding).unwrap_or_else(|error| panic!("{error}")));
+        packet.extend_from_slice(&payload);
+        packet.resize(4 + packet_length, 0);
+        packet
+    }
+
+    async fn accept_port_and_service_probes(listener: &TcpListener) {
+        let (_port_scan, _) = listener
+            .accept()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let (mut service_probe, _) = listener
+            .accept()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        service_probe
+            .write_all(b"SSH-2.0-initial-fixture\r\n")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    async fn complete_ssh_fixture(listener: TcpListener) {
+        accept_port_and_service_probes(&listener).await;
+        let (mut ssh, _) = listener
+            .accept()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut identification = vec![0_u8; crate::ssh::CLIENT_IDENTIFICATION.len()];
+        ssh.read_exact(&mut identification)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(identification, crate::ssh::CLIENT_IDENTIFICATION);
+        ssh.write_all(b"SSH-2.0-engine-fixture\r\n")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut length = [0_u8; 4];
+        ssh.read_exact(&mut length)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut packet = vec![
+            0_u8;
+            usize::try_from(u32::from_be_bytes(length))
+                .unwrap_or_else(|error| panic!("{error}"))
+        ];
+        ssh.read_exact(&mut packet)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(packet[1], 20);
+        ssh.write_all(&engine_ssh_packet())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn loopback_configuration(port: u16) -> ScanConfiguration {
+        ScanConfiguration {
+            ports: vec![port],
+            udp_ports: Vec::new(),
+            concurrency: 64,
+            connect_timeout_ms: 100,
+            request_timeout_ms: 500,
+            global_timeout_ms: 2_000,
+            ipv4_only: false,
+            ipv6_only: false,
+            authorization_acknowledged: true,
+        }
+    }
 
     #[tokio::test]
     async fn scans_only_explicit_loopback_without_dns() {
@@ -1216,6 +1355,194 @@ mod tests {
             1
         );
         assert_eq!(report.status, ScanStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn services_selection_runs_ssh_analysis_without_endpoint_propagation() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let fixture = tokio::spawn(complete_ssh_fixture(listener));
+        let report = run_scan_selected_with_progress(
+            normalize_target("127.0.0.1").unwrap_or_else(|error| panic!("{error}")),
+            loopback_configuration(address.port()),
+            CancellationToken::new(),
+            ScanSelection::only(&[ScanStage::Services]),
+            |_| {},
+        )
+        .await;
+        fixture.await.unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(report.status, ScanStatus::Completed);
+        assert_eq!(report.hosts.len(), 1);
+        assert_eq!(report.hosts[0].ip, address.ip());
+        assert_eq!(report.services.len(), 1);
+        assert_eq!(report.services[0].address, address);
+        assert_eq!(report.services[0].service, crate::ServiceKind::Ssh);
+        assert_eq!(
+            report.services[0]
+                .protocol_details
+                .get("ssh_analysis_status")
+                .map(String::as_str),
+            Some("complete_inferred")
+        );
+        assert!(report.http.is_empty());
+        assert!(report.tls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dns_and_ports_only_selections_do_not_run_ssh_analysis() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let port_fixture = tokio::spawn(async move {
+            let (_socket, _) = listener
+                .accept()
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert!(
+                timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let report = run_scan_selected_with_progress(
+            normalize_target("127.0.0.1").unwrap_or_else(|error| panic!("{error}")),
+            loopback_configuration(address.port()),
+            CancellationToken::new(),
+            ScanSelection::only(&[ScanStage::Ports]),
+            |_| {},
+        )
+        .await;
+        port_fixture.await.unwrap_or_else(|error| panic!("{error}"));
+        assert!(report.services.is_empty());
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let report = run_scan_selected_with_progress(
+            normalize_target("127.0.0.1").unwrap_or_else(|error| panic!("{error}")),
+            loopback_configuration(address.port()),
+            CancellationToken::new(),
+            ScanSelection::only(&[]),
+            |_| {},
+        )
+        .await;
+        assert!(report.services.is_empty());
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        assert!(
+            report
+                .skipped_checks
+                .iter()
+                .all(|skipped| skipped.check != "ssh")
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_deadline_and_cancellation_preserve_endpoint_reason_and_lifecycle() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let deadline_fixture = tokio::spawn(async move {
+            accept_port_and_service_probes(&listener).await;
+            let (mut ssh, _) = listener
+                .accept()
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            let mut identification = vec![0_u8; crate::ssh::CLIENT_IDENTIFICATION.len()];
+            ssh.read_exact(&mut identification)
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            let mut byte = [0_u8; 1];
+            let _ = ssh.read(&mut byte).await;
+        });
+        let report = run_scan_selected_until_with_progress(
+            normalize_target("127.0.0.1").unwrap_or_else(|error| panic!("{error}")),
+            loopback_configuration(address.port()),
+            CancellationToken::new(),
+            ScanSelection::only(&[ScanStage::Services]),
+            Instant::now() + Duration::from_millis(150),
+            |_| {},
+        )
+        .await;
+        deadline_fixture
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(report.status, ScanStatus::Partial);
+        assert_eq!(
+            report.services[0]
+                .protocol_details
+                .get("ssh_skip_reason")
+                .map(String::as_str),
+            Some("caller deadline exceeded")
+        );
+        assert_eq!(report.services[0].address, address);
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let (started_tx, started_rx) = oneshot::channel();
+        let cancellation_fixture = tokio::spawn(async move {
+            accept_port_and_service_probes(&listener).await;
+            let (mut ssh, _) = listener
+                .accept()
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            let mut identification = vec![0_u8; crate::ssh::CLIENT_IDENTIFICATION.len()];
+            ssh.read_exact(&mut identification)
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            started_tx
+                .send(())
+                .unwrap_or_else(|()| panic!("receiver dropped"));
+            let mut byte = [0_u8; 1];
+            let _ = ssh.read(&mut byte).await;
+        });
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            started_rx.await.unwrap_or_else(|error| panic!("{error}"));
+            cancel.cancel();
+        });
+        let report = run_scan_selected_with_progress(
+            normalize_target("127.0.0.1").unwrap_or_else(|error| panic!("{error}")),
+            loopback_configuration(address.port()),
+            cancellation,
+            ScanSelection::only(&[ScanStage::Services]),
+            |_| {},
+        )
+        .await;
+        cancellation_fixture
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(report.status, ScanStatus::Interrupted);
+        assert_eq!(
+            report.services[0]
+                .protocol_details
+                .get("ssh_skip_reason")
+                .map(String::as_str),
+            Some("cancelled")
+        );
+        assert_eq!(report.services[0].address, address);
     }
 
     #[tokio::test]

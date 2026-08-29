@@ -18,6 +18,7 @@ All notable changes are documented here.
 
 ### Added
 
+- Default-on bounded SSH identification and KEXINIT posture analysis for already identified TCP SSH services, with one deduplicated reconnect, RFC client-first inferred algorithm selections, a Medium/medium-confidence finding only for an inferred KEXINIT preference-intersection selection of an exact SHA-1/3DES legacy tail, per-endpoint indeterminate reasons, and no key exchange or authentication.
 - Additive bounded TLS evidence for negotiated successful handshakes and certificates rejected by the unchanged validating WebPKI verifier, including peer-chain length, lowercase SHA-256 leaf fingerprints, reliably parsed public-key bits, and normalized SANs; duplicate implicit-TLS endpoints receive one attempt.
 - Default-on conservative dangling-CNAME indicators for at most 16 directly observed primary-chain destinations, with selected A/AAAA-only classification, no destination propagation, and a Medium finding only for conclusive NXDOMAIN.
 - Default-on conservative wildcard-DNS detection for hostname scans using exactly two UUID-v4 child probes, selected A/AAAA plus CNAME lookups, hashed answer summaries, non-retention, and an informational finding only for identical non-empty answers.

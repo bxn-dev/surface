@@ -9,6 +9,7 @@ mod intelligence;
 mod ports;
 mod scanner;
 mod service;
+mod ssh;
 mod target;
 mod tls;
 
