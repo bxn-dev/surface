@@ -1,7 +1,6 @@
 //! Core models and input parsing for Surface scans.
 
 mod dns;
-mod egress;
 mod engine;
 mod exposure;
 mod findings;
@@ -19,13 +18,17 @@ use uuid::Uuid;
 
 #[doc(inline)]
 pub use dns::{
-    AddressSource, DmarcObservation, DnsObservation, DnsRecord, MailObservation, ResolvedHost,
-    SpfObservation, analyze_dns, interpret_mail, lookup_txt,
+    AddressSource, AuthoritativeAxfrObservation, AxfrAttempt, AxfrLimits, AxfrOutcome, CnameHop,
+    DanglingCnameObservation, DanglingCnameStatus, DmarcObservation, DnsObservation, DnsRecord,
+    DnssecObservation, DnssecRecordType, DnssecRrsetObservation, DnssecStatus, MailObservation,
+    ResolvedHost, SpfObservation, WildcardDnsObservation, WildcardDnsRecordType, WildcardDnsStatus,
+    analyze_dns, interpret_mail, lookup_txt,
 };
 #[doc(inline)]
-pub use egress::is_global_unicast;
-#[doc(inline)]
-pub use engine::{run_hosted_scan, run_scan};
+pub use engine::{
+    run_scan, run_scan_selected_until_with_progress, run_scan_selected_with_progress,
+    run_scan_with_progress,
+};
 #[doc(inline)]
 pub use exposure::{
     EXPOSURE_MODEL_VERSION, ExposureScore, ScoreClassification, ScoreDeduction, calculate_exposure,
@@ -38,8 +41,10 @@ pub use findings::{
 pub use http::{CookieObservation, HttpObservation, RedirectObservation, analyze_http};
 #[doc(inline)]
 pub use intelligence::{
-    CveCandidate, DkimObservation, IntelligenceBundle, IntelligenceObservation, NetworkEntry,
-    NetworkMetadata, SubdomainObservation, VulnerabilityEntry, analyze_intelligence, parse_bundle,
+    CertificateTransparencyCandidate, CertificateTransparencyObservation, CveCandidate,
+    DkimObservation, IntelligenceBundle, IntelligenceObservation, NetworkEntry, NetworkMetadata,
+    RelatedDomainCandidate, RelatedDomainsObservation, SubdomainObservation, VulnerabilityEntry,
+    analyze_certificate_transparency, analyze_intelligence, analyze_related_domains, parse_bundle,
 };
 #[doc(inline)]
 pub use ports::{PortSelection, PortSpecError, parse_ports, parse_udp_ports};
@@ -92,6 +97,20 @@ pub enum ScanStage {
     Findings,
 }
 
+/// Reports a scanner stage transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanProgress {
+    /// A stage started.
+    Started(ScanStage),
+    /// A stage completed with its primary observation count.
+    Completed {
+        /// Completed stage.
+        stage: ScanStage,
+        /// Number of primary observations produced by the stage.
+        observations: usize,
+    },
+}
+
 /// Categorizes a reportable scanner error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -108,7 +127,7 @@ pub enum ScanErrorKind {
     Tls,
     /// Operator cancellation.
     Cancelled,
-    /// Required authorization acknowledgement was absent.
+    /// A destination was rejected by an execution policy.
     Authorization,
     /// Output or internal orchestration failure.
     Other,
@@ -169,8 +188,64 @@ pub struct ScanConfiguration {
     pub ipv4_only: bool,
     /// Whether only IPv6 results should later be used.
     pub ipv6_only: bool,
-    /// Whether authorization was explicitly acknowledged.
+    /// Compatibility field retained for report schema 0.3.0; new scans always set this true.
     pub authorization_acknowledged: bool,
+}
+
+/// Selects active scan stages; dependencies are included automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "stage switches directly represent the selected scan groups"
+)]
+pub struct ScanSelection {
+    pub(crate) ports: bool,
+    pub(crate) services: bool,
+    pub(crate) http: bool,
+    pub(crate) tls: bool,
+}
+
+impl ScanSelection {
+    /// Selects every built-in active scan stage.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            ports: true,
+            services: true,
+            http: true,
+            tls: true,
+        }
+    }
+
+    /// Selects stages and their required prerequisites.
+    #[must_use]
+    pub fn only(stages: &[ScanStage]) -> Self {
+        let http = stages.contains(&ScanStage::Http);
+        let tls = stages.contains(&ScanStage::Tls);
+        let services = stages.contains(&ScanStage::Services) || http || tls;
+        let ports = stages.contains(&ScanStage::Ports) || services;
+        Self {
+            ports,
+            services,
+            http,
+            tls,
+        }
+    }
+}
+
+impl Default for ScanSelection {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+/// One intentionally omitted check and its reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedCheck {
+    /// Stable check identifier.
+    pub check: String,
+    /// Human-readable reason.
+    pub reason: String,
 }
 
 /// Contains versioned output shared by all report renderers.
@@ -210,6 +285,9 @@ pub struct ScanReport {
     /// Optional explicitly supplied passive and offline intelligence.
     #[serde(default)]
     pub intelligence: Option<IntelligenceObservation>,
+    /// Checks omitted by selection, unavailable input, or missing credentials.
+    #[serde(default)]
+    pub skipped_checks: Vec<SkippedCheck>,
     /// Partial errors retained across stages.
     pub errors: Vec<ScanError>,
     /// Human-readable explanation of the lifecycle state.
@@ -237,6 +315,7 @@ impl ScanReport {
             findings: Vec::new(),
             exposure_score: None,
             intelligence: None,
+            skipped_checks: Vec::new(),
             errors: Vec::new(),
             message: "Scan has not started.".to_owned(),
         }

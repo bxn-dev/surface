@@ -87,7 +87,7 @@ pub fn calculate_exposure(report: &ScanReport) -> ExposureScore {
         })
         .min(100);
     let value = 100_u8.saturating_sub(u8::try_from(total).unwrap_or(100));
-    let incomplete = report.status != ScanStatus::Completed;
+    let incomplete = report.status != ScanStatus::Completed || !report.skipped_checks.is_empty();
     let mut limitations =
         vec!["This configuration and exposure score is not proof of security.".to_owned()];
     if incomplete {
@@ -180,6 +180,17 @@ mod tests {
         assert_eq!(score.deductions.len(), 2);
         assert!(score.incomplete);
         assert_eq!(score, calculate_exposure(&report));
+    }
+
+    #[test]
+    fn informational_wildcard_finding_does_not_reduce_score() {
+        let mut report = report();
+        report.status = ScanStatus::Completed;
+        report.findings = vec![finding("DNS-WILDCARD-DETECTED", Severity::Info)];
+
+        let score = calculate_exposure(&report);
+        assert_eq!(score.value, 100);
+        assert!(score.deductions.is_empty());
     }
 
     #[test]
