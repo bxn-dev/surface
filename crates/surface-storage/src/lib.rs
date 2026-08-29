@@ -1,21 +1,13 @@
 //! Persists immutable Surface reports and queryable scan history in `SQLite`.
 
 mod backup;
-mod identity;
-mod jobs;
-mod scheduling;
 
 pub use backup::{backup_database, restore_database, verify_database};
-pub use identity::{
-    ActorContext, AuditEvent, AuditFilter, AuthenticatedActor, Role, TenantId, UserRecord,
-};
-pub use jobs::{JobState, ScanJob};
-pub use scheduling::NotificationDelivery;
 
 use std::fmt;
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use surface_core::{ScanReport, ScanStatus, Severity};
 use time::{Duration, OffsetDateTime};
@@ -569,7 +561,7 @@ fn scan_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanSummary> {
 
 #[cfg(test)]
 mod tests {
-    use surface_core::{normalize_target, ScanConfiguration, ScanReport, ScanStatus};
+    use surface_core::{ScanConfiguration, ScanReport, ScanStatus, normalize_target};
     use tempfile::tempdir;
 
     use super::{HistoryFilter, RetentionPolicy, Storage};
@@ -695,12 +687,14 @@ mod tests {
         let mut storage = Storage::open(directory.path().join("surface.db"))
             .unwrap_or_else(|error| panic!("{error}"));
 
-        assert!(storage
-            .prune(&RetentionPolicy {
-                older_than: Some(time::Duration::seconds(i64::MAX)),
-                ..RetentionPolicy::default()
-            })
-            .is_err());
+        assert!(
+            storage
+                .prune(&RetentionPolicy {
+                    older_than: Some(time::Duration::seconds(i64::MAX)),
+                    ..RetentionPolicy::default()
+                })
+                .is_err()
+        );
     }
 
     #[test]
