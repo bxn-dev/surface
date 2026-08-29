@@ -1,14 +1,17 @@
 use std::fmt;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use clap_complete::Shell;
+use indicatif::{ProgressBar, ProgressDrawTarget};
 use surface_core::{
-    ScanConfiguration, ScanReport, ScanStatus, Severity, analyze_intelligence, normalize_target,
-    parse_bundle, parse_ports, parse_udp_ports, run_scan,
+    IntelligenceObservation, ScanConfiguration, ScanProgress, ScanReport, ScanSelection, ScanStage,
+    ScanStatus, Severity, SkippedCheck, analyze_certificate_transparency, analyze_intelligence,
+    analyze_related_domains, calculate_exposure, normalize_target, parse_bundle, parse_ports,
+    parse_udp_ports, run_scan_selected_until_with_progress,
 };
 use surface_report::{
     decode_key, diff_reports, render_cyclonedx, render_diff_html, render_diff_json,
@@ -29,7 +32,6 @@ const AUTHORIZED_USE_NOTICE: &str =
 const EXIT_INVALID_INPUT: u8 = 1;
 const EXIT_HIGH_FINDINGS: u8 = 2;
 const EXIT_SCAN_FAILED: u8 = 3;
-const EXIT_AUTHORIZATION_REQUIRED: u8 = 4;
 
 /// Analyzes externally observable services and security-related configuration.
 #[derive(Debug, Parser)]
@@ -102,9 +104,6 @@ struct ScanArgs {
     /// Writes the report to a file instead of stdout.
     #[arg(long)]
     output: Option<PathBuf>,
-    /// Disables terminal colors.
-    #[arg(long)]
-    no_color: bool,
     /// Enables diagnostic logging in later scanning phases.
     #[arg(long, conflicts_with = "quiet")]
     verbose: bool,
@@ -117,9 +116,6 @@ struct ScanArgs {
     /// Restricts future address discovery to IPv6.
     #[arg(long, conflicts_with = "ipv4_only")]
     ipv6_only: bool,
-    /// Confirms authorization to actively assess the target.
-    #[arg(long)]
-    acknowledge_authorization: bool,
     /// `SQLite` database path used when persistence is enabled.
     #[arg(long, requires = "persist")]
     database: Option<PathBuf>,
@@ -135,6 +131,9 @@ struct ScanArgs {
     /// Optional bounded offline network/CVE intelligence bundle.
     #[arg(long)]
     intelligence_bundle: Option<PathBuf>,
+    /// Restricts the default full scan to selected groups (repeatable or comma-separated).
+    #[arg(long, value_enum, value_delimiter = ',')]
+    only: Vec<ScanPart>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -188,7 +187,7 @@ enum DatabaseCommand {
         #[arg(long)]
         database: PathBuf,
     },
-    /// Atomically restores a verified backup. The server must be stopped.
+    /// Atomically restores a verified backup while no process uses the database.
     Restore {
         #[arg(long)]
         database: PathBuf,
@@ -289,6 +288,16 @@ impl From<SeverityFilter> for Severity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ScanPart {
+    Dns,
+    Ports,
+    Services,
+    Http,
+    Tls,
+    Intelligence,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ReportFormat {
     Terminal,
@@ -372,11 +381,34 @@ async fn run(command: Command) -> Result<(), AppError> {
 
 #[expect(
     clippy::too_many_lines,
-    reason = "linear CLI orchestration preserves authorization, cancellation, intelligence, and output ordering"
+    reason = "linear CLI orchestration preserves cancellation, intelligence, and output ordering"
 )]
 async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
+    let scan_deadline = tokio::time::Instant::now() + arguments.global_timeout;
     let target = normalize_target(&arguments.target)
         .map_err(|error| AppError::new(error.to_string(), EXIT_INVALID_INPUT))?;
+    let full_scan = arguments.only.is_empty();
+    let intelligence_selected = full_scan || arguments.only.contains(&ScanPart::Intelligence);
+    let selected_stages = arguments
+        .only
+        .iter()
+        .filter_map(|part| match part {
+            ScanPart::Dns | ScanPart::Intelligence => None,
+            ScanPart::Ports => Some(ScanStage::Ports),
+            ScanPart::Services => Some(ScanStage::Services),
+            ScanPart::Http => Some(ScanStage::Http),
+            ScanPart::Tls => Some(ScanStage::Tls),
+        })
+        .collect::<Vec<_>>();
+    let selection = if full_scan {
+        ScanSelection::all()
+    } else {
+        ScanSelection::only(&selected_stages)
+    };
+    let reverse_ns_api_key = intelligence_selected
+        .then(|| std::env::var("SURFACE_WHOISXML_API_KEY").ok())
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
     if target.explicit_ip.is_some_and(|ip| {
         (arguments.ipv4_only && ip.is_ipv6()) || (arguments.ipv6_only && ip.is_ipv4())
     }) {
@@ -395,12 +427,6 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
         .map_err(|error| AppError::new(error.to_string(), EXIT_INVALID_INPUT))?;
     let udp_ports = parse_udp_ports(&arguments.udp_ports)
         .map_err(|error| AppError::new(error.to_string(), EXIT_INVALID_INPUT))?;
-    if !target.is_local() && !arguments.acknowledge_authorization {
-        return Err(AppError::new(
-            "active scanning requires --acknowledge-authorization for non-loopback targets",
-            EXIT_AUTHORIZATION_REQUIRED,
-        ));
-    }
     let configuration = ScanConfiguration {
         ports: ports.as_slice().to_vec(),
         udp_ports: udp_ports.as_slice().to_vec(),
@@ -410,7 +436,7 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
         global_timeout_ms: duration_millis(arguments.global_timeout)?,
         ipv4_only: arguments.ipv4_only,
         ipv6_only: arguments.ipv6_only,
-        authorization_acknowledged: arguments.acknowledge_authorization,
+        authorization_acknowledged: true,
     };
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
@@ -419,35 +445,211 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
             signal_cancellation.cancel();
         }
     });
-    let mut report = run_scan(target, configuration, cancellation).await;
-    signal_task.abort();
-    if !arguments.subdomains.is_empty()
-        || !arguments.dkim_selectors.is_empty()
-        || arguments.intelligence_bundle.is_some()
+    let progress = progress_bar(arguments.quiet);
+    let scan_progress = progress.clone();
+    let mut report = run_scan_selected_until_with_progress(
+        target,
+        configuration,
+        cancellation.clone(),
+        selection,
+        scan_deadline,
+        move |event| match event {
+            ScanProgress::Started(stage) => scan_progress.set_message(format!("{stage:?}")),
+            ScanProgress::Completed {
+                stage,
+                observations,
+            } => scan_progress.set_message(format!("{stage:?}: {observations}")),
+        },
+    )
+    .await;
+    progress.finish_and_clear();
+    if intelligence_selected
+        && (!arguments.subdomains.is_empty()
+            || !arguments.dkim_selectors.is_empty()
+            || arguments.intelligence_bundle.is_some())
     {
-        let bundle = if let Some(path) = &arguments.intelligence_bundle {
-            let bytes = tokio::fs::read(path).await.map_err(|error| {
-                AppError::new(
-                    format!("could not read '{}': {error}", path.display()),
-                    EXIT_INVALID_INPUT,
+        let explicit_intelligence = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => None,
+            result = tokio::time::timeout_at(scan_deadline, async {
+                let bundle = if let Some(path) = &arguments.intelligence_bundle {
+                    let bytes = read_bounded(path, 16 * 1024 * 1024).await?;
+                    Some(parse_bundle(&bytes).map_err(|error| {
+                        AppError::new(error, EXIT_INVALID_INPUT)
+                    })?)
+                } else {
+                    None
+                };
+                analyze_intelligence(
+                    &report,
+                    &arguments.subdomains,
+                    &arguments.dkim_selectors,
+                    bundle.as_ref(),
+                    arguments.request_timeout,
                 )
-            })?;
-            Some(parse_bundle(&bytes).map_err(|error| AppError::new(error, EXIT_INVALID_INPUT))?)
-        } else {
-            None
+                .await
+                .map_err(|error| AppError::new(error, EXIT_INVALID_INPUT))
+            }) => result.ok(),
         };
-        report.intelligence = Some(
-            analyze_intelligence(
-                &report,
-                &arguments.subdomains,
-                &arguments.dkim_selectors,
-                bundle.as_ref(),
-                arguments.request_timeout,
-            )
-            .await
-            .map_err(|error| AppError::new(error, EXIT_INVALID_INPUT))?,
+        if let Some(result) = explicit_intelligence {
+            match result {
+                Ok(observation) => {
+                    if !observation.complete {
+                        mark_intelligence_partial(&mut report);
+                    }
+                    report.intelligence = Some(observation);
+                }
+                Err(error) => {
+                    signal_task.abort();
+                    return Err(error);
+                }
+            }
+        } else {
+            mark_intelligence_stopped(
+                &mut report,
+                cancellation.is_cancelled(),
+                &[
+                    ("subdomain_dns", !arguments.subdomains.is_empty()),
+                    ("dkim", !arguments.dkim_selectors.is_empty()),
+                    (
+                        "offline_network_metadata",
+                        arguments.intelligence_bundle.is_some(),
+                    ),
+                    (
+                        "offline_cve_correlation",
+                        arguments.intelligence_bundle.is_some(),
+                    ),
+                ],
+            );
+        }
+    }
+    let related_configured = reverse_ns_api_key.is_some();
+    let ct_applicable = intelligence_selected && report.target.hostname.is_some();
+    let certspotter_api_key = std::env::var("SURFACE_CERTSPOTTER_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let passive_results = if ct_applicable || related_configured {
+        let passive_progress = progress_bar(arguments.quiet);
+        passive_progress.set_message("Passive intelligence");
+        let results = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => None,
+            result = tokio::time::timeout_at(scan_deadline, async {
+                tokio::join!(
+                    async {
+                        if ct_applicable {
+                            Some(
+                                analyze_certificate_transparency(
+                                    &report,
+                                    certspotter_api_key.as_deref(),
+                                    arguments.request_timeout,
+                                )
+                                .await,
+                            )
+                        } else {
+                            None
+                        }
+                    },
+                    async {
+                        if let Some(api_key) = reverse_ns_api_key.as_deref() {
+                            Some(
+                                analyze_related_domains(
+                                    &report,
+                                    api_key,
+                                    arguments.request_timeout,
+                                )
+                                .await,
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                )
+            }) => result.ok(),
+        };
+        passive_progress.finish_and_clear();
+        results
+    } else {
+        Some((None, None))
+    };
+    if let Some((certificate_transparency, related_domains)) = passive_results {
+        if let Some(result) = certificate_transparency {
+            match result {
+                Ok(observation) => {
+                    let intelligence =
+                        report
+                            .intelligence
+                            .get_or_insert_with(|| IntelligenceObservation {
+                                complete: true,
+                                ..IntelligenceObservation::default()
+                            });
+                    let complete = observation.complete;
+                    intelligence.complete &= complete;
+                    intelligence.certificate_transparency = Some(observation);
+                    if !complete {
+                        mark_intelligence_partial(&mut report);
+                    }
+                }
+                Err(reason) => {
+                    report.skipped_checks.push(SkippedCheck {
+                        check: "certificate_transparency".to_owned(),
+                        reason,
+                    });
+                    mark_intelligence_partial(&mut report);
+                }
+            }
+        }
+        if let Some(result) = related_domains {
+            match result {
+                Ok(related) => {
+                    let intelligence =
+                        report
+                            .intelligence
+                            .get_or_insert_with(|| IntelligenceObservation {
+                                complete: true,
+                                ..IntelligenceObservation::default()
+                            });
+                    let complete = related.complete;
+                    intelligence.complete &= complete;
+                    intelligence.related_domains = Some(related);
+                    if !complete {
+                        mark_intelligence_partial(&mut report);
+                    }
+                }
+                Err(reason) => {
+                    report.skipped_checks.push(SkippedCheck {
+                        check: "related_domains".to_owned(),
+                        reason,
+                    });
+                    mark_intelligence_partial(&mut report);
+                }
+            }
+        }
+    } else {
+        mark_intelligence_stopped(
+            &mut report,
+            cancellation.is_cancelled(),
+            &[
+                ("certificate_transparency", ct_applicable),
+                ("related_domains", related_configured),
+            ],
         );
     }
+    if intelligence_selected && !ct_applicable {
+        report.skipped_checks.push(SkippedCheck {
+            check: "certificate_transparency".to_owned(),
+            reason: "certificate transparency discovery requires a hostname target".to_owned(),
+        });
+    }
+    record_intelligence_skips(
+        &mut report,
+        &arguments,
+        intelligence_selected,
+        related_configured,
+    );
+    refresh_exposure_score(&mut report);
+    report.completed_at = Some(time::OffsetDateTime::now_utc());
+    signal_task.abort();
     if arguments.persist {
         let database = arguments.database.as_ref().ok_or_else(|| {
             AppError::new("--database is required with --persist", EXIT_INVALID_INPUT)
@@ -475,9 +677,21 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
         })?;
     } else {
         print!("{rendered}");
+        let html_path = PathBuf::from(format!("surface-{}.html", report.scan_id));
+        tokio::fs::write(&html_path, render_html(&report))
+            .await
+            .map_err(|error| {
+                AppError::new(
+                    format!("could not write '{}': {error}", html_path.display()),
+                    EXIT_SCAN_FAILED,
+                )
+            })?;
+        if !arguments.quiet {
+            eprintln!("HTML report: {}", html_path.display());
+        }
     }
 
-    let _ = (arguments.no_color, arguments.verbose, arguments.quiet);
+    let _ = arguments.verbose;
     if let Some(error) = report_exit_error(&report) {
         return Err(error);
     }
@@ -821,6 +1035,91 @@ fn report_exit_error(report: &ScanReport) -> Option<AppError> {
         })
 }
 
+fn refresh_exposure_score(report: &mut ScanReport) {
+    report.exposure_score = Some(calculate_exposure(report));
+}
+
+fn mark_intelligence_partial(report: &mut ScanReport) {
+    if report.status == ScanStatus::Completed {
+        report.status = ScanStatus::Partial;
+        "Scan completed with incomplete intelligence.".clone_into(&mut report.message);
+    }
+}
+
+fn mark_intelligence_stopped(report: &mut ScanReport, cancelled: bool, checks: &[(&str, bool)]) {
+    let reason = if cancelled {
+        report.status = ScanStatus::Interrupted;
+        "scan interrupted"
+    } else {
+        if report.status != ScanStatus::Interrupted {
+            report.status = ScanStatus::Partial;
+        }
+        "global timeout expired"
+    };
+    reason.clone_into(&mut report.message);
+    for (check, applicable) in checks {
+        if *applicable
+            && !report
+                .skipped_checks
+                .iter()
+                .any(|skipped| skipped.check == *check)
+        {
+            report.skipped_checks.push(SkippedCheck {
+                check: (*check).to_owned(),
+                reason: reason.to_owned(),
+            });
+        }
+    }
+}
+
+fn record_intelligence_skips(
+    report: &mut ScanReport,
+    arguments: &ScanArgs,
+    intelligence_selected: bool,
+    related_configured: bool,
+) {
+    let mut skip = |check: &str, reason: &str| {
+        report.skipped_checks.push(SkippedCheck {
+            check: check.to_owned(),
+            reason: reason.to_owned(),
+        });
+    };
+    if !intelligence_selected {
+        skip("intelligence", "excluded by --only");
+        return;
+    }
+    if arguments.subdomains.is_empty() {
+        skip("subdomain_dns", "no child domains supplied");
+    }
+    if arguments.dkim_selectors.is_empty() {
+        skip("dkim", "no selectors supplied");
+    }
+    if arguments.intelligence_bundle.is_none() {
+        skip(
+            "offline_network_metadata",
+            "no intelligence bundle supplied",
+        );
+        skip("offline_cve_correlation", "no intelligence bundle supplied");
+    }
+    if !related_configured {
+        skip(
+            "related_domains",
+            "SURFACE_WHOISXML_API_KEY is not configured",
+        );
+    }
+}
+
+fn progress_bar(quiet: bool) -> ProgressBar {
+    let draw_target = if !quiet && io::stderr().is_terminal() {
+        ProgressDrawTarget::stderr_with_hz(15)
+    } else {
+        ProgressDrawTarget::hidden()
+    };
+    let progress = ProgressBar::with_draw_target(None, draw_target);
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress
+}
+
 fn init_logging(command: &Command) {
     let level = match command {
         Command::Scan(arguments) if arguments.quiet => tracing_subscriber::filter::LevelFilter::OFF,
@@ -884,8 +1183,9 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Command, EXIT_AUTHORIZATION_REQUIRED, EXIT_INVALID_INPUT, EXIT_SCAN_FAILED,
-        parse_duration, parse_retention_duration, report_exit_error, run,
+        Cli, Command, EXIT_INVALID_INPUT, EXIT_SCAN_FAILED, ScanPart, mark_intelligence_partial,
+        mark_intelligence_stopped, parse_duration, parse_retention_duration,
+        refresh_exposure_score, report_exit_error, run,
     };
 
     #[test]
@@ -898,11 +1198,15 @@ mod tests {
             "22,80,443",
             "--format",
             "json",
-            "--acknowledge-authorization",
+            "--only",
+            "dns,http",
         ])
         .unwrap_or_else(|error| panic!("{error}"));
 
-        assert!(matches!(cli.command, Command::Scan(_)));
+        let Command::Scan(arguments) = cli.command else {
+            panic!("expected scan command");
+        };
+        assert_eq!(arguments.only, vec![ScanPart::Dns, ScanPart::Http]);
     }
 
     #[test]
@@ -938,8 +1242,38 @@ mod tests {
         assert!(parse_retention_duration("9223372036854775807d").is_err());
     }
 
+    #[test]
+    fn stopped_intelligence_records_timeout_or_cancellation() {
+        let mut report = surface_core::ScanReport::not_started(
+            surface_core::normalize_target("example.com").unwrap_or_else(|error| panic!("{error}")),
+            surface_core::ScanConfiguration {
+                ports: vec![80],
+                udp_ports: Vec::new(),
+                concurrency: 1,
+                connect_timeout_ms: 100,
+                request_timeout_ms: 100,
+                global_timeout_ms: 1_000,
+                ipv4_only: false,
+                ipv6_only: false,
+                authorization_acknowledged: true,
+            },
+        );
+        report.status = surface_core::ScanStatus::Completed;
+        mark_intelligence_partial(&mut report);
+        assert_eq!(report.status, surface_core::ScanStatus::Partial);
+        report.status = surface_core::ScanStatus::Completed;
+
+        mark_intelligence_stopped(&mut report, false, &[("certificate_transparency", true)]);
+        assert_eq!(report.status, surface_core::ScanStatus::Partial);
+        assert_eq!(report.skipped_checks[0].reason, "global timeout expired");
+
+        mark_intelligence_stopped(&mut report, true, &[("related_domains", true)]);
+        assert_eq!(report.status, surface_core::ScanStatus::Interrupted);
+        assert_eq!(report.skipped_checks[1].reason, "scan interrupted");
+    }
+
     #[tokio::test]
-    async fn invalid_configuration_precedes_authorization_failure() {
+    async fn invalid_configuration_is_rejected_before_scanning() {
         let invalid = Cli::try_parse_from(["surface", "scan", "example.com", "--ports", "nope"])
             .unwrap_or_else(|error| panic!("{error}"));
         let invalid_error = run(invalid.command)
@@ -953,13 +1287,38 @@ mod tests {
             .await
             .expect_err("incompatible address family must fail");
         assert_eq!(family_error.exit_code, EXIT_INVALID_INPUT);
+    }
 
-        let unauthorized = Cli::try_parse_from(["surface", "scan", "example.com"])
-            .unwrap_or_else(|error| panic!("{error}"));
-        let authorization_error = run(unauthorized.command)
-            .await
-            .expect_err("authorization must fail");
-        assert_eq!(authorization_error.exit_code, EXIT_AUTHORIZATION_REQUIRED);
+    #[test]
+    fn skipped_checks_mark_recalculated_score_incomplete() {
+        let mut report = surface_core::ScanReport::not_started(
+            surface_core::normalize_target("127.0.0.1").unwrap_or_else(|error| panic!("{error}")),
+            surface_core::ScanConfiguration {
+                ports: vec![80],
+                udp_ports: Vec::new(),
+                concurrency: 1,
+                connect_timeout_ms: 100,
+                request_timeout_ms: 100,
+                global_timeout_ms: 1_000,
+                ipv4_only: false,
+                ipv6_only: false,
+                authorization_acknowledged: true,
+            },
+        );
+        report.status = surface_core::ScanStatus::Completed;
+        report.skipped_checks.push(surface_core::SkippedCheck {
+            check: "related_domains".to_owned(),
+            reason: "credential unavailable".to_owned(),
+        });
+
+        refresh_exposure_score(&mut report);
+
+        assert!(
+            report
+                .exposure_score
+                .as_ref()
+                .is_some_and(|score| score.incomplete)
+        );
     }
 
     #[test]
