@@ -9,8 +9,14 @@ use futures::StreamExt;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-use crate::{DnsObservation, ScanReport, analyze_dns, lookup_txt, normalize_target};
+use crate::{
+    DnsObservation, ScanReport, ScanStatus, SkippedCheck, analyze_dns, lookup_txt,
+    normalize_target,
+    passive_http::{FetchError, PinnedClients, get_bounded, is_public_destination},
+};
 
 const MAX_SUBDOMAINS: usize = 32;
 const MAX_SELECTORS: usize = 32;
@@ -23,6 +29,85 @@ const MAX_CT_CANDIDATES: usize = 1_000;
 const MAX_CT_RESPONSE_BYTES: usize = 1_048_576;
 const CERTSPOTTER_ENDPOINT: &str = "https://api.certspotter.com/v1/issuances";
 
+// RDAP limits bound fan-out, memory, recursion, and retained administrative data.
+const MAX_RDAP_ADDRESSES: usize = 8;
+const MAX_RDAP_CONCURRENCY: usize = 4;
+const MAX_BOOTSTRAP_BYTES: usize = 64 * 1_024;
+const MAX_RDAP_RESPONSE_BYTES: usize = 256 * 1_024;
+const MAX_JSON_DEPTH: usize = 32;
+const MAX_BOOTSTRAP_SERVICES: usize = 64;
+const MAX_BOOTSTRAP_PREFIXES: usize = 1_024;
+const MAX_BOOTSTRAP_ALTERNATES: usize = 8;
+const MAX_BOOTSTRAP_STRING_BYTES: usize = 512;
+const MAX_RDAP_STATUSES: usize = 16;
+const MAX_RDAP_STATUS_BYTES: usize = 64;
+const MAX_RDAP_HANDLE_BYTES: usize = 256;
+const MAX_RDAP_NAME_BYTES: usize = 256;
+const MAX_RDAP_TYPE_BYTES: usize = 128;
+const MAX_RDAP_COUNTRY_BYTES: usize = 2;
+const IANA_IPV4_BOOTSTRAP: &str = "https://data.iana.org/rdap/ipv4.json";
+const IANA_IPV6_BOOTSTRAP: &str = "https://data.iana.org/rdap/ipv6.json";
+
+#[derive(Debug, Clone, Copy)]
+struct AllowedRdapBase {
+    scheme: &'static str,
+    host: &'static str,
+    port: Option<u16>,
+    base_path: &'static str,
+    registry: &'static str,
+}
+
+const OFFICIAL_RDAP_BASES: &[AllowedRdapBase] = &[
+    AllowedRdapBase {
+        scheme: "https",
+        host: "rdap.arin.net",
+        port: None,
+        base_path: "/registry/",
+        registry: "ARIN",
+    },
+    AllowedRdapBase {
+        scheme: "https",
+        host: "rdap.db.ripe.net",
+        port: None,
+        base_path: "/",
+        registry: "RIPE NCC",
+    },
+    AllowedRdapBase {
+        scheme: "https",
+        host: "rdap.apnic.net",
+        port: None,
+        base_path: "/",
+        registry: "APNIC",
+    },
+    AllowedRdapBase {
+        scheme: "https",
+        host: "rdap.lacnic.net",
+        port: None,
+        base_path: "/rdap/",
+        registry: "LACNIC",
+    },
+    AllowedRdapBase {
+        scheme: "https",
+        host: "rdap.afrinic.net",
+        port: None,
+        base_path: "/rdap/",
+        registry: "AFRINIC",
+    },
+];
+
+#[derive(Clone, Copy)]
+struct RdapConfig<'a> {
+    ipv4_bootstrap: &'a str,
+    ipv6_bootstrap: &'a str,
+    allowed_bases: &'a [AllowedRdapBase],
+}
+
+const PRODUCTION_RDAP_CONFIG: RdapConfig<'static> = RdapConfig {
+    ipv4_bootstrap: IANA_IPV4_BOOTSTRAP,
+    ipv6_bootstrap: IANA_IPV6_BOOTSTRAP,
+    allowed_bases: OFFICIAL_RDAP_BASES,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct IntelligenceObservation {
     pub subdomains: Vec<SubdomainObservation>,
@@ -34,6 +119,9 @@ pub struct IntelligenceObservation {
     pub related_domains: Option<RelatedDomainsObservation>,
     #[serde(default)]
     pub certificate_transparency: Option<CertificateTransparencyObservation>,
+    /// Administrative IP-allocation evidence from authoritative RDAP registries.
+    #[serde(default)]
+    pub network_registrations: Vec<NetworkRegistrationObservation>,
     pub complete: bool,
     pub errors: Vec<String>,
 }
@@ -81,6 +169,31 @@ pub struct CertificateTransparencyCandidate {
     pub name: String,
     pub wildcard: bool,
     pub issuance_count: usize,
+}
+
+/// Authoritative administrative registration evidence for one primary DNS address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkRegistrationObservation {
+    /// Canonical address queried once through RDAP.
+    pub address: IpAddr,
+    /// Stable evidence source identifier.
+    pub source: String,
+    /// Authoritative regional registry selected by IANA bootstrap data.
+    pub registry: String,
+    /// Registry-unique network handle when supplied.
+    pub handle: Option<String>,
+    /// Registration holder-assigned network name when supplied.
+    pub name: Option<String>,
+    /// Registry-specific administrative network classification.
+    pub network_type: Option<String>,
+    /// Registered range start when supplied with a coherent end.
+    pub start_address: Option<IpAddr>,
+    /// Registered range end when supplied with a coherent start.
+    pub end_address: Option<IpAddr>,
+    /// Registration country code; this is not geolocation evidence.
+    pub registration_country: Option<String>,
+    /// Bounded registry statuses.
+    pub statuses: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,6 +409,561 @@ pub async fn analyze_intelligence(
         .dkim
         .sort_by(|left, right| left.selector.cmp(&right.selector));
     Ok(observation)
+}
+
+#[derive(Debug, Deserialize)]
+struct RdapBootstrap {
+    services: Vec<(Vec<String>, Vec<String>)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RdapNetworkResponse {
+    #[serde(rename = "objectClassName")]
+    object_class_name: Option<String>,
+    handle: Option<String>,
+    name: Option<String>,
+    #[serde(rename = "type")]
+    network_type: Option<String>,
+    #[serde(rename = "startAddress")]
+    start_address: Option<String>,
+    #[serde(rename = "endAddress")]
+    end_address: Option<String>,
+    country: Option<String>,
+    #[serde(default)]
+    status: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BootstrapEntry {
+    prefix: Prefix,
+    endpoint: Option<ApprovedRdapBase>,
+}
+
+#[derive(Debug, Clone)]
+struct ApprovedRdapBase {
+    url: Url,
+    policy: AllowedRdapBase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RdapStop {
+    Cancelled,
+    Deadline,
+}
+
+/// Collects bounded authoritative administrative registration evidence.
+///
+/// Only eligible addresses already present in primary DNS results are queried. Returned ranges,
+/// links, and entities never become scan targets or inputs to other intelligence checks.
+pub async fn analyze_network_registrations(
+    report: &mut ScanReport,
+    request_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) {
+    analyze_network_registrations_with(
+        report,
+        request_timeout,
+        deadline,
+        cancellation,
+        PRODUCTION_RDAP_CONFIG,
+        PinnedClients::new(request_timeout),
+    )
+    .await;
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded RDAP orchestration keeps one shared deadline and lifecycle transition"
+)]
+async fn analyze_network_registrations_with(
+    report: &mut ScanReport,
+    request_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    config: RdapConfig<'_>,
+    mut clients: PinnedClients,
+) {
+    let (addresses, truncated) = eligible_rdap_addresses(report);
+    if addresses.is_empty() {
+        record_network_registration_skip(
+            report,
+            "no eligible external address in primary DNS results",
+        );
+        return;
+    }
+
+    let mut failures = BTreeSet::new();
+    if truncated {
+        failures.insert("address limit reached");
+    }
+    let mut ipv4_entries = None;
+    let mut ipv6_entries = None;
+    for (ipv6, endpoint) in [
+        (false, config.ipv4_bootstrap),
+        (true, config.ipv6_bootstrap),
+    ] {
+        if !addresses.iter().any(|address| address.is_ipv6() == ipv6) {
+            continue;
+        }
+        let Ok(url) = Url::parse(endpoint) else {
+            failures.insert("bootstrap endpoint was invalid");
+            continue;
+        };
+        let body = match async {
+            let client = clients.client_for(&url, deadline, cancellation).await?;
+            get_bounded(
+                &client,
+                url,
+                MAX_BOOTSTRAP_BYTES,
+                request_timeout,
+                deadline,
+                cancellation,
+            )
+            .await
+        }
+        .await
+        {
+            Ok(body) => body,
+            Err(FetchError::Cancelled) => {
+                finish_network_registrations(
+                    report,
+                    Vec::new(),
+                    failures,
+                    Some(RdapStop::Cancelled),
+                );
+                return;
+            }
+            Err(FetchError::Deadline) => {
+                finish_network_registrations(
+                    report,
+                    Vec::new(),
+                    failures,
+                    Some(RdapStop::Deadline),
+                );
+                return;
+            }
+            Err(error) => {
+                failures.insert(bootstrap_fetch_reason(error));
+                continue;
+            }
+        };
+        match parse_bootstrap(&body, ipv6, config.allowed_bases) {
+            Ok(entries) if ipv6 => ipv6_entries = Some(entries),
+            Ok(entries) => ipv4_entries = Some(entries),
+            Err(reason) => {
+                failures.insert(reason);
+            }
+        }
+    }
+
+    let mut requests = Vec::new();
+    for address in addresses {
+        let entries = if address.is_ipv4() {
+            ipv4_entries.as_deref()
+        } else {
+            ipv6_entries.as_deref()
+        };
+        let Some(entries) = entries else {
+            failures.insert("bootstrap data unavailable for an address family");
+            continue;
+        };
+        let Some(endpoint) = longest_bootstrap_endpoint(address, entries) else {
+            failures.insert("bootstrap had no approved authoritative endpoint");
+            continue;
+        };
+        match construct_rdap_url(&endpoint, address) {
+            Ok(url) => match clients.client_for(&url, deadline, cancellation).await {
+                Ok(client) => requests.push((address, endpoint.policy.registry, url, client)),
+                Err(FetchError::Cancelled) => {
+                    finish_network_registrations(
+                        report,
+                        Vec::new(),
+                        failures,
+                        Some(RdapStop::Cancelled),
+                    );
+                    return;
+                }
+                Err(FetchError::Deadline) => {
+                    finish_network_registrations(
+                        report,
+                        Vec::new(),
+                        failures,
+                        Some(RdapStop::Deadline),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    failures.insert(rdap_fetch_reason(error));
+                }
+            },
+            Err(reason) => {
+                failures.insert(reason);
+            }
+        }
+    }
+
+    let lookups = futures::stream::iter(requests.into_iter().map(
+        |(address, registry, url, client)| async move {
+            let response = get_bounded(
+                &client,
+                url,
+                MAX_RDAP_RESPONSE_BYTES,
+                request_timeout,
+                deadline,
+                cancellation,
+            )
+            .await;
+            (address, registry, response)
+        },
+    ))
+    .buffer_unordered(MAX_RDAP_CONCURRENCY);
+    futures::pin_mut!(lookups);
+
+    let mut observations = Vec::new();
+    let mut stop = None;
+    while let Some((address, registry, response)) = lookups.next().await {
+        match response {
+            Ok(body) => match parse_rdap_response(&body, address, registry) {
+                Ok(observation) => observations.push(observation),
+                Err(reason) => {
+                    failures.insert(reason);
+                }
+            },
+            Err(FetchError::Cancelled) => {
+                stop = Some(RdapStop::Cancelled);
+                break;
+            }
+            Err(FetchError::Deadline) => {
+                stop = Some(RdapStop::Deadline);
+                break;
+            }
+            Err(error) => {
+                failures.insert(rdap_fetch_reason(error));
+            }
+        }
+    }
+    finish_network_registrations(report, observations, failures, stop);
+}
+
+fn eligible_rdap_addresses(report: &ScanReport) -> (Vec<IpAddr>, bool) {
+    let mut addresses = report
+        .dns
+        .iter()
+        .flat_map(|dns| dns.resolved_hosts.iter())
+        .filter_map(|host| canonical_external_address(host.ip))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let truncated = addresses.len() > MAX_RDAP_ADDRESSES;
+    addresses.truncate(MAX_RDAP_ADDRESSES);
+    (addresses, truncated)
+}
+
+fn canonical_external_address(address: IpAddr) -> Option<IpAddr> {
+    is_public_destination(address).then_some(address)
+}
+
+fn parse_bootstrap(
+    body: &[u8],
+    ipv6: bool,
+    allowed_bases: &[AllowedRdapBase],
+) -> Result<Vec<BootstrapEntry>, &'static str> {
+    validate_json_depth(body).map_err(|()| "bootstrap JSON exceeded nesting limit")?;
+    let bootstrap: RdapBootstrap =
+        serde_json::from_slice(body).map_err(|_| "bootstrap response was invalid")?;
+    if bootstrap.services.len() > MAX_BOOTSTRAP_SERVICES {
+        return Err("bootstrap response exceeded service limit");
+    }
+    let mut prefix_count = 0_usize;
+    let mut entries = Vec::new();
+    for (prefixes, alternates) in bootstrap.services {
+        prefix_count = prefix_count.saturating_add(prefixes.len());
+        if prefix_count > MAX_BOOTSTRAP_PREFIXES
+            || alternates.len() > MAX_BOOTSTRAP_ALTERNATES
+            || prefixes
+                .iter()
+                .chain(alternates.iter())
+                .any(|value| value.len() > MAX_BOOTSTRAP_STRING_BYTES)
+        {
+            return Err("bootstrap response exceeded retained field limits");
+        }
+        let endpoint = alternates
+            .iter()
+            .find_map(|value| approved_rdap_base(value, allowed_bases));
+        for value in prefixes {
+            let prefix = parse_prefix(&value).map_err(|_| "bootstrap response was invalid")?;
+            if prefix.network.is_ipv6() != ipv6 {
+                return Err("bootstrap response mixed address families");
+            }
+            entries.push(BootstrapEntry {
+                prefix,
+                endpoint: endpoint.clone(),
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn approved_rdap_base(value: &str, allowed_bases: &[AllowedRdapBase]) -> Option<ApprovedRdapBase> {
+    let url = Url::parse(value).ok()?;
+    let policy = allowed_bases
+        .iter()
+        .copied()
+        .find(|policy| url_matches_policy(&url, *policy, policy.base_path))?;
+    Some(ApprovedRdapBase { url, policy })
+}
+
+fn url_matches_policy(url: &Url, policy: AllowedRdapBase, path: &str) -> bool {
+    let port_matches = match policy.port {
+        Some(port) => url.port() == Some(port),
+        None => url.port().is_none(),
+    };
+    url.scheme() == policy.scheme
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.host_str() == Some(policy.host)
+        && port_matches
+        && url.path() == path
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+fn longest_bootstrap_endpoint(
+    address: IpAddr,
+    entries: &[BootstrapEntry],
+) -> Option<ApprovedRdapBase> {
+    entries
+        .iter()
+        .filter(|entry| entry.prefix.contains(address))
+        .max_by_key(|entry| entry.prefix.length)
+        .and_then(|entry| entry.endpoint.clone())
+}
+
+fn construct_rdap_url(endpoint: &ApprovedRdapBase, address: IpAddr) -> Result<Url, &'static str> {
+    if !url_matches_policy(&endpoint.url, endpoint.policy, endpoint.policy.base_path) {
+        return Err("RDAP base endpoint failed validation");
+    }
+    let canonical = address.to_string();
+    let mut url = endpoint.url.clone();
+    url.path_segments_mut()
+        .map_err(|()| "RDAP base endpoint failed validation")?
+        .pop_if_empty()
+        .push("ip")
+        .push(&canonical);
+    let expected_path = format!("{}ip/{canonical}", endpoint.policy.base_path);
+    if !url_matches_policy(&url, endpoint.policy, &expected_path) {
+        return Err("constructed RDAP endpoint failed validation");
+    }
+    Ok(url)
+}
+
+fn parse_rdap_response(
+    body: &[u8],
+    address: IpAddr,
+    registry: &str,
+) -> Result<NetworkRegistrationObservation, &'static str> {
+    validate_json_depth(body).map_err(|()| "RDAP JSON exceeded nesting limit")?;
+    let response: RdapNetworkResponse =
+        serde_json::from_slice(body).map_err(|_| "RDAP response was invalid")?;
+    if response.object_class_name.as_deref() != Some("ip network") {
+        return Err("RDAP response was not an IP network object");
+    }
+    validate_optional_field(response.handle.as_ref(), MAX_RDAP_HANDLE_BYTES)?;
+    validate_optional_field(response.name.as_ref(), MAX_RDAP_NAME_BYTES)?;
+    validate_optional_field(response.network_type.as_ref(), MAX_RDAP_TYPE_BYTES)?;
+    validate_optional_field(response.country.as_ref(), MAX_RDAP_COUNTRY_BYTES)?;
+    if response.country.as_ref().is_some_and(|country| {
+        country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_alphabetic())
+    }) {
+        return Err("RDAP response contained an invalid registration country");
+    }
+    if response.status.len() > MAX_RDAP_STATUSES
+        || response
+            .status
+            .iter()
+            .any(|status| status.is_empty() || status.len() > MAX_RDAP_STATUS_BYTES)
+    {
+        return Err("RDAP response exceeded retained status limits");
+    }
+    let (start_address, end_address) = match (response.start_address, response.end_address) {
+        (None, None) => (None, None),
+        (Some(start), Some(end)) => {
+            let start = start
+                .parse::<IpAddr>()
+                .map_err(|_| "RDAP response contained an invalid range")?;
+            let end = end
+                .parse::<IpAddr>()
+                .map_err(|_| "RDAP response contained an invalid range")?;
+            if !coherent_range(start, end, address) {
+                return Err("RDAP response range did not contain the queried address");
+            }
+            (Some(start), Some(end))
+        }
+        _ => return Err("RDAP response contained an incomplete range"),
+    };
+    let mut statuses = response.status;
+    statuses.sort();
+    statuses.dedup();
+    Ok(NetworkRegistrationObservation {
+        address,
+        source: "RDAP".to_owned(),
+        registry: registry.to_owned(),
+        handle: response.handle,
+        name: response.name,
+        network_type: response.network_type,
+        start_address,
+        end_address,
+        registration_country: response.country,
+        statuses,
+    })
+}
+
+fn validate_optional_field(value: Option<&String>, maximum: usize) -> Result<(), &'static str> {
+    if value.is_some_and(|value| value.is_empty() || value.len() > maximum) {
+        return Err("RDAP response exceeded retained string limits");
+    }
+    Ok(())
+}
+
+fn coherent_range(start: IpAddr, end: IpAddr, address: IpAddr) -> bool {
+    match (start, end, address) {
+        (IpAddr::V4(start), IpAddr::V4(end), IpAddr::V4(address)) => {
+            u32::from(start) <= u32::from(address) && u32::from(address) <= u32::from(end)
+        }
+        (IpAddr::V6(start), IpAddr::V6(end), IpAddr::V6(address)) => {
+            u128::from(start) <= u128::from(address) && u128::from(address) <= u128::from(end)
+        }
+        _ => false,
+    }
+}
+
+fn validate_json_depth(body: &[u8]) -> Result<(), ()> {
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in body {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match *byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > MAX_JSON_DEPTH {
+                    return Err(());
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+const fn bootstrap_fetch_reason(error: FetchError) -> &'static str {
+    match error {
+        FetchError::Timeout => "bootstrap request timed out",
+        FetchError::Resolution => "bootstrap hostname resolution failed",
+        FetchError::Destination => "bootstrap destination was not public",
+        FetchError::Request => "bootstrap request failed",
+        FetchError::Http(_) => "bootstrap service returned an HTTP error",
+        FetchError::TooLarge => "bootstrap response exceeded 64 KiB",
+        FetchError::Cancelled => "scan interrupted",
+        FetchError::Deadline => "global timeout expired",
+    }
+}
+
+const fn rdap_fetch_reason(error: FetchError) -> &'static str {
+    match error {
+        FetchError::Timeout => "RDAP request timed out",
+        FetchError::Resolution => "RDAP hostname resolution failed",
+        FetchError::Destination => "RDAP destination was not public",
+        FetchError::Request => "RDAP request failed",
+        FetchError::Http(_) => "RDAP service returned an HTTP error",
+        FetchError::TooLarge => "RDAP response exceeded 256 KiB",
+        FetchError::Cancelled => "scan interrupted",
+        FetchError::Deadline => "global timeout expired",
+    }
+}
+
+fn finish_network_registrations(
+    report: &mut ScanReport,
+    mut observations: Vec<NetworkRegistrationObservation>,
+    failures: BTreeSet<&'static str>,
+    stop: Option<RdapStop>,
+) {
+    observations.sort_by_key(|observation| observation.address);
+    if !observations.is_empty() || !failures.is_empty() || stop.is_some() {
+        let intelligence = report
+            .intelligence
+            .get_or_insert_with(|| IntelligenceObservation {
+                complete: true,
+                ..IntelligenceObservation::default()
+            });
+        intelligence.network_registrations.extend(observations);
+        intelligence
+            .network_registrations
+            .sort_by_key(|observation| observation.address);
+        intelligence
+            .network_registrations
+            .dedup_by_key(|observation| observation.address);
+        intelligence.complete &= failures.is_empty() && stop.is_none();
+    }
+
+    let reason = match stop {
+        Some(RdapStop::Cancelled) => {
+            if report.status != ScanStatus::Failed {
+                report.status = ScanStatus::Interrupted;
+                "Scan interrupted.".clone_into(&mut report.message);
+            }
+            Some("scan interrupted".to_owned())
+        }
+        Some(RdapStop::Deadline) => {
+            mark_network_registration_partial(report);
+            Some("global timeout expired".to_owned())
+        }
+        None if !failures.is_empty() => {
+            mark_network_registration_partial(report);
+            Some(format!(
+                "network registration lookup incomplete: {}",
+                failures.into_iter().collect::<Vec<_>>().join("; ")
+            ))
+        }
+        None => None,
+    };
+    if let Some(reason) = reason {
+        record_network_registration_skip(report, &reason);
+    }
+}
+
+fn mark_network_registration_partial(report: &mut ScanReport) {
+    if report.status == ScanStatus::Completed {
+        report.status = ScanStatus::Partial;
+        "Scan completed with incomplete intelligence.".clone_into(&mut report.message);
+    }
+}
+
+fn record_network_registration_skip(report: &mut ScanReport, reason: &str) {
+    if let Some(existing) = report
+        .skipped_checks
+        .iter_mut()
+        .find(|skip| skip.check == "network_registration")
+    {
+        reason.clone_into(&mut existing.reason);
+    } else {
+        report.skipped_checks.push(SkippedCheck {
+            check: "network_registration".to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
 }
 
 /// Finds bounded passive hostname candidates in Certificate Transparency logs.
@@ -707,7 +1375,7 @@ fn correlate_cves(report: &ScanReport, bundle: &IntelligenceBundle) -> Vec<CveCa
     output
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Prefix {
     network: IpAddr,
     length: u8,
@@ -792,6 +1460,8 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        str::FromStr,
+        time::Duration,
     };
 
     use reqwest::Client;
@@ -802,14 +1472,20 @@ mod tests {
     };
 
     use crate::{
-        DetectionConfidence, HostObservation, PortObservation, PortState, ScanConfiguration,
-        ScanReport, ServiceKind, ServiceObservation, TransportProtocol, normalize_target,
+        AddressSource, DetectionConfidence, DnsObservation, HostObservation, MailObservation,
+        PortObservation, PortState, ResolvedHost, ScanConfiguration, ScanReport, ScanStatus,
+        ServiceKind, ServiceObservation, SpfObservation, TransportProtocol, normalize_target,
     };
 
     use super::{
-        CertSpotterIssuance, MAX_CT_RESPONSE_BYTES, analyze_certificate_transparency_at,
-        analyze_intelligence, correlate_cves, correlate_networks, ct_candidates,
-        fetch_certspotter_page, identify_nameserver_provider, parse_bundle, related_candidates,
+        AllowedRdapBase, CertSpotterIssuance, MAX_BOOTSTRAP_BYTES, MAX_CT_RESPONSE_BYTES,
+        MAX_RDAP_RESPONSE_BYTES, OFFICIAL_RDAP_BASES, PinnedClients, RdapConfig, RdapStop,
+        analyze_certificate_transparency_at, analyze_intelligence,
+        analyze_network_registrations_with, approved_rdap_base, canonical_external_address,
+        coherent_range, construct_rdap_url, correlate_cves, correlate_networks, ct_candidates,
+        eligible_rdap_addresses, fetch_certspotter_page, finish_network_registrations,
+        identify_nameserver_provider, longest_bootstrap_endpoint, parse_bootstrap, parse_bundle,
+        parse_rdap_response, related_candidates, validate_json_depth,
     };
 
     async fn mock_http_response(
@@ -856,6 +1532,141 @@ mod tests {
         (format!("http://{address}/v1/issuances"), task)
     }
 
+    #[derive(Clone)]
+    struct MockRoute {
+        status: &'static str,
+        headers: String,
+        body: Vec<u8>,
+        delay: Duration,
+    }
+
+    struct MockHttpRequests {
+        stop: tokio::sync::oneshot::Sender<()>,
+        task: JoinHandle<Vec<String>>,
+    }
+
+    impl MockHttpRequests {
+        async fn finish(self) -> Vec<String> {
+            let _ = self.stop.send(());
+            self.task.await.unwrap_or_else(|error| panic!("{error}"))
+        }
+    }
+
+    async fn mock_http_routes(
+        maximum_requests: usize,
+        build: impl FnOnce(SocketAddr) -> BTreeMap<String, MockRoute>,
+    ) -> (SocketAddr, MockHttpRequests) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let routes = build(address);
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..maximum_requests {
+                let (mut socket, request_text, reply) = tokio::select! {
+                    result = async {
+                        let (mut socket, _) = listener
+                            .accept()
+                            .await
+                            .unwrap_or_else(|error| panic!("{error}"));
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 1_024];
+                        while request.len() < 16 * 1_024 {
+                            let read = socket
+                                .read(&mut chunk)
+                                .await
+                                .unwrap_or_else(|error| panic!("{error}"));
+                            if read == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&chunk[..read]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let request_text = String::from_utf8_lossy(&request).into_owned();
+                        let path = request_text
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let reply = routes.get(path).cloned().unwrap_or(MockRoute {
+                            status: "404 Not Found",
+                            headers: String::new(),
+                            body: Vec::new(),
+                            delay: Duration::ZERO,
+                        });
+                        (socket, request_text, reply)
+                    } => result,
+                    _ = &mut stopped => break,
+                };
+                requests.push(request_text);
+                let completed = tokio::select! {
+                    () = async {
+                        tokio::time::sleep(reply.delay).await;
+                        let response = format!(
+                            "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+                            reply.status,
+                            reply.body.len(),
+                            reply.headers
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.write_all(&reply.body).await;
+                    } => true,
+                    _ = &mut stopped => false,
+                };
+                if !completed {
+                    break;
+                }
+            }
+            requests
+        });
+        (address, MockHttpRequests { stop, task })
+    }
+
+    fn report_with_dns(addresses: impl IntoIterator<Item = IpAddr>) -> ScanReport {
+        let mut report = report();
+        report.status = ScanStatus::Completed;
+        report.dns = Some(DnsObservation {
+            queried_name: "example.com".to_owned(),
+            records: Vec::new(),
+            cname_chain: Vec::new(),
+            dangling_cnames: Vec::new(),
+            resolved_hosts: addresses
+                .into_iter()
+                .map(|ip| ResolvedHost {
+                    hostname: Some("example.com".to_owned()),
+                    ip,
+                    source: if ip.is_ipv4() {
+                        AddressSource::ARecord
+                    } else {
+                        AddressSource::AaaaRecord
+                    },
+                })
+                .collect(),
+            mail: MailObservation {
+                mx_present: false,
+                spf: SpfObservation {
+                    records: Vec::new(),
+                    terminal_policy: None,
+                },
+                dmarc: Vec::new(),
+                mta_sts: Vec::new(),
+                mta_sts_policy_available: None,
+                tls_rpt: Vec::new(),
+            },
+            dnssec: None,
+            authoritative_axfr: None,
+            wildcard_dns: None,
+            errors: Vec::new(),
+        });
+        report
+    }
+
     fn report() -> ScanReport {
         let mut report = ScanReport::not_started(
             normalize_target("example.com").unwrap_or_else(|error| panic!("{error}")),
@@ -891,6 +1702,682 @@ mod tests {
             protocol_details: BTreeMap::default(),
         });
         report
+    }
+
+    fn fixture_clients(
+        request_timeout: Duration,
+        addresses: impl IntoIterator<Item = SocketAddr>,
+    ) -> PinnedClients {
+        PinnedClients::fixture(
+            request_timeout,
+            addresses
+                .into_iter()
+                .map(|address| (address.ip().to_string(), vec![address]))
+                .collect(),
+        )
+    }
+
+    fn fixture_policy(address: SocketAddr) -> AllowedRdapBase {
+        let host: &'static str = Box::leak(address.ip().to_string().into_boxed_str());
+        AllowedRdapBase {
+            scheme: "http",
+            host,
+            port: Some(address.port()),
+            base_path: "/rdap/",
+            registry: "TEST-RIR",
+        }
+    }
+
+    #[tokio::test]
+    async fn excluded_address_classes_make_no_requests() {
+        let excluded = [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.88.99.1",
+            "192.168.1.1",
+            "192.175.48.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:10.0.0.1",
+            "::ffff:100.64.0.1",
+            "::ffff:192.0.2.1",
+            "64:ff9b::",
+            "64:ff9b::ffff:ffff",
+            "64:ff9b:1::",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
+            "2001::1",
+            "2001:2::1",
+            "2001:db8::1",
+            "2002::1",
+            "2620:4f:8000::1",
+            "3fff::1",
+            "fc00::1",
+            "fe80::1",
+            "ff00::1",
+        ]
+        .into_iter()
+        .map(|value| IpAddr::from_str(value).unwrap_or_else(|error| panic!("{error}")))
+        .collect::<Vec<_>>();
+        for address in &excluded {
+            assert_eq!(canonical_external_address(*address), None, "{address}");
+        }
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let server = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let endpoint = format!("http://{server}/ipv4.json");
+        let mut report = report_with_dns(excluded);
+        analyze_network_registrations_with(
+            &mut report,
+            Duration::from_millis(50),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &tokio_util::sync::CancellationToken::new(),
+            RdapConfig {
+                ipv4_bootstrap: &endpoint,
+                ipv6_bootstrap: &endpoint,
+                allowed_bases: &[],
+            },
+            fixture_clients(Duration::from_millis(50), [server]),
+        )
+        .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(report.status, ScanStatus::Completed);
+        assert_eq!(report.skipped_checks.len(), 1);
+        assert_eq!(report.skipped_checks[0].check, "network_registration");
+    }
+
+    #[test]
+    fn eligible_addresses_are_canonical_sorted_deduplicated_and_capped() {
+        let mut addresses = (1..=10)
+            .rev()
+            .map(|last| IpAddr::V4(Ipv4Addr::new(8, 8, 8, last)))
+            .collect::<Vec<_>>();
+        addresses.extend([
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::from_str("::ffff:8.8.8.8").unwrap_or_else(|error| panic!("{error}")),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ]);
+        let report = report_with_dns(addresses);
+
+        let (eligible, truncated) = eligible_rdap_addresses(&report);
+
+        assert!(truncated);
+        assert_eq!(eligible.len(), 8);
+        assert!(eligible.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(eligible[0], IpAddr::V4(Ipv4Addr::new(8, 8, 8, 1)));
+        assert_eq!(eligible[7], IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn bootstrap_uses_longest_prefix_and_preserves_family() {
+        let ipv4 = br#"{
+          "services":[
+            [["8.0.0.0/8"],["https://rdap.arin.net/registry/"]],
+            [["8.8.0.0/16"],["https://rdap.apnic.net/"]]
+          ]
+        }"#;
+        let entries = parse_bootstrap(ipv4, false, OFFICIAL_RDAP_BASES)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let endpoint = longest_bootstrap_endpoint(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), &entries)
+            .unwrap_or_else(|| panic!("missing endpoint"));
+        assert_eq!(endpoint.policy.registry, "APNIC");
+
+        let ipv6 = br#"{"services":[[["2001:4860::/32"],["https://rdap.db.ripe.net/"]]]}"#;
+        let entries = parse_bootstrap(ipv6, true, OFFICIAL_RDAP_BASES)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            longest_bootstrap_endpoint(
+                IpAddr::from_str("2001:4860:4860::8888").unwrap_or_else(|error| panic!("{error}")),
+                &entries,
+            )
+            .is_some()
+        );
+        assert!(parse_bootstrap(ipv4, true, OFFICIAL_RDAP_BASES).is_err());
+        assert!(parse_bootstrap(b"not-json", false, OFFICIAL_RDAP_BASES).is_err());
+        let long_bootstrap = format!(
+            r#"{{"services":[[["8.0.0.0/8"],["https://{}"]]]}}"#,
+            "x".repeat(513)
+        );
+        assert!(parse_bootstrap(long_bootstrap.as_bytes(), false, OFFICIAL_RDAP_BASES).is_err());
+
+        let malicious_specific = br#"{
+          "services":[
+            [["8.0.0.0/8"],["https://rdap.arin.net/registry/"]],
+            [["8.8.0.0/16"],["https://evil.invalid/rdap/"]]
+          ]
+        }"#;
+        let entries = parse_bootstrap(malicious_specific, false, OFFICIAL_RDAP_BASES)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            longest_bootstrap_endpoint(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), &entries,).is_none()
+        );
+    }
+
+    #[test]
+    fn rdap_endpoint_policy_rejects_every_unsafe_url_component() {
+        for rejected in [
+            "http://rdap.arin.net/registry/",
+            "https://evil.invalid/registry/",
+            "https://rdap.arin.net:444/registry/",
+            "https://rdap.arin.net/wrong/",
+            "https://user@rdap.arin.net/registry/",
+            "https://user:password@rdap.arin.net/registry/",
+            "https://rdap.arin.net/registry/?query=1",
+            "https://rdap.arin.net/registry/#fragment",
+            "https://rdap.arin.net/registry",
+        ] {
+            assert!(
+                approved_rdap_base(rejected, OFFICIAL_RDAP_BASES).is_none(),
+                "{rejected}"
+            );
+        }
+        assert!(
+            approved_rdap_base("https://rdap.arin.net:443/registry/", OFFICIAL_RDAP_BASES)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rdap_url_uses_exact_canonical_percent_safe_ip_path() {
+        let base = approved_rdap_base("https://rdap.apnic.net/", OFFICIAL_RDAP_BASES)
+            .unwrap_or_else(|| panic!("approved endpoint rejected"));
+        let ipv4 = construct_rdap_url(&base, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(ipv4.as_str(), "https://rdap.apnic.net/ip/8.8.8.8");
+        let address = IpAddr::from_str("2001:4860:4860:0:0:0:0:8888")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let ipv6 = construct_rdap_url(&base, address).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            ipv6.as_str(),
+            "https://rdap.apnic.net/ip/2001:4860:4860::8888"
+        );
+        assert!(ipv6.query().is_none());
+        assert!(ipv6.fragment().is_none());
+    }
+
+    #[test]
+    fn rdap_parser_bounds_json_and_retained_fields() {
+        let too_deep = format!("{}0{}", "[".repeat(33), "]".repeat(33));
+        assert!(validate_json_depth(too_deep.as_bytes()).is_err());
+        assert!(parse_rdap_response(b"not-json", "8.8.8.8".parse().unwrap(), "ARIN").is_err());
+
+        let long_handle = format!(
+            r#"{{"objectClassName":"ip network","handle":"{}"}}"#,
+            "x".repeat(257)
+        );
+        assert!(
+            parse_rdap_response(long_handle.as_bytes(), "8.8.8.8".parse().unwrap(), "ARIN")
+                .is_err()
+        );
+        let statuses = serde_json::json!({
+            "objectClassName": "ip network",
+            "status": (0..17).map(|index| format!("status-{index}")).collect::<Vec<_>>()
+        });
+        assert!(
+            parse_rdap_response(
+                &serde_json::to_vec(&statuses).unwrap_or_else(|error| panic!("{error}")),
+                "8.8.8.8".parse().unwrap(),
+                "ARIN"
+            )
+            .is_err()
+        );
+        let long_status = serde_json::json!({
+            "objectClassName": "ip network",
+            "status": ["x".repeat(65)]
+        });
+        assert!(
+            parse_rdap_response(
+                &serde_json::to_vec(&long_status).unwrap_or_else(|error| panic!("{error}")),
+                "8.8.8.8".parse().unwrap(),
+                "ARIN"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rdap_parser_retains_only_bounded_registration_fields() {
+        let body = br#"{
+          "objectClassName":"ip network",
+          "handle":"NET-8-8-8-0-1",
+          "name":"EXAMPLE-NET",
+          "type":"DIRECT ALLOCATION",
+          "startAddress":"8.8.8.0",
+          "endAddress":"8.8.8.255",
+          "country":"US",
+          "status":["active","active"],
+          "entities":[{"handle":"CONTACT"}],
+          "remarks":[{"description":["not retained"]}],
+          "links":[{"href":"https://example.invalid/next"}]
+        }"#;
+        let observation = parse_rdap_response(
+            body,
+            "8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}")),
+            "ARIN",
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(observation.source, "RDAP");
+        assert_eq!(observation.registry, "ARIN");
+        assert_eq!(observation.handle.as_deref(), Some("NET-8-8-8-0-1"));
+        assert_eq!(observation.registration_country.as_deref(), Some("US"));
+        assert_eq!(observation.statuses, ["active"]);
+        let serialized =
+            serde_json::to_string(&observation).unwrap_or_else(|error| panic!("{error}"));
+        assert!(!serialized.contains("CONTACT"));
+        assert!(!serialized.contains("not retained"));
+        assert!(!serialized.contains("example.invalid"));
+    }
+
+    #[test]
+    fn rdap_ranges_must_be_coherent_and_contain_the_query() {
+        assert!(coherent_range(
+            "8.8.8.0".parse().unwrap(),
+            "8.8.8.255".parse().unwrap(),
+            "8.8.8.8".parse().unwrap()
+        ));
+        for body in [
+            br#"{"objectClassName":"ip network","startAddress":"8.8.9.0","endAddress":"8.8.9.255"}"#.as_slice(),
+            br#"{"objectClassName":"ip network","startAddress":"8.8.8.255","endAddress":"8.8.8.0"}"#.as_slice(),
+            br#"{"objectClassName":"ip network","startAddress":"8.8.8.0"}"#.as_slice(),
+            br#"{"objectClassName":"ip network","startAddress":"2001:4860::","endAddress":"2001:4860::ffff"}"#.as_slice(),
+        ] {
+            assert!(parse_rdap_response(body, "8.8.8.8".parse().unwrap(), "ARIN").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_rdap_success_is_retained_without_target_propagation() {
+        let (server, requests) = mock_http_routes(3, |address| {
+            let bootstrap = format!(
+                r#"{{"services":[[["1.0.0.0/8","8.0.0.0/8"],["http://{address}/rdap/"]]]}}"#
+            );
+            BTreeMap::from([
+                (
+                    "/ipv4.json".to_owned(),
+                    MockRoute {
+                        status: "200 OK",
+                        headers: String::new(),
+                        body: bootstrap.into_bytes(),
+                        delay: Duration::ZERO,
+                    },
+                ),
+                (
+                    "/rdap/ip/1.1.1.1".to_owned(),
+                    MockRoute {
+                        status: "200 OK",
+                        headers: String::new(),
+                        body: br#"{"objectClassName":"ip network","handle":"NET-1","startAddress":"1.0.0.0","endAddress":"1.255.255.255","country":"AU","entities":[{"handle":"DROP"}]}"#.to_vec(),
+                        delay: Duration::ZERO,
+                    },
+                ),
+                (
+                    "/rdap/ip/8.8.8.8".to_owned(),
+                    MockRoute {
+                        status: "503 Service Unavailable",
+                        headers: String::new(),
+                        body: b"secret body".to_vec(),
+                        delay: Duration::ZERO,
+                    },
+                ),
+            ])
+        })
+        .await;
+        let bootstrap = format!("http://{server}/ipv4.json");
+        let allowed = [fixture_policy(server)];
+        let mut report = report_with_dns([
+            "8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}")),
+            "1.1.1.1".parse().unwrap_or_else(|error| panic!("{error}")),
+        ]);
+        let hosts = report.hosts.clone();
+        let services = report.services.clone();
+
+        analyze_network_registrations_with(
+            &mut report,
+            Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+            RdapConfig {
+                ipv4_bootstrap: &bootstrap,
+                ipv6_bootstrap: &bootstrap,
+                allowed_bases: &allowed,
+            },
+            fixture_clients(Duration::from_secs(1), [server]),
+        )
+        .await;
+        let requests = requests.finish().await;
+
+        let registrations = &report
+            .intelligence
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing intelligence"))
+            .network_registrations;
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(
+            registrations[0].address,
+            "1.1.1.1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(report.status, ScanStatus::Partial);
+        assert_eq!(report.skipped_checks.len(), 1);
+        assert!(!report.skipped_checks[0].reason.contains("secret"));
+        assert_eq!(report.hosts, hosts);
+        assert_eq!(report.services, services);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("GET /rdap/ip/"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_and_rdap_size_limits_are_enforced_before_json_parse() {
+        let (bootstrap_server, bootstrap_requests) = mock_http_routes(1, |_| {
+            BTreeMap::from([(
+                "/ipv4.json".to_owned(),
+                MockRoute {
+                    status: "200 OK",
+                    headers: String::new(),
+                    body: vec![b' '; MAX_BOOTSTRAP_BYTES + 1],
+                    delay: Duration::ZERO,
+                },
+            )])
+        })
+        .await;
+        let endpoint = format!("http://{bootstrap_server}/ipv4.json");
+        let mut report =
+            report_with_dns(["8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}"))]);
+        analyze_network_registrations_with(
+            &mut report,
+            Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+            RdapConfig {
+                ipv4_bootstrap: &endpoint,
+                ipv6_bootstrap: &endpoint,
+                allowed_bases: &[],
+            },
+            fixture_clients(Duration::from_secs(1), [bootstrap_server]),
+        )
+        .await;
+        let bootstrap_requests = bootstrap_requests.finish().await;
+        assert_eq!(bootstrap_requests.len(), 1);
+        assert!(report.skipped_checks[0].reason.contains("64 KiB"));
+
+        let (rdap_server, rdap_requests) = mock_http_routes(2, |address| {
+            let bootstrap =
+                format!(r#"{{"services":[[["8.0.0.0/8"],["http://{address}/rdap/"]]]}}"#);
+            BTreeMap::from([
+                (
+                    "/ipv4.json".to_owned(),
+                    MockRoute {
+                        status: "200 OK",
+                        headers: String::new(),
+                        body: bootstrap.into_bytes(),
+                        delay: Duration::ZERO,
+                    },
+                ),
+                (
+                    "/rdap/ip/8.8.8.8".to_owned(),
+                    MockRoute {
+                        status: "200 OK",
+                        headers: String::new(),
+                        body: vec![b' '; MAX_RDAP_RESPONSE_BYTES + 1],
+                        delay: Duration::ZERO,
+                    },
+                ),
+            ])
+        })
+        .await;
+        let endpoint = format!("http://{rdap_server}/ipv4.json");
+        let allowed = [fixture_policy(rdap_server)];
+        let mut report =
+            report_with_dns(["8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}"))]);
+        analyze_network_registrations_with(
+            &mut report,
+            Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+            RdapConfig {
+                ipv4_bootstrap: &endpoint,
+                ipv6_bootstrap: &endpoint,
+                allowed_bases: &allowed,
+            },
+            fixture_clients(Duration::from_secs(1), [rdap_server]),
+        )
+        .await;
+        let rdap_requests = rdap_requests.finish().await;
+        assert_eq!(rdap_requests.len(), 2);
+        assert!(report.skipped_checks[0].reason.contains("256 KiB"));
+    }
+
+    #[tokio::test]
+    async fn rdap_redirects_are_not_followed() {
+        let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let target_url = format!(
+            "http://{}/ipv4.json",
+            target
+                .local_addr()
+                .unwrap_or_else(|error| panic!("{error}"))
+        );
+        let (redirect, requests) = mock_http_routes(1, move |_| {
+            BTreeMap::from([(
+                "/ipv4.json".to_owned(),
+                MockRoute {
+                    status: "302 Found",
+                    headers: format!("Location: {target_url}\r\n"),
+                    body: Vec::new(),
+                    delay: Duration::ZERO,
+                },
+            )])
+        })
+        .await;
+        let endpoint = format!("http://{redirect}/ipv4.json");
+        let mut report =
+            report_with_dns(["8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}"))]);
+        analyze_network_registrations_with(
+            &mut report,
+            Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+            RdapConfig {
+                ipv4_bootstrap: &endpoint,
+                ipv6_bootstrap: &endpoint,
+                allowed_bases: &[],
+            },
+            fixture_clients(Duration::from_secs(1), [redirect]),
+        )
+        .await;
+        let requests = requests.finish().await;
+        assert_eq!(requests.len(), 1);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), target.accept())
+                .await
+                .is_err()
+        );
+        assert!(report.skipped_checks[0].reason.contains("HTTP error"));
+    }
+
+    #[tokio::test]
+    async fn request_timeout_deadline_and_cancellation_have_stable_lifecycle() {
+        async fn run_delayed(request_timeout: Duration, deadline: Duration) -> ScanReport {
+            let (server, requests) = mock_http_routes(2, |address| {
+                let bootstrap =
+                    format!(r#"{{"services":[[["8.0.0.0/8"],["http://{address}/rdap/"]]]}}"#);
+                BTreeMap::from([
+                    (
+                        "/ipv4.json".to_owned(),
+                        MockRoute {
+                            status: "200 OK",
+                            headers: String::new(),
+                            body: bootstrap.into_bytes(),
+                            delay: Duration::ZERO,
+                        },
+                    ),
+                    (
+                        "/rdap/ip/8.8.8.8".to_owned(),
+                        MockRoute {
+                            status: "200 OK",
+                            headers: String::new(),
+                            body: br#"{"objectClassName":"ip network"}"#.to_vec(),
+                            delay: Duration::from_millis(100),
+                        },
+                    ),
+                ])
+            })
+            .await;
+            let endpoint = format!("http://{server}/ipv4.json");
+            let allowed = [fixture_policy(server)];
+            let mut report =
+                report_with_dns(["8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}"))]);
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                analyze_network_registrations_with(
+                    &mut report,
+                    request_timeout,
+                    tokio::time::Instant::now() + deadline,
+                    &tokio_util::sync::CancellationToken::new(),
+                    RdapConfig {
+                        ipv4_bootstrap: &endpoint,
+                        ipv6_bootstrap: &endpoint,
+                        allowed_bases: &allowed,
+                    },
+                    fixture_clients(request_timeout, [server]),
+                ),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+            let requests = requests.finish().await;
+            for path in ["/ipv4.json", "/rdap/ip/8.8.8.8"] {
+                assert!(
+                    requests
+                        .iter()
+                        .filter(|request| request.starts_with(&format!("GET {path} ")))
+                        .count()
+                        <= 1
+                );
+            }
+            report
+        }
+
+        let timeout_report = run_delayed(Duration::from_millis(10), Duration::from_secs(1)).await;
+        assert_eq!(timeout_report.status, ScanStatus::Partial);
+        assert!(
+            timeout_report.skipped_checks[0]
+                .reason
+                .contains("timed out")
+        );
+
+        let deadline_report = run_delayed(Duration::from_secs(1), Duration::from_millis(10)).await;
+        assert_eq!(deadline_report.status, ScanStatus::Partial);
+        assert_eq!(
+            deadline_report.skipped_checks[0].reason,
+            "global timeout expired"
+        );
+
+        let (server, requests) = mock_http_routes(1, |_| BTreeMap::new()).await;
+        let endpoint = format!("http://{server}/ipv4.json");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let mut cancelled =
+            report_with_dns(["8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}"))]);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            analyze_network_registrations_with(
+                &mut cancelled,
+                Duration::from_secs(1),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                &cancellation,
+                RdapConfig {
+                    ipv4_bootstrap: &endpoint,
+                    ipv6_bootstrap: &endpoint,
+                    allowed_bases: &[],
+                },
+                fixture_clients(Duration::from_secs(1), [server]),
+            ),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(cancelled.status, ScanStatus::Interrupted);
+        assert_eq!(cancelled.skipped_checks[0].reason, "scan interrupted");
+        assert!(requests.finish().await.is_empty());
+    }
+
+    #[test]
+    fn network_registration_skip_is_deduplicated_and_preserves_terminal_states() {
+        let mut report = report_with_dns([]);
+        finish_network_registrations(
+            &mut report,
+            Vec::new(),
+            BTreeSet::from(["RDAP request failed"]),
+            None,
+        );
+        finish_network_registrations(
+            &mut report,
+            Vec::new(),
+            BTreeSet::from(["RDAP request timed out"]),
+            None,
+        );
+        assert_eq!(report.skipped_checks.len(), 1);
+        assert_eq!(report.status, ScanStatus::Partial);
+
+        report.status = ScanStatus::Failed;
+        finish_network_registrations(
+            &mut report,
+            Vec::new(),
+            BTreeSet::new(),
+            Some(RdapStop::Cancelled),
+        );
+        assert_eq!(report.status, ScanStatus::Failed);
+        report.status = ScanStatus::Interrupted;
+        finish_network_registrations(
+            &mut report,
+            Vec::new(),
+            BTreeSet::from(["RDAP request failed"]),
+            None,
+        );
+        assert_eq!(report.status, ScanStatus::Interrupted);
+        assert_eq!(report.skipped_checks.len(), 1);
+    }
+
+    #[test]
+    fn older_intelligence_json_defaults_registration_evidence() {
+        let observation: super::IntelligenceObservation = serde_json::from_str(
+            r#"{
+              "subdomains":[],"dkim":[],"networks":[],"cve_candidates":[],
+              "bundle_version":null,"related_domains":null,
+              "certificate_transparency":null,"complete":true,"errors":[]
+            }"#,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(observation.network_registrations.is_empty());
     }
 
     #[test]

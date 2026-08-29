@@ -6,6 +6,7 @@ mod exposure;
 mod findings;
 mod http;
 mod intelligence;
+mod passive_http;
 mod ports;
 mod scanner;
 mod service;
@@ -44,8 +45,9 @@ pub use http::{CookieObservation, HttpObservation, RedirectObservation, analyze_
 pub use intelligence::{
     CertificateTransparencyCandidate, CertificateTransparencyObservation, CveCandidate,
     DkimObservation, IntelligenceBundle, IntelligenceObservation, NetworkEntry, NetworkMetadata,
-    RelatedDomainCandidate, RelatedDomainsObservation, SubdomainObservation, VulnerabilityEntry,
-    analyze_certificate_transparency, analyze_intelligence, analyze_related_domains, parse_bundle,
+    NetworkRegistrationObservation, RelatedDomainCandidate, RelatedDomainsObservation,
+    SubdomainObservation, VulnerabilityEntry, analyze_certificate_transparency,
+    analyze_intelligence, analyze_network_registrations, analyze_related_domains, parse_bundle,
 };
 #[doc(inline)]
 pub use ports::{PortSelection, PortSpecError, parse_ports, parse_udp_ports};

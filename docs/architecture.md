@@ -11,12 +11,14 @@ flowchart TD
     F --> H[Validating TLS Analysis]
     F --> SSH[Bounded SSH Identification and KEXINIT Analysis]
     C --> I[Passive Mail Analysis]
+    C --> RDAP[Bounded Authoritative RDAP Registration Evidence]
     C --> S[Bounded CertSpotter CT Discovery]
     G --> J[Pure Finding Engine]
     H --> J
     SSH --> J
     I --> J
     J --> K[Versioned ScanReport]
+    RDAP --> K
     S --> K
     K --> L[Terminal]
     K --> M[JSON]
@@ -47,4 +49,4 @@ Service probes are selected by a centralized port-to-behavior registry. Payloads
 
 TLS performs one normal validating rustls handshake per deduplicated applicable implicit-TLS endpoint. It does not disable validation, brute-force protocols or ciphers, or reconnect to recover rejected certificate evidence.
 
-HTTP remains address-pinned and same-origin. CertSpotter Certificate Transparency names, supplied subdomains, and DKIM selectors are passive and bounded; CT names are reported but never scanned automatically. CVE/network metadata comes only from a validated offline bundle; candidates are correlations, never exploit confirmation.
+HTTP remains address-pinned and same-origin. RDAP considers only up to eight sorted, deduplicated eligible addresses already in the primary target's `dns.resolved_hosts`; IANA bootstrap prefixes, registry-returned ranges, links, and entities never enter any target set or other intelligence query. Bootstrap selection is longest-prefix, registry URLs are constrained to exact official HTTPS hosts and base paths, redirects are disabled, and bootstrap/RDAP bytes, JSON depth, strings, collections, concurrency, request time, cancellation, and the caller deadline are bounded. Its fields are administrative registration evidence, not current BGP-origin, ownership, operational-control, or geolocation claims. CertSpotter Certificate Transparency names, supplied subdomains, and DKIM selectors are passive and bounded; CT names are reported but never scanned automatically. CVE/network metadata comes only from a validated offline bundle; candidates are correlations, never exploit confirmation.
