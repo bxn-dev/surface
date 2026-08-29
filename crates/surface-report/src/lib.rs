@@ -255,40 +255,62 @@ pub fn render_terminal(report: &ScanReport) -> String {
     if !report.tls.is_empty() {
         let _ = writeln!(output, "TLS");
         for tls in &report.tls {
-            if tls.handshake_succeeded {
+            let _ = writeln!(
+                output,
+                "  {}  validation={}  trusted={}  hostname={}  protocol={}  cipher={}  chain={}  key_bits={}",
+                tls.address,
+                if tls.handshake_succeeded {
+                    "passed"
+                } else {
+                    "failed"
+                },
+                option_yes_no(tls.certificate_trusted),
+                option_yes_no(tls.hostname_matches),
+                clean_terminal(tls.protocol_version.as_deref().unwrap_or("unknown")),
+                clean_terminal(tls.cipher_suite.as_deref().unwrap_or("unknown")),
+                tls.certificate_chain_length
+                    .map_or_else(|| "unknown".to_owned(), |length| length.to_string()),
+                tls.public_key_bits
+                    .map_or_else(|| "unknown".to_owned(), |bits| bits.to_string())
+            );
+            let _ = writeln!(
+                output,
+                "    Leaf SHA-256: {}",
+                clean_terminal(tls.leaf_certificate_sha256.as_deref().unwrap_or("unknown"))
+            );
+            let _ = writeln!(
+                output,
+                "    Subject: {}  Issuer: {}  Serial: {}",
+                clean_terminal(tls.subject.as_deref().unwrap_or("unknown")),
+                clean_terminal(tls.issuer.as_deref().unwrap_or("unknown")),
+                clean_terminal(tls.serial_number.as_deref().unwrap_or("unknown"))
+            );
+            let _ = writeln!(
+                output,
+                "    Validity: {} to {}  key_oid={}  signature_oid={}",
+                tls.valid_from_unix
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                tls.valid_until_unix
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                clean_terminal(tls.public_key_algorithm.as_deref().unwrap_or("unknown")),
+                clean_terminal(tls.signature_algorithm.as_deref().unwrap_or("unknown"))
+            );
+            let _ = writeln!(
+                output,
+                "    SANs{}: {}",
+                if tls.subject_alt_names_truncated {
+                    " (truncated)"
+                } else {
+                    ""
+                },
+                clean_terminal(&tls.subject_alt_names.join(", "))
+            );
+            for limitation in &tls.errors {
                 let _ = writeln!(
                     output,
-                    "  {}  trusted=yes  hostname=yes  protocol={}  cipher={}  chain={}  key_bits={}",
-                    tls.address,
-                    tls.protocol_version.as_deref().unwrap_or("unknown"),
-                    clean_terminal(tls.cipher_suite.as_deref().unwrap_or("unknown")),
-                    tls.certificate_chain_length
-                        .map_or_else(|| "unknown".to_owned(), |length| length.to_string()),
-                    tls.public_key_bits
-                        .map_or_else(|| "unknown".to_owned(), |bits| bits.to_string())
+                    "    Error/limitation: {}",
+                    clean_terminal(limitation)
                 );
-                let _ = writeln!(
-                    output,
-                    "    Leaf SHA-256: {}",
-                    clean_terminal(tls.leaf_certificate_sha256.as_deref().unwrap_or("unknown"))
-                );
-                let _ = writeln!(
-                    output,
-                    "    SANs{}: {}",
-                    if tls.subject_alt_names_truncated {
-                        " (truncated)"
-                    } else {
-                        ""
-                    },
-                    clean_terminal(&tls.subject_alt_names.join(", "))
-                );
-                for limitation in &tls.errors {
-                    let _ = writeln!(
-                        output,
-                        "    Error/limitation: {}",
-                        clean_terminal(limitation)
-                    );
-                }
             }
         }
         output.push('\n');
@@ -834,21 +856,26 @@ pub fn render_html(report: &ScanReport) -> String {
                 .collect::<Vec<_>>()
                 .join("; ");
             format!(
-                "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 escape_html(&tls.address.to_string()),
                 escape_html(&tls.server_name),
-                if tls.handshake_succeeded { "yes" } else { "no" },
-                option_bool(tls.certificate_trusted),
+                if tls.handshake_succeeded { "passed" } else { "failed" },
+                option_yes_no(tls.certificate_trusted),
+                option_yes_no(tls.hostname_matches),
                 escape_html(tls.protocol_version.as_deref().unwrap_or("—")),
                 escape_html(tls.cipher_suite.as_deref().unwrap_or("—")),
                 tls.certificate_chain_length.map_or_else(|| "—".to_owned(), |value| value.to_string()),
-                tls.public_key_bits.map_or_else(|| "—".to_owned(), |value| value.to_string()),
                 escape_html(tls.leaf_certificate_sha256.as_deref().unwrap_or("—")),
-                escape_html(tls.valid_until_unix.map_or_else(|| "—".to_owned(), |value| value.to_string()).as_str()),
                 escape_html(tls.subject.as_deref().unwrap_or("—")),
                 escape_html(tls.issuer.as_deref().unwrap_or("—")),
+                escape_html(tls.serial_number.as_deref().unwrap_or("—")),
+                tls.valid_from_unix.map_or_else(|| "—".to_owned(), |value| value.to_string()),
+                tls.valid_until_unix.map_or_else(|| "—".to_owned(), |value| value.to_string()),
                 if names.is_empty() { "—" } else { &names },
                 if tls.subject_alt_names_truncated { "yes" } else { "no" },
+                escape_html(tls.public_key_algorithm.as_deref().unwrap_or("—")),
+                tls.public_key_bits.map_or_else(|| "—".to_owned(), |value| value.to_string()),
+                escape_html(tls.signature_algorithm.as_deref().unwrap_or("—")),
                 if tls_errors.is_empty() { "—" } else { &tls_errors }
             )
         })
@@ -980,7 +1007,7 @@ pub fn render_html(report: &ScanReport) -> String {
     );
 
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Surface report — {target}</title><style>:root{{color-scheme:light;--bg:#f4f7fb;--panel:#fff;--text:#172033;--muted:#607089;--line:#dbe3ee;--accent:#3157d5}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,sans-serif}}main{{max-width:76rem;margin:auto;padding:2rem 1rem 4rem}}header{{padding:1.5rem;border-radius:1rem;background:linear-gradient(135deg,#172554,#3157d5);color:#fff}}header h1{{margin:0}}.meta,.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.8rem}}.meta div,.card,.finding,section{{background:var(--panel);border:1px solid var(--line);border-radius:.8rem;padding:1rem}}header .meta div{{background:#ffffff18;border-color:#ffffff33}}dt{{font-size:.78rem;text-transform:uppercase;color:var(--muted)}}header dt{{color:#dbeafe}}dd{{margin:0;font-weight:650}}section{{margin-top:1rem}}section>h2{{margin-top:0}}.cards{{margin:1rem 0}}.cards .card{{font-size:1.2rem;font-weight:700}}.cards small{{display:block;color:var(--muted);font-size:.78rem}}code{{overflow-wrap:anywhere}}table{{border-collapse:collapse;width:100%;display:block;overflow:auto}}th,td{{padding:.55rem;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}}ul{{padding-left:1.3rem}}.finding{{border-left:.45rem solid #64748b;margin:.8rem 0}}.critical,.high{{border-left-color:#c62828}}.medium{{border-left-color:#ef6c00}}.low{{border-left-color:#ca8a04}}.info{{border-left-color:#2563eb}}.error{{color:#b91c1c}}footer{{margin-top:2rem;color:var(--muted)}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}section,.card,.finding,header{{break-inside:avoid}}}}</style></head><body><main><header><h1>Surface report</h1><p><code>{target}</code></p><dl class=\"meta\"><div><dt>Status</dt><dd>{status:?}</dd></div><div><dt>Started</dt><dd>{started}</dd></div><div><dt>Completed</dt><dd>{completed}</dd></div><div><dt>Scan ID</dt><dd><code>{scan_id}</code></dd></div></dl></header><div class=\"cards\"><div class=\"card\"><small>Exposure score</small>{score_value}</div><div class=\"card\"><small>Findings</small>{finding_count}</div><div class=\"card\"><small>Hosts</small>{host_count}</div><div class=\"card\"><small>Services</small>{service_count}</div><div class=\"card\"><small>HTTP endpoints</small>{http_count}</div><div class=\"card\"><small>Partial errors</small>{error_count}</div></div><section><h2>Findings</h2>{findings}</section><section><h2>DNS</h2>{dns}</section><section><h2>Hosts and open ports</h2>{hosts}</section><section><h2>Services</h2><table><thead><tr><th>Endpoint</th><th>Transport</th><th>Service</th><th>Confidence</th><th>Details</th></tr></thead><tbody>{services}</tbody></table></section><section><h2>HTTP</h2>{http}</section><section><h2>TLS</h2><table><thead><tr><th>Endpoint</th><th>Server name</th><th>Handshake</th><th>Trusted</th><th>Protocol</th><th>Cipher</th><th>Chain length</th><th>Key bits</th><th>Leaf SHA-256</th><th>Valid until</th><th>Subject</th><th>Issuer</th><th>Names</th><th>SANs truncated</th><th>Errors/limitations</th></tr></thead><tbody>{tls}</tbody></table></section><section><h2>Certificate Transparency candidates</h2>{certificate_transparency}</section><section><h2>Related domain candidates</h2>{related}</section><section><h2>Surface Exposure Score</h2>{score}</section><section><h2>Partial errors</h2><ul>{errors_html}</ul></section><section><h2>Checks not run</h2><ul>{skipped_html}</ul></section><section><h2>Configuration</h2><p>TCP ports: {tcp_ports} · UDP ports: {udp_ports} · concurrency: {concurrency} · connect timeout: {connect_timeout} ms · request timeout: {request_timeout} ms · global timeout: {global_timeout} ms</p></section><section><h2>Limitations</h2><p>Surface analyzes externally observable services and security-related configuration. It performs no active exploitation. DNS answers, redirects, timeouts, and a clean report do not prove security.</p></section><footer>Surface {version} · schema {schema}</footer></main></body></html>\n",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Surface report — {target}</title><style>:root{{color-scheme:light;--bg:#f4f7fb;--panel:#fff;--text:#172033;--muted:#607089;--line:#dbe3ee;--accent:#3157d5}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,sans-serif}}main{{max-width:76rem;margin:auto;padding:2rem 1rem 4rem}}header{{padding:1.5rem;border-radius:1rem;background:linear-gradient(135deg,#172554,#3157d5);color:#fff}}header h1{{margin:0}}.meta,.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.8rem}}.meta div,.card,.finding,section{{background:var(--panel);border:1px solid var(--line);border-radius:.8rem;padding:1rem}}header .meta div{{background:#ffffff18;border-color:#ffffff33}}dt{{font-size:.78rem;text-transform:uppercase;color:var(--muted)}}header dt{{color:#dbeafe}}dd{{margin:0;font-weight:650}}section{{margin-top:1rem}}section>h2{{margin-top:0}}.cards{{margin:1rem 0}}.cards .card{{font-size:1.2rem;font-weight:700}}.cards small{{display:block;color:var(--muted);font-size:.78rem}}code{{overflow-wrap:anywhere}}table{{border-collapse:collapse;width:100%;display:block;overflow:auto}}th,td{{padding:.55rem;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}}ul{{padding-left:1.3rem}}.finding{{border-left:.45rem solid #64748b;margin:.8rem 0}}.critical,.high{{border-left-color:#c62828}}.medium{{border-left-color:#ef6c00}}.low{{border-left-color:#ca8a04}}.info{{border-left-color:#2563eb}}.error{{color:#b91c1c}}footer{{margin-top:2rem;color:var(--muted)}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}section,.card,.finding,header{{break-inside:avoid}}}}</style></head><body><main><header><h1>Surface report</h1><p><code>{target}</code></p><dl class=\"meta\"><div><dt>Status</dt><dd>{status:?}</dd></div><div><dt>Started</dt><dd>{started}</dd></div><div><dt>Completed</dt><dd>{completed}</dd></div><div><dt>Scan ID</dt><dd><code>{scan_id}</code></dd></div></dl></header><div class=\"cards\"><div class=\"card\"><small>Exposure score</small>{score_value}</div><div class=\"card\"><small>Findings</small>{finding_count}</div><div class=\"card\"><small>Hosts</small>{host_count}</div><div class=\"card\"><small>Services</small>{service_count}</div><div class=\"card\"><small>HTTP endpoints</small>{http_count}</div><div class=\"card\"><small>Partial errors</small>{error_count}</div></div><section><h2>Findings</h2>{findings}</section><section><h2>DNS</h2>{dns}</section><section><h2>Hosts and open ports</h2>{hosts}</section><section><h2>Services</h2><table><thead><tr><th>Endpoint</th><th>Transport</th><th>Service</th><th>Confidence</th><th>Details</th></tr></thead><tbody>{services}</tbody></table></section><section><h2>HTTP</h2>{http}</section><section><h2>TLS</h2><table><thead><tr><th>Endpoint</th><th>Server name</th><th>Validation</th><th>Trusted</th><th>Hostname</th><th>Protocol</th><th>Cipher</th><th>Chain length</th><th>Leaf SHA-256</th><th>Subject</th><th>Issuer</th><th>Serial</th><th>Valid from</th><th>Valid until</th><th>Names</th><th>SANs truncated</th><th>Key algorithm</th><th>Key bits</th><th>Signature algorithm</th><th>Errors/limitations</th></tr></thead><tbody>{tls}</tbody></table></section><section><h2>Certificate Transparency candidates</h2>{certificate_transparency}</section><section><h2>Related domain candidates</h2>{related}</section><section><h2>Surface Exposure Score</h2>{score}</section><section><h2>Partial errors</h2><ul>{errors_html}</ul></section><section><h2>Checks not run</h2><ul>{skipped_html}</ul></section><section><h2>Configuration</h2><p>TCP ports: {tcp_ports} · UDP ports: {udp_ports} · concurrency: {concurrency} · connect timeout: {connect_timeout} ms · request timeout: {request_timeout} ms · global timeout: {global_timeout} ms</p></section><section><h2>Limitations</h2><p>Surface analyzes externally observable services and security-related configuration. It performs no active exploitation. DNS answers, redirects, timeouts, and a clean report do not prove security.</p></section><footer>Surface {version} · schema {schema}</footer></main></body></html>\n",
         target = escape_html(&report.target.original),
         status = report.status,
         started = escape_html(&report.started_at.to_string()),
@@ -1071,6 +1098,14 @@ fn option_bool(value: Option<bool>) -> &'static str {
     }
 }
 
+fn option_yes_no(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
+}
+
 fn severity_class(severity: Severity) -> &'static str {
     match severity {
         Severity::Info => "info",
@@ -1141,9 +1176,9 @@ mod tests {
                 .parse()
                 .unwrap_or_else(|error| panic!("{error}")),
             server_name: "example.com".to_owned(),
-            handshake_succeeded: true,
-            certificate_trusted: Some(true),
-            hostname_matches: Some(true),
+            handshake_succeeded: false,
+            certificate_trusted: None,
+            hostname_matches: None,
             protocol_version: Some("TLSv1_3".to_owned()),
             cipher_suite: Some("<cipher>".to_owned()),
             alpn: Some("h2".to_owned()),
@@ -1151,18 +1186,19 @@ mod tests {
             leaf_certificate_sha256: Some("<fingerprint>".to_owned()),
             subject: Some("<subject>".to_owned()),
             issuer: Some("<issuer>".to_owned()),
-            serial_number: Some("01".to_owned()),
+            serial_number: Some("<serial>".to_owned()),
             valid_from_unix: Some(1),
             valid_until_unix: Some(2),
             subject_alt_names: vec!["<san.example>".to_owned()],
             subject_alt_names_truncated: true,
-            public_key_algorithm: Some("1.2.840.10045.2.1".to_owned()),
+            public_key_algorithm: Some("<key-oid>".to_owned()),
             public_key_bits: Some(256),
-            signature_algorithm: Some("1.2.840.10045.4.3.2".to_owned()),
+            signature_algorithm: Some("<signature-oid>".to_owned()),
             errors: vec!["<bounded>".to_owned()],
         });
 
         let terminal = render_terminal(&report);
+        assert!(terminal.contains("validation=failed  trusted=unknown  hostname=unknown"));
         assert!(terminal.contains("cipher=<cipher>  chain=2  key_bits=256"));
         assert!(terminal.contains("Leaf SHA-256: <fingerprint>"));
         assert!(terminal.contains("SANs (truncated): <san.example>"));
@@ -1176,7 +1212,10 @@ mod tests {
             "&lt;fingerprint&gt;",
             "&lt;subject&gt;",
             "&lt;issuer&gt;",
+            "&lt;serial&gt;",
             "&lt;san.example&gt;",
+            "&lt;key-oid&gt;",
+            "&lt;signature-oid&gt;",
             "&lt;bounded&gt;",
         ] {
             assert!(html.contains(escaped));

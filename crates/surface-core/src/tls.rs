@@ -1,13 +1,19 @@
 //! Validating TLS handshake and certificate inspection.
 
 use std::collections::BTreeSet;
+use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures::{StreamExt, stream};
-use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::client::WebPkiServerVerifier;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, DistinguishedName, Error, RootCertStore, SignatureScheme,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
@@ -24,14 +30,158 @@ use crate::{ServiceKind, ServiceObservation, TransportProtocol};
 
 // Rust guideline compliant 2026-02-21
 
-/// Maximum peer certificates inspected after one validated handshake.
+/// Maximum peer certificates inspected during one validating handshake attempt.
 const MAX_CERTIFICATES: usize = 16;
-/// Maximum cumulative certificate DER inspected after one validated handshake.
+/// Maximum cumulative certificate DER inspected during one validating handshake attempt.
 const MAX_CERTIFICATE_DER_BYTES: usize = 1024 * 1024;
 /// Maximum normalized DNS and IP SAN entries retained from the leaf certificate.
 const MAX_SUBJECT_ALT_NAMES: usize = 128;
 
-/// Validated TLS endpoint evidence.
+#[derive(Default)]
+struct CertificateCapture {
+    certificates: Vec<CertificateDer<'static>>,
+    chain_length: usize,
+    der_truncated: bool,
+    #[cfg(test)]
+    verify_server_cert_calls: usize,
+    #[cfg(test)]
+    verify_tls12_signature_calls: usize,
+    #[cfg(test)]
+    verify_tls13_signature_calls: usize,
+    #[cfg(test)]
+    supported_verify_schemes_calls: usize,
+}
+
+struct RecordingServerCertVerifier {
+    delegate: Arc<WebPkiServerVerifier>,
+    capture: Arc<Mutex<CertificateCapture>>,
+}
+
+impl Debug for RecordingServerCertVerifier {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecordingServerCertVerifier")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecordingServerCertVerifier {
+    fn record_certificates(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+    ) {
+        let mut capture = lock_capture(&self.capture);
+        capture.certificates.clear();
+        capture.chain_length = intermediates.len().saturating_add(1);
+        capture.der_truncated = false;
+        #[cfg(test)]
+        {
+            capture.verify_server_cert_calls += 1;
+        }
+
+        let mut cumulative_der_bytes = 0_usize;
+        for certificate in std::iter::once(end_entity)
+            .chain(intermediates)
+            .take(MAX_CERTIFICATES)
+        {
+            let Some(next_bytes) = cumulative_der_bytes.checked_add(certificate.as_ref().len())
+            else {
+                capture.der_truncated = true;
+                break;
+            };
+            if next_bytes > MAX_CERTIFICATE_DER_BYTES {
+                capture.der_truncated = true;
+                break;
+            }
+            cumulative_der_bytes = next_bytes;
+            capture
+                .certificates
+                .push(CertificateDer::from(certificate.as_ref().to_vec()));
+        }
+    }
+
+    #[cfg(test)]
+    fn record_tls12_signature_call(&self) {
+        lock_capture(&self.capture).verify_tls12_signature_calls += 1;
+    }
+
+    #[cfg(test)]
+    fn record_tls13_signature_call(&self) {
+        lock_capture(&self.capture).verify_tls13_signature_calls += 1;
+    }
+
+    #[cfg(test)]
+    fn record_supported_verify_schemes_call(&self) {
+        lock_capture(&self.capture).supported_verify_schemes_calls += 1;
+    }
+}
+
+impl ServerCertVerifier for RecordingServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        self.record_certificates(end_entity, intermediates);
+        self.delegate
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        #[cfg(test)]
+        self.record_tls12_signature_call();
+        self.delegate
+            .verify_tls12_signature(message, certificate, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        #[cfg(test)]
+        self.record_tls13_signature_call();
+        self.delegate
+            .verify_tls13_signature(message, certificate, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        #[cfg(test)]
+        self.record_supported_verify_schemes_call();
+        self.delegate.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.delegate.requires_raw_public_keys()
+    }
+
+    fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
+        self.delegate.root_hint_subjects()
+    }
+}
+
+fn lock_capture(capture: &Mutex<CertificateCapture>) -> MutexGuard<'_, CertificateCapture> {
+    match capture.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn take_capture(capture: &Mutex<CertificateCapture>) -> CertificateCapture {
+    std::mem::take(&mut *lock_capture(capture))
+}
+
+/// TLS endpoint evidence from a certificate-validating handshake attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsObservation {
     /// Connected socket address.
@@ -92,38 +242,38 @@ pub async fn analyze_tls(
     handshake_timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Vec<TlsObservation> {
-    let root_store = webpki_roots::TLS_SERVER_ROOTS
-        .iter()
-        .cloned()
-        .collect::<RootCertStore>();
+    let root_store = Arc::new(
+        webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .cloned()
+            .collect::<RootCertStore>(),
+    );
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let Ok(builder) =
-        ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions()
+    let Ok(verifier) =
+        WebPkiServerVerifier::builder_with_provider(root_store, provider.clone()).build()
     else {
         return Vec::new();
     };
-    let mut config = builder
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    analyze_tls_with_connector(
+    analyze_tls_with_verifier(
         services,
         server_name,
         concurrency,
         handshake_timeout,
         cancellation,
-        TlsConnector::from(Arc::new(config)),
+        provider,
+        verifier,
     )
     .await
 }
 
-async fn analyze_tls_with_connector(
+async fn analyze_tls_with_verifier(
     services: &[ServiceObservation],
     server_name: &str,
     concurrency: usize,
     handshake_timeout: Duration,
     cancellation: &CancellationToken,
-    connector: TlsConnector,
+    provider: Arc<CryptoProvider>,
+    verifier: Arc<WebPkiServerVerifier>,
 ) -> Vec<TlsObservation> {
     let addresses = services
         .iter()
@@ -133,7 +283,8 @@ async fn analyze_tls_with_connector(
     let mut observations = stream::iter(addresses)
         .map(|address| {
             inspect(
-                connector.clone(),
+                provider.clone(),
+                verifier.clone(),
                 address,
                 server_name.to_owned(),
                 handshake_timeout,
@@ -172,22 +323,61 @@ fn is_implicit_tls_candidate(service: &ServiceObservation) -> bool {
 }
 
 async fn inspect(
-    connector: TlsConnector,
+    provider: Arc<CryptoProvider>,
+    verifier: Arc<WebPkiServerVerifier>,
     address: SocketAddr,
     server_name: String,
     handshake_timeout: Duration,
     cancellation: CancellationToken,
 ) -> Option<TlsObservation> {
+    let capture = Arc::new(Mutex::new(CertificateCapture::default()));
+    let Some(connector) = recording_connector(provider, verifier, capture.clone()) else {
+        return Some(failed(
+            address,
+            server_name,
+            "TLS verifier configuration failed",
+        ));
+    };
     tokio::select! {
+        biased;
         () = cancellation.cancelled() => None,
         result = timeout(handshake_timeout, inspect_inner(connector, address, server_name.clone())) => {
             match result {
-                Ok(Ok(observation)) => Some(observation),
-                Ok(Err(error)) => Some(failed(address, server_name, &error)),
-                Err(_) => Some(failed(address, server_name, "TLS handshake timed out")),
+                Ok(Ok(observation)) => {
+                    drop(take_capture(&capture));
+                    Some(observation)
+                }
+                Ok(Err(error)) => Some(failed_with_capture(address, server_name, &error, &capture)),
+                Err(_) => Some(failed_with_capture(
+                    address,
+                    server_name,
+                    "TLS handshake timed out",
+                    &capture,
+                )),
             }
         }
     }
+}
+
+fn recording_connector(
+    provider: Arc<CryptoProvider>,
+    verifier: Arc<WebPkiServerVerifier>,
+    capture: Arc<Mutex<CertificateCapture>>,
+) -> Option<TlsConnector> {
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .ok()?;
+    // This wrapper returns every validating WebPKI result unchanged; it only records bounded input.
+    let recording_verifier = Arc::new(RecordingServerCertVerifier {
+        delegate: verifier,
+        capture,
+    });
+    let mut config = builder
+        .dangerous()
+        .with_custom_certificate_verifier(recording_verifier)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Some(TlsConnector::from(Arc::new(config)))
 }
 
 async fn inspect_inner(
@@ -234,27 +424,46 @@ async fn inspect_inner(
         signature_algorithm: None,
         errors: Vec::new(),
     };
-    inspect_certificates(
-        connection
-            .peer_certificates()
-            .ok_or_else(|| "TLS peer supplied no certificate".to_owned())?,
-        &mut observation,
-    )?;
+    if let Some(certificates) = connection.peer_certificates() {
+        inspect_certificates(certificates, certificates.len(), false, &mut observation);
+    } else {
+        observation
+            .errors
+            .push("TLS peer supplied no certificate".to_owned());
+    }
     Ok(observation)
+}
+
+fn failed_with_capture(
+    address: SocketAddr,
+    server_name: String,
+    error: &str,
+    capture: &Mutex<CertificateCapture>,
+) -> TlsObservation {
+    let mut observation = failed(address, server_name, error);
+    let captured = take_capture(capture);
+    if captured.chain_length != 0 {
+        inspect_certificates(
+            &captured.certificates,
+            captured.chain_length,
+            captured.der_truncated,
+            &mut observation,
+        );
+    }
+    drop(captured);
+    observation
 }
 
 fn inspect_certificates(
     certificates: &[CertificateDer<'_>],
+    chain_length: usize,
+    mut der_truncated: bool,
     observation: &mut TlsObservation,
-) -> Result<(), String> {
-    let leaf = certificates
-        .first()
-        .ok_or_else(|| "TLS peer supplied no certificate".to_owned())?;
-    observation.certificate_chain_length = Some(certificates.len());
-    if certificates.len() > MAX_CERTIFICATES {
+) {
+    observation.certificate_chain_length = Some(chain_length);
+    if chain_length > MAX_CERTIFICATES {
         observation.errors.push(format!(
-            "certificate inspection limited to the first {MAX_CERTIFICATES} of {} peer certificates",
-            certificates.len()
+            "certificate inspection limited to the first {MAX_CERTIFICATES} of {chain_length} peer certificates"
         ));
     }
 
@@ -262,26 +471,37 @@ fn inspect_certificates(
     let mut inspected_certificates = 0_usize;
     for certificate in certificates.iter().take(MAX_CERTIFICATES) {
         let Some(next_bytes) = cumulative_der_bytes.checked_add(certificate.as_ref().len()) else {
-            observation.errors.push(format!(
-                "certificate DER inspection limited to {MAX_CERTIFICATE_DER_BYTES} cumulative bytes"
-            ));
+            der_truncated = true;
             break;
         };
         if next_bytes > MAX_CERTIFICATE_DER_BYTES {
-            observation.errors.push(format!(
-                "certificate DER inspection limited to {MAX_CERTIFICATE_DER_BYTES} cumulative bytes"
-            ));
+            der_truncated = true;
             break;
         }
         cumulative_der_bytes = next_bytes;
         inspected_certificates += 1;
     }
+    if der_truncated {
+        observation.errors.push(format!(
+            "certificate DER inspection limited to {MAX_CERTIFICATE_DER_BYTES} cumulative bytes"
+        ));
+    }
     if inspected_certificates == 0 {
-        return Ok(());
+        return;
     }
 
-    let (_, certificate) = X509Certificate::from_der(leaf.as_ref())
-        .map_err(|error| format!("could not parse leaf certificate: {error}"))?;
+    let Some(leaf) = certificates.first() else {
+        return;
+    };
+    let (_, certificate) = match X509Certificate::from_der(leaf.as_ref()) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            observation.errors.push(sanitize(&format!(
+                "could not parse leaf certificate: {error}"
+            )));
+            return;
+        }
+    };
     match normalized_subject_alt_names(&certificate) {
         Ok((subject_alt_names, subject_alt_names_truncated)) => {
             observation.subject_alt_names = subject_alt_names;
@@ -309,7 +529,6 @@ fn inspect_certificates(
     });
     observation.signature_algorithm =
         Some(certificate.signature_algorithm.algorithm.to_id_string());
-    Ok(())
 }
 
 fn normalized_subject_alt_names(
@@ -427,19 +646,22 @@ mod tests {
     use rcgen::{
         CertificateParams, CertifiedKey, CustomExtension, KeyPair, generate_simple_self_signed,
     };
+    use rustls::client::WebPkiServerVerifier;
+    use rustls::crypto::CryptoProvider;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use rustls::{ClientConfig, RootCertStore, ServerConfig};
+    use rustls::{RootCertStore, ServerConfig, SupportedProtocolVersion};
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use tokio::net::TcpListener;
     use tokio::time::timeout;
-    use tokio_rustls::{TlsAcceptor, TlsConnector};
+    use tokio_rustls::TlsAcceptor;
     use tokio_util::sync::CancellationToken;
     use x509_parser::public_key::PublicKey;
 
     use super::{
-        MAX_CERTIFICATE_DER_BYTES, TlsObservation, analyze_tls, analyze_tls_with_connector, failed,
-        inspect_certificates, parsed_public_key_bits, rsa_modulus_bits,
+        CertificateCapture, MAX_CERTIFICATE_DER_BYTES, RecordingServerCertVerifier, TlsObservation,
+        analyze_tls, analyze_tls_with_verifier, failed, inspect_certificates, inspect_inner,
+        lock_capture, parsed_public_key_bits, recording_connector, rsa_modulus_bits, take_capture,
     };
     use crate::{DetectionConfidence, ServiceKind, ServiceObservation, TransportProtocol};
 
@@ -454,14 +676,43 @@ mod tests {
         }
     }
 
-    fn fixture(names: Vec<String>) -> (TlsConnector, TlsAcceptor, CertificateDer<'static>) {
+    struct Fixture {
+        provider: Arc<CryptoProvider>,
+        verifier: Arc<WebPkiServerVerifier>,
+        acceptor: TlsAcceptor,
+        certificate: CertificateDer<'static>,
+    }
+
+    fn fixture(names: Vec<String>) -> Fixture {
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(names).unwrap_or_else(|error| panic!("{error}"));
-        let certificate = cert.der().clone();
+        fixture_from_parts(cert.der().clone(), &signing_key, None)
+    }
+
+    fn fixture_from_params(
+        params: &CertificateParams,
+        version: Option<&'static SupportedProtocolVersion>,
+    ) -> Fixture {
+        let signing_key = KeyPair::generate().unwrap_or_else(|error| panic!("{error}"));
+        let certificate = params
+            .self_signed(&signing_key)
+            .unwrap_or_else(|error| panic!("{error}"));
+        fixture_from_parts(certificate.der().clone(), &signing_key, version)
+    }
+
+    fn fixture_from_parts(
+        certificate: CertificateDer<'static>,
+        signing_key: &KeyPair,
+        version: Option<&'static SupportedProtocolVersion>,
+    ) -> Fixture {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut server = ServerConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .unwrap_or_else(|error| panic!("{error}"))
+        let server_builder = ServerConfig::builder_with_provider(provider.clone());
+        let server_builder = match version {
+            Some(version) => server_builder.with_protocol_versions(&[version]),
+            None => server_builder.with_safe_default_protocol_versions(),
+        }
+        .unwrap_or_else(|error| panic!("{error}"));
+        let mut server = server_builder
             .with_no_client_auth()
             .with_single_cert(
                 vec![certificate.clone()],
@@ -474,17 +725,16 @@ mod tests {
         roots
             .add(certificate.clone())
             .unwrap_or_else(|error| panic!("{error}"));
-        let mut client = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .unwrap_or_else(|error| panic!("{error}"))
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        client.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        (
-            TlsConnector::from(Arc::new(client)),
-            TlsAcceptor::from(Arc::new(server)),
+        let verifier =
+            WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+                .build()
+                .unwrap_or_else(|error| panic!("{error}"));
+        Fixture {
+            provider,
+            verifier,
+            acceptor: TlsAcceptor::from(Arc::new(server)),
             certificate,
-        )
+        }
     }
 
     fn blank_observation() -> TlsObservation {
@@ -499,9 +749,51 @@ mod tests {
         observation
     }
 
+    async fn analyze_fixture(fixture: Fixture, server_name: &str) -> TlsObservation {
+        let Fixture {
+            provider,
+            verifier,
+            acceptor,
+            ..
+        } = fixture;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            let _ = acceptor.accept(stream).await;
+        });
+        let observation = analyze_tls_with_verifier(
+            &[service(address, ServiceKind::Https)],
+            server_name,
+            1,
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+            provider,
+            verifier,
+        )
+        .await
+        .into_iter()
+        .next()
+        .expect("one TLS observation");
+        server.await.unwrap_or_else(|error| panic!("{error}"));
+        observation
+    }
+
     #[tokio::test]
     async fn reports_successful_fixture_fields_and_deduplicates_endpoint() {
-        let (connector, acceptor, certificate) = fixture(vec!["localhost".to_owned()]);
+        let Fixture {
+            provider,
+            verifier,
+            acceptor,
+            certificate,
+        } = fixture(vec!["localhost".to_owned()]);
         let expected_fingerprint = format!("{:x}", Sha256::digest(certificate.as_ref()));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -525,13 +817,14 @@ mod tests {
             );
         });
         let duplicate = service(address, ServiceKind::Https);
-        let observations = analyze_tls_with_connector(
+        let observations = analyze_tls_with_verifier(
             &[duplicate.clone(), duplicate],
             "localhost",
             2,
             Duration::from_secs(2),
             &CancellationToken::new(),
-            connector,
+            provider,
+            verifier,
         )
         .await;
         server.await.unwrap_or_else(|error| panic!("{error}"));
@@ -557,20 +850,23 @@ mod tests {
 
     #[tokio::test]
     async fn non_applicable_service_makes_no_connection() {
-        let (connector, _, _) = fixture(vec!["localhost".to_owned()]);
+        let Fixture {
+            provider, verifier, ..
+        } = fixture(vec!["localhost".to_owned()]);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let address = listener
             .local_addr()
             .unwrap_or_else(|error| panic!("{error}"));
-        let observations = analyze_tls_with_connector(
+        let observations = analyze_tls_with_verifier(
             &[service(address, ServiceKind::Ssh)],
             "localhost",
             1,
             Duration::from_millis(100),
             &CancellationToken::new(),
-            connector,
+            provider,
+            verifier,
         )
         .await;
 
@@ -587,18 +883,26 @@ mod tests {
         let names = (0..129)
             .map(|index| format!("N{index:03}.EXAMPLE.COM."))
             .collect();
-        let (_, _, certificate) = fixture(names);
+        let certificate = fixture(names).certificate;
         let mut observation = blank_observation();
-        inspect_certificates(std::slice::from_ref(&certificate), &mut observation)
-            .unwrap_or_else(|error| panic!("{error}"));
+        inspect_certificates(
+            std::slice::from_ref(&certificate),
+            1,
+            false,
+            &mut observation,
+        );
         assert_eq!(observation.subject_alt_names.len(), 128);
         assert_eq!(observation.subject_alt_names[0], "n000.example.com");
         assert_eq!(observation.subject_alt_names[127], "n127.example.com");
         assert!(observation.subject_alt_names_truncated);
 
         let mut chain_observation = blank_observation();
-        inspect_certificates(&vec![certificate.clone(); 17], &mut chain_observation)
-            .unwrap_or_else(|error| panic!("{error}"));
+        inspect_certificates(
+            &vec![certificate.clone(); 17],
+            17,
+            false,
+            &mut chain_observation,
+        );
         assert_eq!(chain_observation.certificate_chain_length, Some(17));
         assert!(
             chain_observation
@@ -609,8 +913,7 @@ mod tests {
 
         let oversized = CertificateDer::from(vec![0_u8; MAX_CERTIFICATE_DER_BYTES]);
         let mut bytes_observation = blank_observation();
-        inspect_certificates(&[certificate, oversized], &mut bytes_observation)
-            .unwrap_or_else(|error| panic!("{error}"));
+        inspect_certificates(&[certificate, oversized], 2, false, &mut bytes_observation);
         assert!(bytes_observation.leaf_certificate_sha256.is_some());
         assert!(
             bytes_observation
@@ -629,9 +932,10 @@ mod tests {
         let mut absent_observation = blank_observation();
         inspect_certificates(
             std::slice::from_ref(absent_certificate.der()),
+            1,
+            false,
             &mut absent_observation,
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
+        );
         assert!(absent_observation.subject_alt_names.is_empty());
         assert!(!absent_observation.subject_alt_names_truncated);
         assert!(absent_observation.errors.is_empty());
@@ -649,15 +953,95 @@ mod tests {
         let mut malformed_observation = blank_observation();
         inspect_certificates(
             std::slice::from_ref(malformed_certificate.der()),
+            1,
+            false,
             &mut malformed_observation,
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
+        );
         assert!(malformed_observation.subject_alt_names.is_empty());
         assert!(!malformed_observation.subject_alt_names_truncated);
         assert_eq!(
             malformed_observation.errors,
             ["subject alternative name extension could not be parsed"]
         );
+    }
+
+    #[test]
+    fn rejected_certificate_capture_is_bounded_and_poison_safe() {
+        let Fixture {
+            verifier,
+            certificate,
+            ..
+        } = fixture(vec!["localhost".to_owned()]);
+        let capture = Arc::new(std::sync::Mutex::new(CertificateCapture::default()));
+        let poisoned_capture = capture.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned_capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("poison fixture mutex");
+        });
+        let recorder = RecordingServerCertVerifier {
+            delegate: verifier,
+            capture: capture.clone(),
+        };
+        recorder.record_certificates(&certificate, &vec![certificate.clone(); 16]);
+        let captured = take_capture(&capture);
+        assert_eq!(captured.chain_length, 17);
+        assert_eq!(captured.certificates.len(), 16);
+        assert!(!captured.der_truncated);
+
+        let oversized = CertificateDer::from(vec![0_u8; MAX_CERTIFICATE_DER_BYTES + 1]);
+        recorder.record_certificates(&oversized, &[]);
+        let captured = take_capture(&capture);
+        assert_eq!(captured.chain_length, 1);
+        assert!(captured.certificates.is_empty());
+        assert!(captured.der_truncated);
+    }
+
+    #[tokio::test]
+    async fn delegates_certificate_and_tls_signature_verification() {
+        for (version, expect_tls12) in [
+            (&rustls::version::TLS12, true),
+            (&rustls::version::TLS13, false),
+        ] {
+            let params = CertificateParams::new(vec!["localhost".to_owned()])
+                .unwrap_or_else(|error| panic!("{error}"));
+            let Fixture {
+                provider,
+                verifier,
+                acceptor,
+                ..
+            } = fixture_from_params(&params, Some(version));
+            let capture = Arc::new(std::sync::Mutex::new(CertificateCapture::default()));
+            let connector = recording_connector(provider, verifier, capture.clone())
+                .expect("safe TLS versions are available");
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            let address = listener
+                .local_addr()
+                .unwrap_or_else(|error| panic!("{error}"));
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                acceptor
+                    .accept(stream)
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+            });
+            let observation = inspect_inner(connector, address, "localhost".to_owned())
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            server.await.unwrap_or_else(|error| panic!("{error}"));
+            assert!(observation.handshake_succeeded);
+            let calls = lock_capture(&capture);
+            assert_eq!(calls.verify_server_cert_calls, 1);
+            assert!(calls.supported_verify_schemes_calls > 0);
+            assert_eq!(calls.verify_tls12_signature_calls > 0, expect_tls12);
+            assert_eq!(calls.verify_tls13_signature_calls > 0, !expect_tls12);
+        }
     }
 
     #[test]
@@ -712,8 +1096,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_wrong_name_and_expired_certificates_retain_leaf_evidence() {
+        let wrong_name =
+            analyze_fixture(fixture(vec!["wrong.example".to_owned()]), "localhost").await;
+        assert!(!wrong_name.handshake_succeeded);
+        assert_eq!(wrong_name.certificate_trusted, None);
+        assert_eq!(wrong_name.hostname_matches, None);
+        assert_eq!(wrong_name.certificate_chain_length, Some(1));
+        assert_eq!(wrong_name.subject_alt_names, ["wrong.example"]);
+        assert!(wrong_name.leaf_certificate_sha256.is_some());
+
+        let mut params = CertificateParams::new(vec!["localhost".to_owned()])
+            .unwrap_or_else(|error| panic!("{error}"));
+        params.not_before = time::OffsetDateTime::from_unix_timestamp(946_684_800)
+            .unwrap_or_else(|error| panic!("{error}"));
+        params.not_after = time::OffsetDateTime::from_unix_timestamp(978_307_200)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let expired = analyze_fixture(fixture_from_params(&params, None), "localhost").await;
+        assert!(!expired.handshake_succeeded);
+        assert_eq!(expired.certificate_trusted, None);
+        assert_eq!(expired.hostname_matches, None);
+        assert_eq!(expired.valid_from_unix, Some(946_684_800));
+        assert_eq!(expired.valid_until_unix, Some(978_307_200));
+        assert!(expired.leaf_certificate_sha256.is_some());
+    }
+
+    #[tokio::test]
+    async fn abort_timeout_and_cancellation_retain_no_certificate_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let aborted = analyze_tls(
+            &[service(address, ServiceKind::Https)],
+            "localhost",
+            1,
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await;
+        server.await.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(aborted.len(), 1);
+        assert!(!aborted[0].handshake_succeeded);
+        assert_eq!(aborted[0].certificate_chain_length, None);
+        assert_eq!(aborted[0].leaf_certificate_sha256, None);
+        assert!(aborted[0].errors.iter().all(|error| error.len() <= 512));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let server = tokio::spawn(async move {
+            let Ok((_stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let timed_out = analyze_tls(
+            &[service(address, ServiceKind::Https)],
+            "localhost",
+            1,
+            Duration::from_millis(25),
+            &CancellationToken::new(),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(timed_out.len(), 1);
+        assert_eq!(timed_out[0].errors, ["TLS handshake timed out"]);
+        assert_eq!(timed_out[0].certificate_chain_length, None);
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let cancelled = analyze_tls(
+            &[service(address, ServiceKind::Https)],
+            "localhost",
+            1,
+            Duration::from_secs(1),
+            &cancellation,
+        )
+        .await;
+        assert!(cancelled.is_empty());
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn reports_self_signed_certificate_validation_failure() {
-        let (_, acceptor, _) = fixture(vec!["localhost".to_owned()]);
+        let Fixture {
+            acceptor,
+            certificate,
+            ..
+        } = fixture(vec!["localhost".to_owned()]);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
@@ -736,7 +1226,16 @@ mod tests {
         )
         .await;
         server.await.unwrap_or_else(|error| panic!("{error}"));
-        assert!(!observations[0].handshake_succeeded);
-        assert!(!observations[0].errors.is_empty());
+        let observation = &observations[0];
+        assert!(!observation.handshake_succeeded);
+        assert_eq!(observation.certificate_trusted, None);
+        assert_eq!(observation.hostname_matches, None);
+        assert_eq!(observation.certificate_chain_length, Some(1));
+        assert_eq!(
+            observation.leaf_certificate_sha256,
+            Some(format!("{:x}", Sha256::digest(certificate.as_ref())))
+        );
+        assert_eq!(observation.subject_alt_names, ["localhost"]);
+        assert!(!observation.errors.is_empty());
     }
 }

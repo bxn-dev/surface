@@ -470,15 +470,31 @@ fn tls_findings(
                 Severity::High,
                 FindingCategory::Tls,
                 target,
-                "The expected TLS endpoint did not complete a certificate-validating handshake. The failure may involve trust, hostname, validity, or protocol configuration.",
+                "The expected TLS endpoint did not complete the certificate-validating handshake.",
                 &observation.address.to_string(),
                 observation.errors.first().map_or("handshake failed", String::as_str),
                 Some("Inspect the certificate chain, identity, validity period, and TLS configuration."),
                 FindingConfidence::Medium,
             ));
         }
-        if let Some(valid_until) = observation.valid_until_unix {
-            let remaining = valid_until - now.unix_timestamp();
+        let scan_time = now.unix_timestamp();
+        if let Some(valid_from) = observation.valid_from_unix
+            && valid_from > scan_time
+        {
+            findings.push(finding(
+                "TLS-CERT-NOT-YET-VALID",
+                "TLS certificate is not yet valid",
+                Severity::High,
+                FindingCategory::Tls,
+                target,
+                "The observed leaf certificate validity start follows the scan time.",
+                &observation.address.to_string(),
+                &format!("valid_from_unix={valid_from}"),
+                Some("Install a certificate whose validity period has started."),
+                FindingConfidence::High,
+            ));
+        } else if let Some(valid_until) = observation.valid_until_unix {
+            let remaining = valid_until - scan_time;
             if remaining < 0 {
                 findings.push(finding(
                     "TLS-CERT-EXPIRED",
@@ -492,7 +508,7 @@ fn tls_findings(
                     Some("Replace or renew the certificate."),
                     FindingConfidence::High,
                 ));
-            } else if remaining < 30 * 24 * 60 * 60 {
+            } else if observation.handshake_succeeded && remaining < 30 * 24 * 60 * 60 {
                 findings.push(finding(
                     "TLS-CERT-EXPIRING",
                     "TLS certificate expires soon",
@@ -548,9 +564,10 @@ mod tests {
     use super::{Severity, generate_findings};
     use crate::{
         AddressSource, AuthoritativeAxfrObservation, AxfrAttempt, AxfrOutcome, CnameHop,
-        DanglingCnameObservation, DanglingCnameStatus, DnsObservation, DnsRecord,
-        DnssecObservation, DnssecRecordType, DnssecRrsetObservation, DnssecStatus, MailObservation,
-        ResolvedHost, SpfObservation, WildcardDnsObservation, WildcardDnsRecordType,
+        DanglingCnameObservation, DanglingCnameStatus, DetectionConfidence, DnsObservation,
+        DnsRecord, DnssecObservation, DnssecRecordType, DnssecRrsetObservation, DnssecStatus,
+        MailObservation, ResolvedHost, ServiceKind, ServiceObservation, SpfObservation,
+        TlsObservation, TransportProtocol, WildcardDnsObservation, WildcardDnsRecordType,
         WildcardDnsStatus,
     };
 
@@ -849,6 +866,100 @@ mod tests {
                 )
                 .is_empty(),
                 "unexpected finding for {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_tls_validation_validity_findings_are_mutually_exclusive() {
+        let address = "127.0.0.1:443"
+            .parse()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let service = ServiceObservation {
+            transport: TransportProtocol::Tcp,
+            address,
+            service: ServiceKind::Https,
+            confidence: DetectionConfidence::High,
+            banner: None,
+            protocol_details: std::collections::BTreeMap::new(),
+        };
+        let generic = TlsObservation {
+            address,
+            server_name: "localhost".to_owned(),
+            handshake_succeeded: false,
+            certificate_trusted: None,
+            hostname_matches: None,
+            protocol_version: None,
+            cipher_suite: None,
+            alpn: None,
+            certificate_chain_length: Some(1),
+            leaf_certificate_sha256: Some("00".repeat(32)),
+            subject: Some("CN=localhost".to_owned()),
+            issuer: Some("CN=localhost".to_owned()),
+            serial_number: Some("01".to_owned()),
+            valid_from_unix: None,
+            valid_until_unix: None,
+            subject_alt_names: vec!["localhost".to_owned()],
+            subject_alt_names_truncated: false,
+            public_key_algorithm: Some("1.2.840.10045.2.1".to_owned()),
+            public_key_bits: Some(256),
+            signature_algorithm: Some("1.2.840.10045.4.3.2".to_owned()),
+            errors: vec!["certificate validation failed".to_owned()],
+        };
+
+        let generic_findings = generate_findings(
+            "localhost",
+            None,
+            &[],
+            std::slice::from_ref(&service),
+            &[],
+            std::slice::from_ref(&generic),
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        assert_eq!(generic_findings.len(), 1);
+        assert_eq!(generic_findings[0].id, "TLS-VALIDATION-FAILED");
+        assert!(!generic_findings[0].description.contains("trust"));
+        assert!(!generic_findings[0].description.contains("hostname"));
+
+        let mut expired = generic.clone();
+        expired.valid_from_unix = Some(-100);
+        expired.valid_until_unix = Some(-1);
+        let expired_findings = generate_findings(
+            "localhost",
+            None,
+            &[],
+            std::slice::from_ref(&service),
+            &[],
+            std::slice::from_ref(&expired),
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        assert_eq!(
+            expired_findings
+                .iter()
+                .map(|finding| finding.id.as_str())
+                .collect::<Vec<_>>(),
+            ["TLS-CERT-EXPIRED", "TLS-VALIDATION-FAILED"]
+        );
+
+        for valid_until in [-1, 2_592_000] {
+            let mut not_yet_valid = generic.clone();
+            not_yet_valid.valid_from_unix = Some(1);
+            not_yet_valid.valid_until_unix = Some(valid_until);
+            let future_findings = generate_findings(
+                "localhost",
+                None,
+                &[],
+                std::slice::from_ref(&service),
+                &[],
+                std::slice::from_ref(&not_yet_valid),
+                time::OffsetDateTime::UNIX_EPOCH,
+            );
+            assert_eq!(
+                future_findings
+                    .iter()
+                    .map(|finding| finding.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["TLS-CERT-NOT-YET-VALID", "TLS-VALIDATION-FAILED"]
             );
         }
     }
