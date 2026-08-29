@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use surface_core::{PortState, ScanReport};
 
-use super::escape_html;
+use super::{clean_terminal, escape_html};
 
 // Rust guideline compliant 2026-02-21
 
@@ -189,7 +189,9 @@ pub fn render_diff_json(diff: &ScanDiff) -> Result<String, serde_json::Error> {
 pub fn render_diff_terminal(diff: &ScanDiff) -> String {
     let mut output = format!(
         "Surface scan diff\nOld: {}\nNew: {}\nTarget: {}\n\n",
-        diff.old_scan.scan_id, diff.new_scan.scan_id, diff.new_scan.target
+        clean_terminal(&diff.old_scan.scan_id),
+        clean_terminal(&diff.new_scan.scan_id),
+        clean_terminal(&diff.new_scan.target)
     );
     let sections = [
         ("Network", &diff.network_changes),
@@ -211,15 +213,24 @@ pub fn render_diff_terminal(diff: &ScanDiff) -> String {
                 (Some(_), None) => '-',
                 _ => '~',
             };
-            let _ = writeln!(output, "  {marker} {} {}", change.category, change.key);
+            let _ = writeln!(
+                output,
+                "  {marker} {} {}",
+                clean_terminal(&change.category),
+                clean_terminal(&change.key)
+            );
         }
         output.push('\n');
     }
     if let Some(change) = &diff.score_change {
-        let _ = writeln!(output, "Exposure score changed: {}", change.evidence);
+        let _ = writeln!(
+            output,
+            "Exposure score changed: {}",
+            clean_terminal(&change.evidence)
+        );
     }
     for warning in &diff.warnings {
-        let _ = writeln!(output, "Warning: {warning}");
+        let _ = writeln!(output, "Warning: {}", clean_terminal(warning));
     }
     if diff.summary.added == 0 && diff.summary.removed == 0 && diff.summary.changed == 0 {
         output.push_str("No semantic changes.\n");
@@ -661,15 +672,17 @@ fn json_key(value: &impl Serialize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use surface_core::{
-        Evidence, Finding, FindingCategory, FindingConfidence, HostObservation, PortObservation,
-        PortState, ScanConfiguration, ScanError, ScanErrorKind, ScanReport, ScanStage, ScanStatus,
-        Severity, TlsObservation, TransportProtocol, normalize_target,
+        DetectionConfidence, Evidence, Finding, FindingCategory, FindingConfidence,
+        HostObservation, PortObservation, PortState, ScanConfiguration, ScanError, ScanErrorKind,
+        ScanReport, ScanStage, ScanStatus, ServiceKind, ServiceObservation, Severity,
+        TlsObservation, TransportProtocol, normalize_target,
     };
 
-    use super::{diff_reports, render_diff_json};
+    use super::{Change, diff_reports, render_diff_json, render_diff_terminal};
 
     fn report() -> ScanReport {
         let mut report = ScanReport::not_started(
@@ -688,6 +701,74 @@ mod tests {
         );
         report.status = ScanStatus::Completed;
         report
+    }
+
+    fn ssh_service(protocol_details: BTreeMap<String, String>) -> ServiceObservation {
+        ServiceObservation {
+            transport: TransportProtocol::Tcp,
+            address: "192.0.2.1:22"
+                .parse()
+                .unwrap_or_else(|error| panic!("{error}")),
+            service: ServiceKind::Ssh,
+            confidence: DetectionConfidence::High,
+            banner: Some("SSH-2.0-OpenSSH_9.9".to_owned()),
+            protocol_details,
+        }
+    }
+
+    #[test]
+    fn terminal_diff_sanitizes_imported_dynamic_text() {
+        let report = report();
+        let mut diff = diff_reports(&report, &report).unwrap_or_else(|error| panic!("{error}"));
+        diff.old_scan.scan_id = "old\u{1b}[31m\r\n\t\0\u{0085}雪".to_owned();
+        diff.new_scan.scan_id = "new\u{009b}31m".to_owned();
+        diff.new_scan.target = "target\nline".to_owned();
+        diff.network_changes.push(Change {
+            category: "sec\u{1b}[2J\rtion".to_owned(),
+            key: "entity\tproperty\n雪".to_owned(),
+            old_value: Some(serde_json::json!({"before\nkey": "before\u{1b}[31m\0"})),
+            new_value: Some(serde_json::json!({"after\rkey": "after\u{009b}31m\t"})),
+            target: "change\ntarget".to_owned(),
+            significance: "high\r".to_owned(),
+            confidence: "high\t".to_owned(),
+            evidence: "unused\0evidence".to_owned(),
+        });
+        diff.score_change = Some(Change {
+            category: "score\ncategory".to_owned(),
+            key: "score\rkey".to_owned(),
+            old_value: Some(serde_json::json!(1)),
+            new_value: Some(serde_json::json!(2)),
+            target: "score\ttarget".to_owned(),
+            significance: "medium\0".to_owned(),
+            confidence: "high\u{0085}".to_owned(),
+            evidence: "reason\n\u{1b}[31m雪".to_owned(),
+        });
+        diff.warnings
+            .push("warning\r\n\t\0\u{009b}31m雪".to_owned());
+        diff.summary.changed = 2;
+        let original = diff.clone();
+
+        let rendered = render_diff_terminal(&diff);
+
+        assert_eq!(diff, original);
+        assert_eq!(
+            rendered
+                .chars()
+                .filter(|character| *character == '\n')
+                .count(),
+            10
+        );
+        assert!(
+            rendered
+                .chars()
+                .all(|character| character == '\n' || !character.is_control())
+        );
+        assert!(rendered.contains("Old: old [31m     雪"));
+        assert!(rendered.contains("New: new 31m"));
+        assert!(rendered.contains("Target: target line"));
+        assert!(rendered.contains("sec [2J tion entity property 雪"));
+        assert!(rendered.contains("reason  [31m雪"));
+        assert!(rendered.contains("warning     31m雪"));
     }
 
     #[test]
@@ -763,6 +844,65 @@ mod tests {
         let diff = diff_reports(&old, &new).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(diff.finding_changes.len(), 1);
         assert!(diff.completeness_changes.is_empty());
+    }
+
+    #[test]
+    fn ssh_completion_and_status_changes_are_visible() {
+        let mut old = report();
+        let mut new = report();
+        old.services.push(ssh_service(BTreeMap::from([
+            ("ssh_analysis_status".to_owned(), "indeterminate".to_owned()),
+            ("ssh_skip_reason".to_owned(), "request timeout".to_owned()),
+        ])));
+        new.services.push(ssh_service(BTreeMap::from([
+            ("ssh_protocol".to_owned(), "2.0".to_owned()),
+            (
+                "ssh_analysis_status".to_owned(),
+                "complete_inferred".to_owned(),
+            ),
+            ("ssh_kex".to_owned(), "curve25519-sha256".to_owned()),
+        ])));
+
+        let diff = diff_reports(&old, &new).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(diff.service_changes.len(), 1);
+        let new_details = &diff.service_changes[0]
+            .new_value
+            .as_ref()
+            .unwrap_or_else(|| panic!("new SSH service evidence missing"))["protocol_details"];
+        assert_eq!(new_details["ssh_analysis_status"], "complete_inferred");
+        assert_eq!(new_details["ssh_kex"], "curve25519-sha256");
+        assert!(new_details.get("ssh_skip_reason").is_none());
+    }
+
+    #[test]
+    fn ssh_algorithm_changes_are_visible() {
+        let mut old = report();
+        let mut new = report();
+        let details = BTreeMap::from([
+            (
+                "ssh_analysis_status".to_owned(),
+                "complete_inferred".to_owned(),
+            ),
+            ("ssh_kex".to_owned(), "curve25519-sha256".to_owned()),
+        ]);
+        old.services.push(ssh_service(details.clone()));
+        let mut changed = details;
+        changed.insert(
+            "ssh_kex".to_owned(),
+            "diffie-hellman-group14-sha256".to_owned(),
+        );
+        new.services.push(ssh_service(changed));
+
+        let diff = diff_reports(&old, &new).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(diff.service_changes.len(), 1);
+        assert_eq!(
+            diff.service_changes[0]
+                .new_value
+                .as_ref()
+                .unwrap_or_else(|| panic!("new SSH algorithm evidence missing"))["protocol_details"]
+                ["ssh_kex"],
+            "diffie-hellman-group14-sha256"
+        );
     }
 
     #[test]

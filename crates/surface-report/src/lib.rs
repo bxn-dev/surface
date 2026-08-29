@@ -6,7 +6,7 @@ mod signing;
 
 use std::fmt::Write;
 
-use surface_core::{PortState, ScanReport, Severity};
+use surface_core::{PortState, ScanReport, ServiceKind, ServiceObservation, Severity};
 
 #[doc(inline)]
 pub use diff::{
@@ -19,6 +19,17 @@ pub use signing::{SignatureEnvelope, VerificationError, decode_key, sign_bytes, 
 
 // Rust guideline compliant 2026-02-21
 
+/// Maximum characters rendered for one externally supplied SSH text value.
+const SSH_DISPLAY_CHARS: usize = 255;
+const SSH_SELECTION_KEYS: [&str; 6] = [
+    "ssh_kex",
+    "ssh_host_key_algorithm",
+    "ssh_cipher_c2s",
+    "ssh_cipher_s2c",
+    "ssh_mac_c2s",
+    "ssh_mac_s2c",
+];
+
 /// Renders a report as human-readable plain text.
 #[must_use]
 #[expect(
@@ -27,7 +38,11 @@ pub use signing::{SignatureEnvelope, VerificationError, decode_key, sign_bytes, 
 )]
 pub fn render_terminal(report: &ScanReport) -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "Surface {}", report.scanner_version);
+    let _ = writeln!(
+        output,
+        "Surface {}",
+        clean_terminal(&report.scanner_version)
+    );
     let _ = writeln!(
         output,
         "Target: {}",
@@ -216,6 +231,59 @@ pub fn render_terminal(report: &ScanReport) -> String {
         output.push('\n');
     }
 
+    if report.services.iter().any(has_ssh_posture) {
+        let _ = writeln!(output, "SSH posture");
+        for service in report
+            .services
+            .iter()
+            .filter(|service| has_ssh_posture(service))
+        {
+            let detail =
+                |key| bounded_ssh_value(service.protocol_details.get(key).map(String::as_str));
+            let _ = writeln!(
+                output,
+                "  {}  protocol={}  software={}  status={}",
+                service.address,
+                clean_terminal(&detail("ssh_protocol")),
+                clean_terminal(&detail("ssh_software")),
+                clean_terminal(&detail("ssh_analysis_status"))
+            );
+            if let Some(banner) = service.banner.as_deref() {
+                let _ = writeln!(
+                    output,
+                    "    Banner: {}",
+                    clean_terminal(&bounded_ssh_value(Some(banner)))
+                );
+            }
+            if has_complete_ssh_inference(service) {
+                let _ = writeln!(
+                    output,
+                    "    KEXINIT-inferred selections (no completed key exchange): KEX={}  host-key={}",
+                    clean_terminal(&detail("ssh_kex")),
+                    clean_terminal(&detail("ssh_host_key_algorithm"))
+                );
+                let _ = writeln!(
+                    output,
+                    "      cipher c2s={}  s2c={}  MAC c2s={}  s2c={}",
+                    clean_terminal(&detail("ssh_cipher_c2s")),
+                    clean_terminal(&detail("ssh_cipher_s2c")),
+                    clean_terminal(&detail("ssh_mac_c2s")),
+                    clean_terminal(&detail("ssh_mac_s2c"))
+                );
+            } else {
+                let _ = writeln!(output, "    No inferred selections available.");
+            }
+            if let Some(reason) = service.protocol_details.get("ssh_skip_reason") {
+                let _ = writeln!(
+                    output,
+                    "    Skip reason (bounded): {}",
+                    clean_terminal(&bounded_ssh_value(Some(reason)))
+                );
+            }
+        }
+        output.push('\n');
+    }
+
     if !report.http.is_empty() {
         let _ = writeln!(output, "HTTP");
         for http in &report.http {
@@ -389,7 +457,7 @@ pub fn render_terminal(report: &ScanReport) -> String {
             let _ = writeln!(
                 output,
                 "  {:<8} {}",
-                candidate.confidence.to_uppercase(),
+                clean_terminal(&candidate.confidence.to_uppercase()),
                 clean_terminal(&candidate.name)
             );
         }
@@ -402,7 +470,9 @@ pub fn render_terminal(report: &ScanReport) -> String {
         let _ = writeln!(
             output,
             "\nSurface Exposure Score: {}/100 ({:?}, model {})",
-            score.value, score.classification, score.model_version
+            score.value,
+            score.classification,
+            clean_terminal(&score.model_version)
         );
         if score.incomplete {
             let _ = writeln!(
@@ -754,7 +824,16 @@ pub fn render_html(report: &ScanReport) -> String {
             let details = service
                 .protocol_details
                 .iter()
-                .map(|(key, value)| format!("{}={}", escape_html(key), escape_html(value)))
+                .filter(|(key, _)| {
+                    has_complete_ssh_inference(service) || !is_ssh_selection_key(key)
+                })
+                .map(|(key, value)| {
+                    format!(
+                        "{}={}",
+                        escape_html(&bounded_ssh_value(Some(key))),
+                        escape_html(&bounded_ssh_value(Some(value)))
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
@@ -767,6 +846,53 @@ pub fn render_html(report: &ScanReport) -> String {
             )
         })
         .collect::<String>();
+    let ssh_entries = report
+        .services
+        .iter()
+        .filter(|service| has_ssh_posture(service))
+        .map(|service| {
+            let detail = |key| {
+                escape_html(&bounded_ssh_value(
+                    service.protocol_details.get(key).map(String::as_str),
+                ))
+            };
+            let selections = if has_complete_ssh_inference(service) {
+                format!(
+                    "<p><strong>KEXINIT-inferred selections (no completed key exchange):</strong> KEX <code>{}</code> · host key <code>{}</code> · cipher c2s/s2c <code>{}</code>/<code>{}</code> · MAC c2s/s2c <code>{}</code>/<code>{}</code></p>",
+                    detail("ssh_kex"),
+                    detail("ssh_host_key_algorithm"),
+                    detail("ssh_cipher_c2s"),
+                    detail("ssh_cipher_s2c"),
+                    detail("ssh_mac_c2s"),
+                    detail("ssh_mac_s2c")
+                )
+            } else {
+                "<p><strong>No inferred selections available.</strong></p>".to_owned()
+            };
+            let skip_reason = service
+                .protocol_details
+                .get("ssh_skip_reason")
+                .map_or_else(String::new, |reason| {
+                    format!(
+                        "<p><strong>Skip reason (bounded):</strong> <code>{}</code></p>",
+                        escape_html(&bounded_ssh_value(Some(reason)))
+                    )
+                });
+            format!(
+                "<details class=\"card\"><summary><code>{}</code> · status <code>{}</code></summary><p><strong>Protocol:</strong> <code>{}</code> · <strong>Software:</strong> <code>{}</code> · <strong>Banner:</strong> <code>{}</code></p>{selections}{skip_reason}</details>",
+                escape_html(&service.address.to_string()),
+                detail("ssh_analysis_status"),
+                detail("ssh_protocol"),
+                detail("ssh_software"),
+                escape_html(&bounded_ssh_value(service.banner.as_deref())),
+            )
+        })
+        .collect::<String>();
+    let ssh = if ssh_entries.is_empty() {
+        String::new()
+    } else {
+        format!("<section><h2>SSH posture</h2>{ssh_entries}</section>")
+    };
     let http = report
         .http
         .iter()
@@ -1007,7 +1133,7 @@ pub fn render_html(report: &ScanReport) -> String {
     );
 
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Surface report — {target}</title><style>:root{{color-scheme:light;--bg:#f4f7fb;--panel:#fff;--text:#172033;--muted:#607089;--line:#dbe3ee;--accent:#3157d5}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,sans-serif}}main{{max-width:76rem;margin:auto;padding:2rem 1rem 4rem}}header{{padding:1.5rem;border-radius:1rem;background:linear-gradient(135deg,#172554,#3157d5);color:#fff}}header h1{{margin:0}}.meta,.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.8rem}}.meta div,.card,.finding,section{{background:var(--panel);border:1px solid var(--line);border-radius:.8rem;padding:1rem}}header .meta div{{background:#ffffff18;border-color:#ffffff33}}dt{{font-size:.78rem;text-transform:uppercase;color:var(--muted)}}header dt{{color:#dbeafe}}dd{{margin:0;font-weight:650}}section{{margin-top:1rem}}section>h2{{margin-top:0}}.cards{{margin:1rem 0}}.cards .card{{font-size:1.2rem;font-weight:700}}.cards small{{display:block;color:var(--muted);font-size:.78rem}}code{{overflow-wrap:anywhere}}table{{border-collapse:collapse;width:100%;display:block;overflow:auto}}th,td{{padding:.55rem;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}}ul{{padding-left:1.3rem}}.finding{{border-left:.45rem solid #64748b;margin:.8rem 0}}.critical,.high{{border-left-color:#c62828}}.medium{{border-left-color:#ef6c00}}.low{{border-left-color:#ca8a04}}.info{{border-left-color:#2563eb}}.error{{color:#b91c1c}}footer{{margin-top:2rem;color:var(--muted)}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}section,.card,.finding,header{{break-inside:avoid}}}}</style></head><body><main><header><h1>Surface report</h1><p><code>{target}</code></p><dl class=\"meta\"><div><dt>Status</dt><dd>{status:?}</dd></div><div><dt>Started</dt><dd>{started}</dd></div><div><dt>Completed</dt><dd>{completed}</dd></div><div><dt>Scan ID</dt><dd><code>{scan_id}</code></dd></div></dl></header><div class=\"cards\"><div class=\"card\"><small>Exposure score</small>{score_value}</div><div class=\"card\"><small>Findings</small>{finding_count}</div><div class=\"card\"><small>Hosts</small>{host_count}</div><div class=\"card\"><small>Services</small>{service_count}</div><div class=\"card\"><small>HTTP endpoints</small>{http_count}</div><div class=\"card\"><small>Partial errors</small>{error_count}</div></div><section><h2>Findings</h2>{findings}</section><section><h2>DNS</h2>{dns}</section><section><h2>Hosts and open ports</h2>{hosts}</section><section><h2>Services</h2><table><thead><tr><th>Endpoint</th><th>Transport</th><th>Service</th><th>Confidence</th><th>Details</th></tr></thead><tbody>{services}</tbody></table></section><section><h2>HTTP</h2>{http}</section><section><h2>TLS</h2><table><thead><tr><th>Endpoint</th><th>Server name</th><th>Validation</th><th>Trusted</th><th>Hostname</th><th>Protocol</th><th>Cipher</th><th>Chain length</th><th>Leaf SHA-256</th><th>Subject</th><th>Issuer</th><th>Serial</th><th>Valid from</th><th>Valid until</th><th>Names</th><th>SANs truncated</th><th>Key algorithm</th><th>Key bits</th><th>Signature algorithm</th><th>Errors/limitations</th></tr></thead><tbody>{tls}</tbody></table></section><section><h2>Certificate Transparency candidates</h2>{certificate_transparency}</section><section><h2>Related domain candidates</h2>{related}</section><section><h2>Surface Exposure Score</h2>{score}</section><section><h2>Partial errors</h2><ul>{errors_html}</ul></section><section><h2>Checks not run</h2><ul>{skipped_html}</ul></section><section><h2>Configuration</h2><p>TCP ports: {tcp_ports} · UDP ports: {udp_ports} · concurrency: {concurrency} · connect timeout: {connect_timeout} ms · request timeout: {request_timeout} ms · global timeout: {global_timeout} ms</p></section><section><h2>Limitations</h2><p>Surface analyzes externally observable services and security-related configuration. It performs no active exploitation. DNS answers, redirects, timeouts, and a clean report do not prove security.</p></section><footer>Surface {version} · schema {schema}</footer></main></body></html>\n",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Surface report — {target}</title><style>:root{{color-scheme:light;--bg:#f4f7fb;--panel:#fff;--text:#172033;--muted:#607089;--line:#dbe3ee;--accent:#3157d5}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,sans-serif}}main{{max-width:76rem;margin:auto;padding:2rem 1rem 4rem}}header{{padding:1.5rem;border-radius:1rem;background:linear-gradient(135deg,#172554,#3157d5);color:#fff}}header h1{{margin:0}}.meta,.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.8rem}}.meta div,.card,.finding,section{{background:var(--panel);border:1px solid var(--line);border-radius:.8rem;padding:1rem}}header .meta div{{background:#ffffff18;border-color:#ffffff33}}dt{{font-size:.78rem;text-transform:uppercase;color:var(--muted)}}header dt{{color:#dbeafe}}dd{{margin:0;font-weight:650}}section{{margin-top:1rem}}section>h2{{margin-top:0}}.cards{{margin:1rem 0}}.cards .card{{font-size:1.2rem;font-weight:700}}.cards small{{display:block;color:var(--muted);font-size:.78rem}}code{{overflow-wrap:anywhere}}table{{border-collapse:collapse;width:100%;display:block;overflow:auto}}th,td{{padding:.55rem;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}}ul{{padding-left:1.3rem}}.finding{{border-left:.45rem solid #64748b;margin:.8rem 0}}.critical,.high{{border-left-color:#c62828}}.medium{{border-left-color:#ef6c00}}.low{{border-left-color:#ca8a04}}.info{{border-left-color:#2563eb}}.error{{color:#b91c1c}}footer{{margin-top:2rem;color:var(--muted)}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}section,.card,.finding,header{{break-inside:avoid}}}}</style></head><body><main><header><h1>Surface report</h1><p><code>{target}</code></p><dl class=\"meta\"><div><dt>Status</dt><dd>{status:?}</dd></div><div><dt>Started</dt><dd>{started}</dd></div><div><dt>Completed</dt><dd>{completed}</dd></div><div><dt>Scan ID</dt><dd><code>{scan_id}</code></dd></div></dl></header><div class=\"cards\"><div class=\"card\"><small>Exposure score</small>{score_value}</div><div class=\"card\"><small>Findings</small>{finding_count}</div><div class=\"card\"><small>Hosts</small>{host_count}</div><div class=\"card\"><small>Services</small>{service_count}</div><div class=\"card\"><small>HTTP endpoints</small>{http_count}</div><div class=\"card\"><small>Partial errors</small>{error_count}</div></div><section><h2>Findings</h2>{findings}</section><section><h2>DNS</h2>{dns}</section><section><h2>Hosts and open ports</h2>{hosts}</section><section><h2>Services</h2><table><thead><tr><th>Endpoint</th><th>Transport</th><th>Service</th><th>Confidence</th><th>Details</th></tr></thead><tbody>{services}</tbody></table></section>{ssh}<section><h2>HTTP</h2>{http}</section><section><h2>TLS</h2><table><thead><tr><th>Endpoint</th><th>Server name</th><th>Validation</th><th>Trusted</th><th>Hostname</th><th>Protocol</th><th>Cipher</th><th>Chain length</th><th>Leaf SHA-256</th><th>Subject</th><th>Issuer</th><th>Serial</th><th>Valid from</th><th>Valid until</th><th>Names</th><th>SANs truncated</th><th>Key algorithm</th><th>Key bits</th><th>Signature algorithm</th><th>Errors/limitations</th></tr></thead><tbody>{tls}</tbody></table></section><section><h2>Certificate Transparency candidates</h2>{certificate_transparency}</section><section><h2>Related domain candidates</h2>{related}</section><section><h2>Surface Exposure Score</h2>{score}</section><section><h2>Partial errors</h2><ul>{errors_html}</ul></section><section><h2>Checks not run</h2><ul>{skipped_html}</ul></section><section><h2>Configuration</h2><p>TCP ports: {tcp_ports} · UDP ports: {udp_ports} · concurrency: {concurrency} · connect timeout: {connect_timeout} ms · request timeout: {request_timeout} ms · global timeout: {global_timeout} ms</p></section><section><h2>Limitations</h2><p>Surface analyzes externally observable services and security-related configuration. It performs no active exploitation. DNS answers, redirects, timeouts, and a clean report do not prove security.</p></section><footer>Surface {version} · schema {schema}</footer></main></body></html>\n",
         target = escape_html(&report.target.original),
         status = report.status,
         started = escape_html(&report.started_at.to_string()),
@@ -1034,6 +1160,7 @@ pub fn render_html(report: &ScanReport) -> String {
             &hosts
         },
         services = services,
+        ssh = ssh,
         http = if http.is_empty() {
             "<p>No HTTP endpoints observed.</p>"
         } else {
@@ -1063,7 +1190,30 @@ pub fn render_html(report: &ScanReport) -> String {
     )
 }
 
-fn clean_terminal(value: &str) -> String {
+fn has_ssh_posture(service: &ServiceObservation) -> bool {
+    service.service == ServiceKind::Ssh
+}
+
+fn has_complete_ssh_inference(service: &ServiceObservation) -> bool {
+    service
+        .protocol_details
+        .get("ssh_analysis_status")
+        .is_some_and(|status| status == "complete_inferred")
+}
+
+fn is_ssh_selection_key(key: &str) -> bool {
+    SSH_SELECTION_KEYS.contains(&key)
+}
+
+fn bounded_ssh_value(value: Option<&str>) -> String {
+    value
+        .unwrap_or("unknown")
+        .chars()
+        .take(SSH_DISPLAY_CHARS)
+        .collect()
+}
+
+pub(crate) fn clean_terminal(value: &str) -> String {
     value
         .chars()
         .map(|character| {
@@ -1123,11 +1273,12 @@ mod tests {
     use surface_core::{
         AuthoritativeAxfrObservation, AxfrAttempt, AxfrOutcome, CertificateTransparencyCandidate,
         CertificateTransparencyObservation, CnameHop, DanglingCnameObservation,
-        DanglingCnameStatus, DnsObservation, DnssecObservation, DnssecRecordType,
-        DnssecRrsetObservation, DnssecStatus, HttpObservation, IntelligenceObservation,
-        MailObservation, RedirectObservation, RelatedDomainCandidate, RelatedDomainsObservation,
-        ScanConfiguration, ScanReport, SkippedCheck, SpfObservation, TlsObservation,
-        WildcardDnsObservation, WildcardDnsRecordType, WildcardDnsStatus, normalize_target,
+        DanglingCnameStatus, DetectionConfidence, DnsObservation, DnssecObservation,
+        DnssecRecordType, DnssecRrsetObservation, DnssecStatus, HttpObservation,
+        IntelligenceObservation, MailObservation, RedirectObservation, RelatedDomainCandidate,
+        RelatedDomainsObservation, ScanConfiguration, ScanReport, ServiceKind, ServiceObservation,
+        SkippedCheck, SpfObservation, TlsObservation, TransportProtocol, WildcardDnsObservation,
+        WildcardDnsRecordType, WildcardDnsStatus, calculate_exposure, normalize_target,
     };
 
     use super::{render_html, render_json, render_terminal};
@@ -1149,6 +1300,23 @@ mod tests {
         )
     }
 
+    fn ssh_service(
+        port: u16,
+        banner: Option<&str>,
+        protocol_details: BTreeMap<String, String>,
+    ) -> ServiceObservation {
+        ServiceObservation {
+            transport: TransportProtocol::Tcp,
+            address: format!("127.0.0.1:{port}")
+                .parse()
+                .unwrap_or_else(|error| panic!("{error}")),
+            service: ServiceKind::Ssh,
+            confidence: DetectionConfidence::High,
+            banner: banner.map(str::to_owned),
+            protocol_details,
+        }
+    }
+
     #[test]
     fn renderers_expose_truthful_status() {
         let report = report("example.com");
@@ -1156,6 +1324,51 @@ mod tests {
         let json = render_json(&report).unwrap_or_default();
         assert!(json.contains("\"status\": \"not_started\""));
         assert!(json.contains("\"schema_version\": \"0.3.0\""));
+        assert!(!render_terminal(&report).contains("\nSSH posture\n"));
+        assert!(!render_html(&report).contains("<h2>SSH posture</h2>"));
+    }
+
+    #[test]
+    fn terminal_sanitizes_imported_dynamic_metadata() {
+        let mut report = report("example.com");
+        report.scanner_version = "scanner\u{1b}[31m\nINJECTED-SCANNER\u{7}\u{9b}".to_owned();
+        let mut score = calculate_exposure(&report);
+        score.model_version = "model\u{1b}]0;owned\nINJECTED-MODEL\u{0}\u{85}".to_owned();
+        report.exposure_score = Some(score);
+        report.intelligence = Some(IntelligenceObservation {
+            related_domains: Some(RelatedDomainsObservation {
+                nameservers: Vec::new(),
+                provider: None,
+                candidates: vec![RelatedDomainCandidate {
+                    name: "café.example".to_owned(),
+                    matched_nameservers: Vec::new(),
+                    confidence: "mé\u{1b}[31m\nBAD\u{0}\u{85}".to_owned(),
+                    evidence: Vec::new(),
+                }],
+                complete: true,
+                errors: Vec::new(),
+            }),
+            ..IntelligenceObservation::default()
+        });
+
+        let terminal = render_terminal(&report);
+        assert_eq!(
+            terminal.lines().next(),
+            Some("Surface scanner [31m INJECTED-SCANNER  ")
+        );
+        assert!(terminal.lines().any(|line| {
+            line == "Surface Exposure Score: 100/100 (Favorable, model model ]0;owned INJECTED-MODEL  )"
+        }));
+        assert!(
+            terminal
+                .lines()
+                .any(|line| line == "  MÉ [31M BAD   café.example")
+        );
+        assert!(
+            terminal
+                .chars()
+                .all(|character| character == '\n' || !character.is_control())
+        );
     }
 
     #[test]
@@ -1166,6 +1379,159 @@ mod tests {
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(!html.contains("src=\"http"));
+    }
+
+    #[test]
+    fn complete_ssh_posture_is_bounded_sanitized_escaped_and_truthful() {
+        let mut report = report("example.com");
+        report.services.push(ssh_service(
+            22,
+            Some("SSH-2.0-<banner>\u{1b}[31m"),
+            BTreeMap::from([
+                ("ssh_protocol".to_owned(), "2.0".to_owned()),
+                ("ssh_software".to_owned(), "<software>&\u{7}".to_owned()),
+                ("ssh_kex".to_owned(), "<kex>".to_owned()),
+                ("ssh_host_key_algorithm".to_owned(), "<host-key>".to_owned()),
+                ("ssh_cipher_c2s".to_owned(), "<cipher-c2s>".to_owned()),
+                ("ssh_cipher_s2c".to_owned(), "<cipher-s2c>".to_owned()),
+                ("ssh_mac_c2s".to_owned(), "<mac-c2s>".to_owned()),
+                ("ssh_mac_s2c".to_owned(), "<mac-s2c>".to_owned()),
+                (
+                    "ssh_analysis_status".to_owned(),
+                    "complete_inferred".to_owned(),
+                ),
+            ]),
+        ));
+
+        let terminal = render_terminal(&report);
+        assert!(terminal.contains("127.0.0.1:22  protocol=2.0"));
+        assert!(terminal.contains("status=complete_inferred"));
+        assert!(terminal.contains("KEXINIT-inferred selections (no completed key exchange)"));
+        assert!(!terminal.contains('\u{1b}'));
+        assert!(!terminal.contains('\u{7}'));
+
+        let html = render_html(&report);
+        assert!(html.contains("KEXINIT-inferred selections (no completed key exchange)"));
+        for escaped in [
+            "&lt;banner&gt;",
+            "&lt;software&gt;&amp;",
+            "&lt;kex&gt;",
+            "&lt;host-key&gt;",
+            "&lt;cipher-c2s&gt;",
+            "&lt;cipher-s2c&gt;",
+            "&lt;mac-c2s&gt;",
+            "&lt;mac-s2c&gt;",
+        ] {
+            assert!(html.contains(escaped));
+        }
+        assert!(!html.contains('\u{1b}'));
+        assert!(!html.contains('\u{7}'));
+        assert!(!html.contains("src=\"http"));
+    }
+
+    #[test]
+    fn indeterminate_and_timeout_ssh_posture_has_no_selection_claim() {
+        let mut report = report("example.com");
+        report.services.push(ssh_service(
+            2222,
+            None,
+            BTreeMap::from([
+                ("ssh_protocol".to_owned(), "2.0".to_owned()),
+                ("ssh_software".to_owned(), "OpenSSH_<9>&".to_owned()),
+                ("ssh_analysis_status".to_owned(), "indeterminate".to_owned()),
+                (
+                    "ssh_skip_reason".to_owned(),
+                    format!("<request timeout>\u{1b}[31m{}END", "x".repeat(300)),
+                ),
+            ]),
+        ));
+        report.services.push(ssh_service(
+            2200,
+            None,
+            BTreeMap::from([(
+                "ssh_skip_reason".to_owned(),
+                "identification timeout".to_owned(),
+            )]),
+        ));
+
+        let terminal = render_terminal(&report);
+        assert!(terminal.contains("protocol=2.0  software=OpenSSH_<9>&  status=indeterminate"));
+        assert!(terminal.contains("status=unknown"));
+        assert_eq!(
+            terminal
+                .matches("No inferred selections available.")
+                .count(),
+            2
+        );
+        assert!(terminal.contains("Skip reason (bounded): <request timeout>"));
+        assert!(!terminal.contains("KEXINIT"));
+        assert!(!terminal.contains('\u{1b}'));
+        assert!(!terminal.contains("END"));
+
+        let html = render_html(&report);
+        assert!(html.contains("status <code>indeterminate</code>"));
+        assert!(html.contains("status <code>unknown</code>"));
+        assert_eq!(html.matches("No inferred selections available.").count(), 2);
+        assert!(html.contains("OpenSSH_&lt;9&gt;&amp;"));
+        assert!(html.contains("&lt;request timeout&gt;"));
+        assert!(!html.contains("KEXINIT"));
+        assert!(!html.contains('\u{1b}'));
+        assert!(!html.contains("END"));
+    }
+
+    #[test]
+    fn stale_ssh_selections_are_suppressed_when_status_is_not_complete() {
+        let mut report = report("example.com");
+        report.services.push(ssh_service(
+            22,
+            None,
+            BTreeMap::from([
+                ("ssh_analysis_status".to_owned(), "indeterminate".to_owned()),
+                ("ssh_kex".to_owned(), "stale-kex".to_owned()),
+                (
+                    "ssh_host_key_algorithm".to_owned(),
+                    "stale-host-key".to_owned(),
+                ),
+                ("ssh_cipher_c2s".to_owned(), "stale-cipher".to_owned()),
+                ("ssh_mac_c2s".to_owned(), "stale-mac".to_owned()),
+            ]),
+        ));
+
+        for rendered in [render_terminal(&report), render_html(&report)] {
+            assert!(rendered.contains("No inferred selections available."));
+            assert!(!rendered.contains("stale-"));
+            assert!(!rendered.contains("KEXINIT"));
+        }
+    }
+
+    #[test]
+    fn older_report_json_remains_renderable_without_ssh_posture() {
+        let mut report = report("example.com");
+        report.services.push(ServiceObservation {
+            transport: TransportProtocol::Tcp,
+            address: "127.0.0.1:80"
+                .parse()
+                .unwrap_or_else(|error| panic!("{error}")),
+            service: ServiceKind::Http,
+            confidence: DetectionConfidence::Medium,
+            banner: None,
+            protocol_details: BTreeMap::new(),
+        });
+        let mut value = serde_json::to_value(report).unwrap_or_else(|error| panic!("{error}"));
+        value["schema_version"] = serde_json::json!("0.2.0");
+        if let Some(configuration) = value["configuration"].as_object_mut() {
+            configuration.remove("udp_ports");
+        }
+        if let Some(service) = value["services"][0].as_object_mut() {
+            service.remove("transport");
+        }
+
+        let old: ScanReport =
+            serde_json::from_value(value).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(old.schema_version, "0.2.0");
+        assert_eq!(old.services[0].transport, TransportProtocol::Tcp);
+        assert!(!render_terminal(&old).contains("\nSSH posture\n"));
+        assert!(!render_html(&old).contains("<h2>SSH posture</h2>"));
     }
 
     #[test]

@@ -247,10 +247,12 @@ const fn security_severity(severity: Severity) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::Value;
     use surface_core::{
-        Finding, FindingCategory, FindingConfidence, ScanConfiguration, ScanReport, Severity,
-        normalize_target,
+        DetectionConfidence, Finding, FindingCategory, FindingConfidence, ScanConfiguration,
+        ScanReport, ServiceKind, ServiceObservation, Severity, TransportProtocol, normalize_target,
     };
 
     use super::{render_cyclonedx, render_sarif};
@@ -303,6 +305,34 @@ mod tests {
             render_sarif(&forward).unwrap_or_default(),
             render_sarif(&reversed).unwrap_or_default()
         );
+    }
+
+    #[test]
+    fn ssh_details_remain_generic_cyclonedx_service_properties() {
+        let mut report = report();
+        report.services.push(ServiceObservation {
+            transport: TransportProtocol::Tcp,
+            address: "192.0.2.1:22"
+                .parse()
+                .unwrap_or_else(|error| panic!("{error}")),
+            service: ServiceKind::Ssh,
+            confidence: DetectionConfidence::High,
+            banner: Some("SSH-2.0-OpenSSH_9.9".to_owned()),
+            protocol_details: BTreeMap::from([
+                (
+                    "ssh_analysis_status".to_owned(),
+                    "complete_inferred".to_owned(),
+                ),
+                ("ssh_kex".to_owned(), "curve25519-sha256".to_owned()),
+            ]),
+        });
+
+        let cyclonedx = render_cyclonedx(&report).unwrap_or_else(|error| panic!("{error}"));
+        assert!(cyclonedx.contains("surface:protocol:ssh_analysis_status"));
+        assert!(cyclonedx.contains("surface:protocol:ssh_kex"));
+        let sarif = render_sarif(&report).unwrap_or_else(|error| panic!("{error}"));
+        assert!(!sarif.contains("ssh_analysis_status"));
+        assert!(!sarif.contains("ssh_kex"));
     }
 
     #[test]

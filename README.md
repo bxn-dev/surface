@@ -39,6 +39,7 @@ Example addresses are documentation-only; tests and CI never scan public infrast
 - bounded Tokio TCP connect and UDP response scanning across selectable or complete port ranges
 - graceful Ctrl+C cancellation with partial reports
 - centralized bounded probes and curated service hints for web, mail, databases, VPNs, infrastructure, and game servers
+- bounded SSH identification and one KEXINIT intersection for already identified SSH services, reported as inferred before key exchange with no authentication, host-key retrieval, commands, or banner-based CVE inference
 - bounded HTTP redirects/bodies, selected headers, cookie flags, title and well-known files
 - one validating Rustls handshake per deduplicated implicit-TLS endpoint, with negotiated cipher and bounded chain/SAN, leaf SHA-256, and key evidence retained even when the unchanged verifier rejects a presented certificate
 - evidence-backed findings separated from raw observations
@@ -123,9 +124,11 @@ flowchart TD
     E --> F[Service Probes]
     F --> G[HTTP Analysis]
     F --> H[TLS Analysis]
+    F --> S[SSH Identification and KEXINIT Analysis]
     C --> I[Mail Configuration Analysis]
     G --> J[Finding Engine]
     H --> J
+    S --> J
     I --> J
     J --> K[Scan Report]
     K --> L[Terminal]
@@ -137,7 +140,7 @@ flowchart TD
 
 ## Limitations
 
-TCP timeouts do not prove filtering. Service identification can be uncertain. TLS uses one certificate-validating handshake per applicable implicit-TLS candidate; bounded presented-certificate evidence may remain visible after rejection, but validation stays failed and trust or hostname status stays unknown unless independently established. Certificate inspection is capped at 16 peer certificates, 1 MiB cumulative DER, and 128 normalized SAN entries, and no DER is retained. CDN/reverse-proxy observations may describe edge infrastructure. Header requirements depend on application context. DNSSEC uses Hickory local validation with built-in trust anchors for selected primary-host A/AAAA RRsets. System or upstream resolver limitations can make validation indeterminate; only cryptographic `Proof::Bogus` produces the high-severity DNSSEC finding. Dangling-CNAME checks query selected A/AAAA only for at most 16 resolver-observed primary-chain destinations; only conclusive NXDOMAIN produces a potential indicator, and ownership, claimability, and takeover feasibility are not tested. Destination answers are never scanned or propagated. Wildcard DNS detection compares selected A/AAAA and CNAME answers for exactly two random child names; mixed, rotating, incomplete, or errored answers remain indeterminate, and detection is contextual rather than automatically a vulnerability. Probe names and answers are never retained or scanned. AXFR runs only when primary-host SOA evidence and exact-owner NS records establish one zone; it retains bounded counts, never transferred owner names or records. DKIM is not inferred without selectors. No active exploitation or complete vulnerability coverage is provided. A clean report does not prove security.
+TCP timeouts do not prove filtering. Service identification can be uncertain. SSH selections are inferred from one bounded KEXINIT exchange and are not completed negotiation; Surface performs no SSH key exchange, authentication, host-key retrieval, commands, or banner-based CVE inference. TLS uses one certificate-validating handshake per applicable implicit-TLS candidate; bounded presented-certificate evidence may remain visible after rejection, but validation stays failed and trust or hostname status stays unknown unless independently established. Certificate inspection is capped at 16 peer certificates, 1 MiB cumulative DER, and 128 normalized SAN entries, and no DER is retained. CDN/reverse-proxy observations may describe edge infrastructure. Header requirements depend on application context. DNSSEC uses Hickory local validation with built-in trust anchors for selected primary-host A/AAAA RRsets. System or upstream resolver limitations can make validation indeterminate; only cryptographic `Proof::Bogus` produces the high-severity DNSSEC finding. Dangling-CNAME checks query selected A/AAAA only for at most 16 resolver-observed primary-chain destinations; only conclusive NXDOMAIN produces a potential indicator, and ownership, claimability, and takeover feasibility are not tested. Destination answers are never scanned or propagated. Wildcard DNS detection compares selected A/AAAA and CNAME answers for exactly two random child names; mixed, rotating, incomplete, or errored answers remain indeterminate, and detection is contextual rather than automatically a vulnerability. Probe names and answers are never retained or scanned. AXFR runs only when primary-host SOA evidence and exact-owner NS records establish one zone; it retains bounded counts, never transferred owner names or records. DKIM is not inferred without selectors. No active exploitation or complete vulnerability coverage is provided. A clean report does not prove security.
 
 See [`docs/limitations.md`](docs/limitations.md).
 
