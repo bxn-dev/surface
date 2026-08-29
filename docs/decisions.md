@@ -4,13 +4,13 @@
 
 Surface uses Tokio `TcpStream::connect`. Raw sockets, stealth scans, spoofing, evasion, exploitation, authentication, and brute force are out of scope.
 
-## Explicit authorization gate
+## Operator responsibility
 
-Non-loopback scans require `--acknowledge-authorization` before DNS or network activity. Local CLI mode permits explicitly supplied private addresses; no hosted mode exists.
+Surface starts scans directly. The CLI notice and documentation require operators to scan only systems they own or are authorized to assess.
 
 ## Primary-host scope
 
-Only explicit targets and primary-host A/AAAA records feed the TCP scanner. Passive MX/NS/CNAME/TXT observations do not create scan targets. HTTP redirects are followed only on the original host.
+Only explicit targets and resolver-returned primary-target A/AAAA records feed the TCP scanner. CNAME edges are preserved as evidence, while MX/NS/TXT observations do not create scan targets. HTTP redirects are followed only on the original host.
 
 ## Observation before interpretation
 
@@ -35,14 +35,6 @@ The score is a deterministic projection of stable finding severity and target id
 ## Integration exports are projections
 
 SARIF and CycloneDX are generated directly from the complete report with `serde_json`; no format-specific dependency or parallel data model is maintained. The Surface JSON report remains the lossless source of truth.
-
-## Hosted execution reuses core scanning
-
-The hosted API adds tenancy and durable leases but invokes the same scan engine. A hosted-only core entry point fails closed for explicit or resolved non-global addresses, preventing request-layer validation bypass. Target authorization attestations are durable tenant state.
-
-## Authentication uses opaque revocable credentials
-
-Passwords use Argon2id with random salts. Session and API credentials are random 256-bit values stored only as SHA-256 hashes. Cookie mutations require exact-origin plus per-session CSRF; bearer tokens require stored scopes. Role authorization is centralized.
 
 ## Passive intelligence is operator supplied
 

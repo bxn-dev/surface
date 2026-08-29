@@ -7,7 +7,9 @@
 - HTTP security-header and cookie recommendations depend on application context. Header presence alone does not prove quality.
 - Surface does not crawl, brute-force directories, authenticate, fuzz, exploit, deliver payloads, evade controls, or test denial of service.
 - Surface does not provide complete vulnerability coverage or infer CVEs solely from banners.
-- DNSSEC is not cryptographically validated and is never reported as validated.
+- DNSSEC uses Hickory's local validator with built-in trust anchors and covers only selected primary-host A/AAAA RRsets. System or upstream resolver limitations, transport failures, and unsupported or inconclusive proofs are indeterminate; only cryptographic `Proof::Bogus` produces the high-severity finding.
+- Dangling-CNAME indicators reuse only the first 16 ordered CNAME hops observed while resolving the primary target. Each destination receives selected A/AAAA lookups only: any address is `resolved`; uniformly authenticated NXDOMAIN is `nxdomain`; uniformly authenticated NOERROR/NODATA with SOA/NSEC/NSEC3 evidence is `no_address`; mixed, bogus, indeterminate, timed-out, or failed results are `indeterminate`. Only `nxdomain` produces a Medium potential indicator. Ownership, provider accounts, registration, claimability, and takeover feasibility are not tested; destination answers are never retained as addresses or propagated to port, service, HTTP, TLS, CT, or other scans.
+- Wildcard DNS detection applies only to hostname targets and compares selected A/AAAA plus CNAME answers for exactly two random UUID-v4 children. Only identical non-empty answer sets are `detected`; authenticated empty answers are `not_detected`; mixed, rotating, incomplete, timed-out, or errored answers are `indeterminate`. Probe names and raw answers are never retained or used as scan targets. Detection is contextual routing evidence, not automatically a vulnerability.
 - DKIM is queried only for explicitly supplied validated selectors; unqueried selectors and general DKIM availability remain unknown.
 - MTA-STS/TLS-RPT/SPF/DMARC record presence does not prove secure mail delivery.
 - The validating TLS handshake cannot retain an invalid leaf certificate when Rustls rejects it; the validation error remains visible.
@@ -15,7 +17,10 @@
 - The exposure score reflects only generated findings. Missing observations never deduct points; compare scores only when coverage and score-model versions are compatible.
 - SARIF and CycloneDX are lossy integration projections; use Surface JSON for complete observations and errors.
 - Offline CVE matches require exact recognized product/version evidence and remain candidates, not confirmed exploitable vulnerabilities. Bundle freshness and completeness are operator responsibilities.
-- Hosted mode is a hardened single-host SQLite deployment, not a horizontally distributed control plane. Restore requires stopping the server.
-- Hosted scans do not fetch MTA-STS policy documents; DNS TXT observations remain available without creating a delegated-subdomain SSRF path.
-- Webhook secrets, signing keys, and environment secrets require separate protected backup and rotation.
+- DNS queries cover the primary target and standard mail-policy names; Surface does not enumerate every possible subdomain.
+- AXFR is attempted only when primary-host SOA evidence and exact-owner NS records establish one unambiguous zone; Surface never guesses a parent zone. At most 4 NS names, 2 addresses per NS, and 8 deduplicated TCP endpoints are considered. Each endpoint is bounded to 2 MiB, 4,096 answer records, 64 messages, the request timeout, cancellation, and the caller's absolute deadline. Only a complete matching authoritative opening/closing SOA transfer is `allowed`; transferred owner names and records are never retained or scanned.
+- CNAME addresses returned while resolving the primary target are scanned, but CNAMEs do not trigger unrelated-host discovery.
+- Certificate Transparency results contain certificate names, not proof that a host currently exists or belongs to the target owner. CertSpotter queries are limited to three 1 MiB pages and 1,000 in-scope names; discovered names are never scanned automatically.
+- Reverse-NS results can be stale or incomplete. An exact nameserver-pair match indicates shared DNS infrastructure, not common ownership; only the first 300 results per nameserver are considered.
+- Passive intelligence sends the target hostname to the configured third-party API provider.
 - A clean report or score of 100 does not prove that a target is secure.

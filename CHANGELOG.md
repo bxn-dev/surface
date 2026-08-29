@@ -6,17 +6,24 @@ All notable changes are documented here.
 
 ### Changed
 
+- Removed the hosted server/control plane in favor of direct CLI scans and complete self-contained HTML reports.
+- Removed the `--acknowledge-authorization` gate; operators remain responsible for scanning only authorized targets.
+- Added `indicatif` stage progress, resolver-returned CNAME-chain evidence, default bounded CertSpotter Certificate Transparency discovery, optional passive exact-pair reverse-NS correlation, and truthful HTTP-to-HTTPS redirect rendering.
 - Added bounded TCP and UDP scanning across `1-65535`, transport-aware reports, truthful UDP `open|filtered` states, and curated service hints for infrastructure, databases, VPNs, and game servers.
 - Added precise encrypted-service names such as SMTPS, IMAPS, and POP3S; bumped report and crate versions to `0.3.0`.
+- Existing safe checks now run by default; `--only` restricts scan groups and reports omitted or unavailable checks explicitly.
+- Scans without `--output` now emit the selected stdout format and a self-contained `surface-<SCAN_ID>.html` report.
 - Removed redundant scan-stage implementation flags in report schema `0.2.0`.
 - Consolidated target identity, HTML escaping, service mapping, and change sorting.
 
 ### Added
 
-- Authenticated tenant-scoped hosted API and minimal web UI with Argon2id, opaque sessions/API tokens, centralized roles, CSRF/origin checks, and audit access.
-- Durable idempotent scan jobs, expiring worker leases, fixed-interval schedules, signed HTTPS webhooks, and hosted non-global egress rejection.
+- Default-on conservative dangling-CNAME indicators for at most 16 directly observed primary-chain destinations, with selected A/AAAA-only classification, no destination propagation, and a Medium finding only for conclusive NXDOMAIN.
+- Default-on conservative wildcard-DNS detection for hostname scans using exactly two UUID-v4 child probes, selected A/AAAA plus CNAME lookups, hashed answer summaries, non-retention, and an informational finding only for identical non-empty answers.
+- Exact-zone Hickory TCP AXFR checks from primary-host SOA/NS evidence, with strict endpoint/transfer bounds, counts-only non-retention, conservative outcomes, and a high-confidence finding only for complete allowed transfers.
+- Default-on Hickory DNSSEC validation for bounded primary-host address RRsets, with conservative status reporting and a high-confidence finding only for cryptographically bogus proofs.
 - Explicit passive subdomain/DKIM observations plus validated offline network metadata and conservative CVE candidates in report schema `0.1.2`.
-- Fixed-cardinality loopback metrics, exact-byte detached Ed25519 signatures, verified atomic SQLite backup/restore, and hardened systemd/Caddy deployment examples.
+- Exact-byte detached Ed25519 signatures and verified atomic SQLite backup/restore.
 - Deterministic semantic scan diffs for report files and persisted scan IDs, with terminal, JSON, and escaped HTML output.
 - Versioned exposure scoring with stable deductions and explicit incomplete-scan limitations.
 - SARIF 2.1.0 and CycloneDX 1.6 JSON exports.
@@ -25,7 +32,7 @@ All notable changes are documented here.
 - Scan-history list, show, delete, and dry-run retention commands.
 - Queryable scan/finding metadata and auditable transactional deletion.
 - Cargo workspace with separated core, reporting, and CLI crates.
-- Authorization-gated domain, URL, IPv4, and IPv6 scanning.
+- Domain, URL, IPv4, and IPv6 scanning.
 - Passive DNS and conservative mail-domain interpretation.
 - Bounded asynchronous TCP connect scanner with cancellation and strict timeouts.
 - Safe service, HTTP, and validating TLS observations.
