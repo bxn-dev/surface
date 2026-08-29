@@ -127,8 +127,8 @@ const fn classification(value: u8) -> ScoreClassification {
 #[cfg(test)]
 mod tests {
     use crate::{
-        normalize_target, Finding, FindingCategory, FindingConfidence, ScanConfiguration,
-        ScanReport, ScanStatus, Severity,
+        Finding, FindingCategory, FindingConfidence, ScanConfiguration, ScanReport, ScanStatus,
+        Severity, normalize_target,
     };
 
     use super::calculate_exposure;

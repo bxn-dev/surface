@@ -545,7 +545,7 @@ fn finding(
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_findings, Severity};
+    use super::{Severity, generate_findings};
     use crate::{
         AddressSource, AuthoritativeAxfrObservation, AxfrAttempt, AxfrOutcome, CnameHop,
         DanglingCnameObservation, DanglingCnameStatus, DnsObservation, DnsRecord,
@@ -645,9 +645,11 @@ mod tests {
         assert_eq!(findings[0].id, "DNS-WILDCARD-DETECTED");
         assert_eq!(findings[0].severity, Severity::Info);
         assert_eq!(findings[0].confidence, super::FindingConfidence::High);
-        assert!(findings[0]
-            .description
-            .contains("not automatically a vulnerability"));
+        assert!(
+            findings[0]
+                .description
+                .contains("not automatically a vulnerability")
+        );
 
         for status in [
             WildcardDnsStatus::NotDetected,
@@ -658,16 +660,18 @@ mod tests {
                 .as_mut()
                 .expect("wildcard observation")
                 .status = status;
-            assert!(generate_findings(
-                "example.com",
-                Some(&dns),
-                &[],
-                &[],
-                &[],
-                &[],
-                time::OffsetDateTime::UNIX_EPOCH,
-            )
-            .is_empty());
+            assert!(
+                generate_findings(
+                    "example.com",
+                    Some(&dns),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    time::OffsetDateTime::UNIX_EPOCH,
+                )
+                .is_empty()
+            );
         }
 
         dns.wildcard_dns = None;
@@ -734,7 +738,23 @@ mod tests {
             DanglingCnameStatus::Indeterminate,
         ] {
             dns.dangling_cnames[0].status = status;
-            assert!(generate_findings(
+            assert!(
+                generate_findings(
+                    "example.com",
+                    Some(&dns),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    time::OffsetDateTime::UNIX_EPOCH,
+                )
+                .is_empty()
+            );
+        }
+        dns.dangling_cnames[0].status = DanglingCnameStatus::NxDomain;
+        dns.dangling_cnames[0].canonical_target = "not-observed.example".to_owned();
+        assert!(
+            generate_findings(
                 "example.com",
                 Some(&dns),
                 &[],
@@ -743,20 +763,8 @@ mod tests {
                 &[],
                 time::OffsetDateTime::UNIX_EPOCH,
             )
-            .is_empty());
-        }
-        dns.dangling_cnames[0].status = DanglingCnameStatus::NxDomain;
-        dns.dangling_cnames[0].canonical_target = "not-observed.example".to_owned();
-        assert!(generate_findings(
-            "example.com",
-            Some(&dns),
-            &[],
-            &[],
-            &[],
-            &[],
-            time::OffsetDateTime::UNIX_EPOCH,
-        )
-        .is_empty());
+            .is_empty()
+        );
     }
 
     #[test]
@@ -904,16 +912,18 @@ mod tests {
             let dnssec = non_bogus_dns.dnssec.as_mut().expect("DNSSEC observation");
             dnssec.status = status;
             dnssec.checked_rrsets[0].status = status;
-            assert!(generate_findings(
-                "example.com",
-                Some(&non_bogus_dns),
-                &[],
-                &[],
-                &[],
-                &[],
-                time::OffsetDateTime::UNIX_EPOCH,
-            )
-            .is_empty());
+            assert!(
+                generate_findings(
+                    "example.com",
+                    Some(&non_bogus_dns),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    time::OffsetDateTime::UNIX_EPOCH,
+                )
+                .is_empty()
+            );
         }
     }
 }

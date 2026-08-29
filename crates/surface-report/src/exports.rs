@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use surface_core::{Finding, ScanReport, Severity};
 
 // Rust guideline compliant 2026-02-21
@@ -249,8 +249,8 @@ const fn security_severity(severity: Severity) -> &'static str {
 mod tests {
     use serde_json::Value;
     use surface_core::{
-        normalize_target, Finding, FindingCategory, FindingConfidence, ScanConfiguration,
-        ScanReport, Severity,
+        Finding, FindingCategory, FindingConfidence, ScanConfiguration, ScanReport, Severity,
+        normalize_target,
     };
 
     use super::{render_cyclonedx, render_sarif};
