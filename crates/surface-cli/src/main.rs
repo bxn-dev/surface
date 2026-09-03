@@ -9,9 +9,10 @@ use clap_complete::Shell;
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use surface_core::{
     IntelligenceObservation, ScanConfiguration, ScanProgress, ScanReport, ScanSelection, ScanStage,
-    ScanStatus, Severity, SkippedCheck, analyze_certificate_transparency, analyze_intelligence,
-    analyze_network_registrations, analyze_related_domains, calculate_exposure, normalize_target,
-    parse_bundle, parse_ports, parse_udp_ports, run_scan_selected_until_with_progress,
+    ScanStatus, Severity, SkippedCheck, analyze_bgp_routes, analyze_certificate_transparency,
+    analyze_intelligence, analyze_network_registrations, analyze_related_domains,
+    calculate_exposure, normalize_target, parse_bundle, parse_ports, parse_udp_ports,
+    run_scan_selected_until_with_progress,
 };
 use surface_report::{
     decode_key, diff_reports, render_cyclonedx, render_diff_html, render_diff_json,
@@ -525,6 +526,13 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
     }
     if intelligence_selected {
         analyze_network_registrations(
+            &mut report,
+            arguments.request_timeout,
+            scan_deadline,
+            &cancellation,
+        )
+        .await;
+        analyze_bgp_routes(
             &mut report,
             arguments.request_timeout,
             scan_deadline,

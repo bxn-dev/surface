@@ -52,18 +52,18 @@ pub(crate) enum FetchError {
     TooLarge,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum DestinationPolicy {
-    Public,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientPolicy {
+    PublicHttpsPinnedDnsNoProxyNoRedirect,
     #[cfg(test)]
-    Fixture,
+    FixtureHttpPinnedDnsNoProxyNoRedirect,
 }
 
 pub(crate) struct PinnedClients {
     request_timeout: Duration,
     clients: BTreeMap<String, Client>,
     resolver: Arc<dyn HostResolver>,
-    policy: DestinationPolicy,
+    policy: ClientPolicy,
 }
 
 impl PinnedClients {
@@ -72,7 +72,7 @@ impl PinnedClients {
             request_timeout,
             clients: BTreeMap::new(),
             resolver: Arc::new(SystemResolver),
-            policy: DestinationPolicy::Public,
+            policy: ClientPolicy::PublicHttpsPinnedDnsNoProxyNoRedirect,
         }
     }
 
@@ -111,13 +111,18 @@ impl PinnedClients {
                     calls: calls.clone(),
                 }),
                 policy: if strict {
-                    DestinationPolicy::Public
+                    ClientPolicy::PublicHttpsPinnedDnsNoProxyNoRedirect
                 } else {
-                    DestinationPolicy::Fixture
+                    ClientPolicy::FixtureHttpPinnedDnsNoProxyNoRedirect
                 },
             },
             calls,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn policy(&self) -> ClientPolicy {
+        self.policy
     }
 
     pub(crate) async fn client_for(
@@ -151,7 +156,7 @@ impl PinnedClients {
 
 fn validated_destinations(
     addresses: Vec<SocketAddr>,
-    policy: DestinationPolicy,
+    policy: ClientPolicy,
 ) -> Result<Vec<SocketAddr>, FetchError> {
     let addresses = addresses
         .into_iter()
@@ -160,7 +165,7 @@ fn validated_destinations(
     if addresses.is_empty() || addresses.len() > MAX_DNS_ADDRESSES {
         return Err(FetchError::Resolution);
     }
-    if matches!(policy, DestinationPolicy::Public)
+    if matches!(policy, ClientPolicy::PublicHttpsPinnedDnsNoProxyNoRedirect)
         && addresses
             .iter()
             .any(|address| !is_public_destination(*address))
@@ -177,7 +182,7 @@ fn build_client(
     hostname: &str,
     addresses: &[SocketAddr],
     request_timeout: Duration,
-    policy: DestinationPolicy,
+    policy: ClientPolicy,
 ) -> Result<Client, FetchError> {
     let builder = Client::builder()
         .timeout(request_timeout)
@@ -186,9 +191,9 @@ fn build_client(
         .user_agent(concat!("surface/", env!("CARGO_PKG_VERSION")))
         .resolve_to_addrs(hostname, addresses);
     let builder = match policy {
-        DestinationPolicy::Public => builder.https_only(true),
+        ClientPolicy::PublicHttpsPinnedDnsNoProxyNoRedirect => builder.https_only(true),
         #[cfg(test)]
-        DestinationPolicy::Fixture => builder,
+        ClientPolicy::FixtureHttpPinnedDnsNoProxyNoRedirect => builder,
     };
     builder.build().map_err(|_| FetchError::Request)
 }
@@ -387,7 +392,10 @@ mod tests {
             "64:ff9b:1::808:808",
         ] {
             assert_eq!(
-                validated_destinations(vec![socket(address)], super::DestinationPolicy::Public),
+                validated_destinations(
+                    vec![socket(address)],
+                    super::ClientPolicy::PublicHttpsPinnedDnsNoProxyNoRedirect,
+                ),
                 Err(FetchError::Destination),
                 "{address}"
             );
@@ -395,12 +403,15 @@ mod tests {
         assert_eq!(
             validated_destinations(
                 vec![socket("8.8.8.8"), socket("127.0.0.1")],
-                super::DestinationPolicy::Public
+                super::ClientPolicy::PublicHttpsPinnedDnsNoProxyNoRedirect,
             ),
             Err(FetchError::Destination)
         );
         assert_eq!(
-            validated_destinations(Vec::new(), super::DestinationPolicy::Public),
+            validated_destinations(
+                Vec::new(),
+                super::ClientPolicy::PublicHttpsPinnedDnsNoProxyNoRedirect,
+            ),
             Err(FetchError::Resolution)
         );
         assert_eq!(
@@ -408,7 +419,7 @@ mod tests {
                 (1..=9)
                     .map(|last| socket(&format!("8.8.8.{last}")))
                     .collect(),
-                super::DestinationPolicy::Public
+                super::ClientPolicy::PublicHttpsPinnedDnsNoProxyNoRedirect,
             ),
             Err(FetchError::Resolution)
         );
@@ -418,7 +429,7 @@ mod tests {
     fn destinations_are_sorted_deduplicated_and_port_neutral() {
         let addresses = validated_destinations(
             vec![socket("9.9.9.9"), socket("8.8.8.8"), socket("9.9.9.9")],
-            super::DestinationPolicy::Public,
+            super::ClientPolicy::PublicHttpsPinnedDnsNoProxyNoRedirect,
         )
         .unwrap_or_else(|error| panic!("{error:?}"));
         assert_eq!(

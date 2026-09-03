@@ -48,6 +48,16 @@ const MAX_RDAP_COUNTRY_BYTES: usize = 2;
 const IANA_IPV4_BOOTSTRAP: &str = "https://data.iana.org/rdap/ipv4.json";
 const IANA_IPV6_BOOTSTRAP: &str = "https://data.iana.org/rdap/ipv6.json";
 
+// RIPEstat bounds limit fan-out, retained ambiguity, and untrusted response data.
+const MAX_BGP_ADDRESSES: usize = 8;
+const MAX_BGP_CONCURRENCY: usize = 4;
+const MAX_BGP_RESPONSE_BYTES: usize = 128 * 1_024;
+const MAX_BGP_ORIGIN_ASNS: usize = 4;
+const RIPESTAT_NETWORK_INFO: &str = "https://stat.ripe.net/data/network-info/data.json";
+const RIPESTAT_SOURCE: &str = "RIPE RIS via RIPEstat";
+const RIPESTAT_OBSERVER_LIMITATION: &str =
+    "RIPE RIS is observer-dependent and network-info uses eight-hour data dumps";
+
 #[derive(Debug, Clone, Copy)]
 struct AllowedRdapBase {
     scheme: &'static str,
@@ -108,6 +118,23 @@ const PRODUCTION_RDAP_CONFIG: RdapConfig<'static> = RdapConfig {
     allowed_bases: OFFICIAL_RDAP_BASES,
 };
 
+#[derive(Clone, Copy)]
+struct BgpConfig<'a> {
+    endpoint: &'a str,
+    scheme: &'a str,
+    host: &'a str,
+    port: Option<u16>,
+    path: &'a str,
+}
+
+const PRODUCTION_BGP_CONFIG: BgpConfig<'static> = BgpConfig {
+    endpoint: RIPESTAT_NETWORK_INFO,
+    scheme: "https",
+    host: "stat.ripe.net",
+    port: None,
+    path: "/data/network-info/data.json",
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct IntelligenceObservation {
     pub subdomains: Vec<SubdomainObservation>,
@@ -122,6 +149,9 @@ pub struct IntelligenceObservation {
     /// Administrative IP-allocation evidence from authoritative RDAP registries.
     #[serde(default)]
     pub network_registrations: Vec<NetworkRegistrationObservation>,
+    /// Observer-based routed-prefix and origin-ASN evidence from RIPE RIS.
+    #[serde(default)]
+    pub bgp_routes: Vec<BgpRouteObservation>,
     pub complete: bool,
     pub errors: Vec<String>,
 }
@@ -194,6 +224,25 @@ pub struct NetworkRegistrationObservation {
     pub registration_country: Option<String>,
     /// Bounded registry statuses.
     pub statuses: Vec<String>,
+}
+
+/// Observer-based route and origin evidence for one primary DNS address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BgpRouteObservation {
+    /// Canonical address queried once through `RIPEstat`.
+    pub address: IpAddr,
+    /// Routed prefix reported by `network-info`, or none when no route was observed.
+    pub prefix: Option<String>,
+    /// Sorted unique observed origin ASNs; no canonical origin is selected.
+    pub origin_asns: Vec<u32>,
+    /// Stable evidence source identifier.
+    pub source: String,
+    /// Whether the successful response was retained coherently without local truncation.
+    ///
+    /// This does not claim globally complete routing visibility or attribution.
+    pub complete: bool,
+    /// Bounded caveats about observer coverage, conflicts, or truncation.
+    pub limitations: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -433,6 +482,22 @@ struct RdapNetworkResponse {
     status: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RipeStatEnvelope {
+    status: String,
+    status_code: u16,
+    data_call_name: String,
+    data_call_status: String,
+    version: String,
+    data: RipeStatNetworkInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct RipeStatNetworkInfo {
+    asns: Vec<String>,
+    prefix: String,
+}
+
 #[derive(Debug, Clone)]
 struct BootstrapEntry {
     prefix: Prefix,
@@ -447,6 +512,12 @@ struct ApprovedRdapBase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RdapStop {
+    Cancelled,
+    Deadline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BgpStop {
     Cancelled,
     Deadline,
 }
@@ -647,6 +718,14 @@ async fn analyze_network_registrations_with(
 }
 
 fn eligible_rdap_addresses(report: &ScanReport) -> (Vec<IpAddr>, bool) {
+    eligible_primary_addresses(report, MAX_RDAP_ADDRESSES)
+}
+
+fn eligible_bgp_addresses(report: &ScanReport) -> (Vec<IpAddr>, bool) {
+    eligible_primary_addresses(report, MAX_BGP_ADDRESSES)
+}
+
+fn eligible_primary_addresses(report: &ScanReport, maximum: usize) -> (Vec<IpAddr>, bool) {
     let mut addresses = report
         .dns
         .iter()
@@ -655,13 +734,365 @@ fn eligible_rdap_addresses(report: &ScanReport) -> (Vec<IpAddr>, bool) {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let truncated = addresses.len() > MAX_RDAP_ADDRESSES;
-    addresses.truncate(MAX_RDAP_ADDRESSES);
+    let truncated = addresses.len() > maximum;
+    addresses.truncate(maximum);
     (addresses, truncated)
 }
 
 fn canonical_external_address(address: IpAddr) -> Option<IpAddr> {
     is_public_destination(address).then_some(address)
+}
+
+/// Collects bounded observer-based BGP prefix and origin evidence.
+///
+/// Only eligible addresses already present in primary DNS results are queried. Returned prefixes
+/// and ASNs never become scan targets or inputs to other intelligence checks.
+pub async fn analyze_bgp_routes(
+    report: &mut ScanReport,
+    request_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) {
+    let (config, clients) = production_bgp_request_configuration(request_timeout);
+    analyze_bgp_routes_with(
+        report,
+        request_timeout,
+        deadline,
+        cancellation,
+        config,
+        clients,
+    )
+    .await;
+}
+
+fn production_bgp_request_configuration(
+    request_timeout: Duration,
+) -> (BgpConfig<'static>, PinnedClients) {
+    (PRODUCTION_BGP_CONFIG, PinnedClients::new(request_timeout))
+}
+
+async fn analyze_bgp_routes_with(
+    report: &mut ScanReport,
+    request_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    config: BgpConfig<'_>,
+    mut clients: PinnedClients,
+) {
+    let (addresses, truncated) = eligible_bgp_addresses(report);
+    if addresses.is_empty() {
+        record_bgp_skip(
+            report,
+            "no eligible external address in primary DNS results",
+        );
+        return;
+    }
+
+    let mut failures = BTreeSet::new();
+    if truncated {
+        failures.insert("address limit reached");
+    }
+    let mut requests = Vec::new();
+    for address in addresses {
+        match construct_bgp_url(config, address) {
+            Ok(url) => requests.push((address, url)),
+            Err(reason) => {
+                failures.insert(reason);
+            }
+        }
+    }
+    let Some((_, first_url)) = requests.first() else {
+        finish_bgp_routes(report, Vec::new(), failures, None);
+        return;
+    };
+    let client = match clients.client_for(first_url, deadline, cancellation).await {
+        Ok(client) => client,
+        Err(FetchError::Cancelled) => {
+            finish_bgp_routes(report, Vec::new(), failures, Some(BgpStop::Cancelled));
+            return;
+        }
+        Err(FetchError::Deadline) => {
+            finish_bgp_routes(report, Vec::new(), failures, Some(BgpStop::Deadline));
+            return;
+        }
+        Err(error) => {
+            failures.insert(bgp_fetch_reason(error));
+            finish_bgp_routes(report, Vec::new(), failures, None);
+            return;
+        }
+    };
+
+    let lookups = futures::stream::iter(requests.into_iter().map(|(address, url)| {
+        let client = client.clone();
+        async move {
+            let response = get_bounded(
+                &client,
+                url,
+                MAX_BGP_RESPONSE_BYTES,
+                request_timeout,
+                deadline,
+                cancellation,
+            )
+            .await;
+            (address, response)
+        }
+    }))
+    .buffer_unordered(MAX_BGP_CONCURRENCY);
+    futures::pin_mut!(lookups);
+
+    let mut observations = Vec::new();
+    let mut stop = None;
+    while let Some((address, response)) = lookups.next().await {
+        match response {
+            Ok(body) => match parse_bgp_response(&body, address) {
+                Ok(observation) => {
+                    if !observation.complete {
+                        failures.insert("RIPEstat returned incomplete BGP evidence");
+                    }
+                    observations.push(observation);
+                }
+                Err(reason) => {
+                    failures.insert(reason);
+                }
+            },
+            Err(FetchError::Cancelled) => {
+                stop = Some(BgpStop::Cancelled);
+                break;
+            }
+            Err(FetchError::Deadline) => {
+                stop = Some(BgpStop::Deadline);
+                break;
+            }
+            Err(error) => {
+                failures.insert(bgp_fetch_reason(error));
+            }
+        }
+    }
+    finish_bgp_routes(report, observations, failures, stop);
+}
+
+fn construct_bgp_url(config: BgpConfig<'_>, address: IpAddr) -> Result<Url, &'static str> {
+    let mut url = Url::parse(config.endpoint).map_err(|_| "RIPEstat endpoint was invalid")?;
+    if !bgp_url_matches_policy(&url, config, false) {
+        return Err("RIPEstat endpoint failed validation");
+    }
+    url.query_pairs_mut()
+        .append_pair("resource", &address.to_string());
+    if !bgp_url_matches_policy(&url, config, true)
+        || url.query_pairs().collect::<Vec<_>>()
+            != [(
+                std::borrow::Cow::Borrowed("resource"),
+                std::borrow::Cow::Owned(address.to_string()),
+            )]
+    {
+        return Err("constructed RIPEstat endpoint failed validation");
+    }
+    Ok(url)
+}
+
+fn bgp_url_matches_policy(url: &Url, config: BgpConfig<'_>, query: bool) -> bool {
+    let port_matches = match config.port {
+        Some(port) => url.port() == Some(port),
+        None => url.port().is_none(),
+    };
+    url.scheme() == config.scheme
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.host_str() == Some(config.host)
+        && port_matches
+        && url.path() == config.path
+        && url.fragment().is_none()
+        && (query == url.query().is_some())
+}
+
+fn parse_bgp_response(body: &[u8], address: IpAddr) -> Result<BgpRouteObservation, &'static str> {
+    validate_json_depth(body).map_err(|()| "RIPEstat JSON exceeded nesting limit")?;
+    let response: RipeStatEnvelope =
+        serde_json::from_slice(body).map_err(|_| "RIPEstat response was invalid")?;
+    let valid_version = response
+        .version
+        .split_once('.')
+        .is_some_and(|(major, minor)| major == "1" && minor.parse::<u16>().is_ok());
+    if response.status != "ok"
+        || response.status_code != 200
+        || response.data_call_name != "network-info"
+        || response.data_call_status != "supported"
+        || !valid_version
+    {
+        return Err("RIPEstat response envelope was not successful");
+    }
+
+    let mut origin_asns = response
+        .data
+        .asns
+        .iter()
+        .map(|value| {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("RIPEstat response contained an invalid origin ASN");
+            }
+            let asn = value
+                .parse::<u32>()
+                .map_err(|_| "RIPEstat response contained an invalid origin ASN")?;
+            if asn == 0 || value != &asn.to_string() {
+                return Err("RIPEstat response contained an invalid origin ASN");
+            }
+            Ok(asn)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    origin_asns.sort_unstable();
+    origin_asns.dedup();
+
+    let mut limitations = vec![RIPESTAT_OBSERVER_LIMITATION.to_owned()];
+    if response.data.prefix.is_empty() {
+        if origin_asns.is_empty() {
+            return Ok(BgpRouteObservation {
+                address,
+                prefix: None,
+                origin_asns,
+                source: RIPESTAT_SOURCE.to_owned(),
+                complete: true,
+                limitations,
+            });
+        }
+        limitations.push(
+            "RIPEstat returned origin ASNs without a routed prefix; attribution was discarded"
+                .to_owned(),
+        );
+        return Ok(BgpRouteObservation {
+            address,
+            prefix: None,
+            origin_asns: Vec::new(),
+            source: RIPESTAT_SOURCE.to_owned(),
+            complete: false,
+            limitations,
+        });
+    }
+
+    let prefix = parse_prefix(&response.data.prefix)
+        .map_err(|_| "RIPEstat response contained an invalid routed prefix")?;
+    if !prefix.contains(address) {
+        return Err("RIPEstat routed prefix did not contain the queried address");
+    }
+    let prefix = Some(prefix.canonical());
+    if origin_asns.is_empty() {
+        limitations.push(
+            "RIPEstat returned a routed prefix without origin ASNs; attribution is indeterminate"
+                .to_owned(),
+        );
+        return Ok(BgpRouteObservation {
+            address,
+            prefix,
+            origin_asns,
+            source: RIPESTAT_SOURCE.to_owned(),
+            complete: false,
+            limitations,
+        });
+    }
+
+    let mut complete = true;
+    if origin_asns.len() > 1 {
+        limitations.push(
+            "multiple origin ASNs were observed; no canonical origin was selected".to_owned(),
+        );
+    }
+    if origin_asns.len() > MAX_BGP_ORIGIN_ASNS {
+        complete = false;
+        origin_asns.truncate(MAX_BGP_ORIGIN_ASNS);
+        limitations.push("origin ASN limit reached; four sorted origins were retained".to_owned());
+    }
+    Ok(BgpRouteObservation {
+        address,
+        prefix,
+        origin_asns,
+        source: RIPESTAT_SOURCE.to_owned(),
+        complete,
+        limitations,
+    })
+}
+
+const fn bgp_fetch_reason(error: FetchError) -> &'static str {
+    match error {
+        FetchError::Timeout => "RIPEstat request timed out",
+        FetchError::Resolution => "RIPEstat hostname resolution failed",
+        FetchError::Destination => "RIPEstat destination was not public",
+        FetchError::Request => "RIPEstat request failed",
+        FetchError::Http(_) => "RIPEstat service returned an HTTP error",
+        FetchError::TooLarge => "RIPEstat response exceeded 128 KiB",
+        FetchError::Cancelled => "scan interrupted",
+        FetchError::Deadline => "global timeout expired",
+    }
+}
+
+fn finish_bgp_routes(
+    report: &mut ScanReport,
+    mut observations: Vec<BgpRouteObservation>,
+    failures: BTreeSet<&'static str>,
+    stop: Option<BgpStop>,
+) {
+    observations.sort_by_key(|observation| observation.address);
+    if !observations.is_empty() || !failures.is_empty() || stop.is_some() {
+        let intelligence = report
+            .intelligence
+            .get_or_insert_with(|| IntelligenceObservation {
+                complete: true,
+                ..IntelligenceObservation::default()
+            });
+        intelligence.bgp_routes.extend(observations);
+        intelligence
+            .bgp_routes
+            .sort_by_key(|observation| observation.address);
+        intelligence
+            .bgp_routes
+            .dedup_by_key(|observation| observation.address);
+        intelligence.complete &= failures.is_empty() && stop.is_none();
+    }
+
+    let reason = match stop {
+        Some(BgpStop::Cancelled) => {
+            if report.status != ScanStatus::Failed {
+                report.status = ScanStatus::Interrupted;
+                "Scan interrupted.".clone_into(&mut report.message);
+            }
+            Some("scan interrupted".to_owned())
+        }
+        Some(BgpStop::Deadline) => {
+            mark_bgp_partial(report);
+            Some("global timeout expired".to_owned())
+        }
+        None if !failures.is_empty() => {
+            mark_bgp_partial(report);
+            Some(format!(
+                "BGP origin lookup incomplete: {}",
+                failures.into_iter().collect::<Vec<_>>().join("; ")
+            ))
+        }
+        None => None,
+    };
+    if let Some(reason) = reason {
+        record_bgp_skip(report, &reason);
+    }
+}
+
+fn mark_bgp_partial(report: &mut ScanReport) {
+    if report.status == ScanStatus::Completed {
+        report.status = ScanStatus::Partial;
+        "Scan completed with incomplete intelligence.".clone_into(&mut report.message);
+    }
+}
+
+fn record_bgp_skip(report: &mut ScanReport, reason: &str) {
+    if let Some(existing) = report
+        .skipped_checks
+        .iter_mut()
+        .find(|skip| skip.check == "bgp_origin")
+    {
+        reason.clone_into(&mut existing.reason);
+    } else {
+        report.skipped_checks.push(SkippedCheck {
+            check: "bgp_origin".to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
 }
 
 fn parse_bootstrap(
@@ -1402,6 +1833,35 @@ impl Prefix {
             _ => false,
         }
     }
+
+    fn canonical(self) -> String {
+        match self.network {
+            IpAddr::V4(network) => {
+                let mask = if self.length == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - self.length)
+                };
+                format!(
+                    "{}/{}",
+                    std::net::Ipv4Addr::from(u32::from(network) & mask),
+                    self.length
+                )
+            }
+            IpAddr::V6(network) => {
+                let mask = if self.length == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - self.length)
+                };
+                format!(
+                    "{}/{}",
+                    std::net::Ipv6Addr::from(u128::from(network) & mask),
+                    self.length
+                )
+            }
+        }
+    }
 }
 fn parse_prefix(value: &str) -> Result<Prefix, String> {
     let (address, length) = value
@@ -1461,6 +1921,10 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         net::{IpAddr, Ipv4Addr, SocketAddr},
         str::FromStr,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -1478,14 +1942,17 @@ mod tests {
     };
 
     use super::{
-        AllowedRdapBase, CertSpotterIssuance, MAX_BOOTSTRAP_BYTES, MAX_CT_RESPONSE_BYTES,
-        MAX_RDAP_RESPONSE_BYTES, OFFICIAL_RDAP_BASES, PinnedClients, RdapConfig, RdapStop,
+        AllowedRdapBase, BgpConfig, BgpStop, CertSpotterIssuance, MAX_BGP_RESPONSE_BYTES,
+        MAX_BOOTSTRAP_BYTES, MAX_CT_RESPONSE_BYTES, MAX_RDAP_RESPONSE_BYTES, OFFICIAL_RDAP_BASES,
+        PinnedClients, RdapConfig, RdapStop, analyze_bgp_routes_with,
         analyze_certificate_transparency_at, analyze_intelligence,
         analyze_network_registrations_with, approved_rdap_base, canonical_external_address,
-        coherent_range, construct_rdap_url, correlate_cves, correlate_networks, ct_candidates,
-        eligible_rdap_addresses, fetch_certspotter_page, finish_network_registrations,
-        identify_nameserver_provider, longest_bootstrap_endpoint, parse_bootstrap, parse_bundle,
-        parse_rdap_response, related_candidates, validate_json_depth,
+        coherent_range, construct_bgp_url, construct_rdap_url, correlate_cves, correlate_networks,
+        ct_candidates, eligible_bgp_addresses, eligible_rdap_addresses, fetch_certspotter_page,
+        finish_bgp_routes, finish_network_registrations, identify_nameserver_provider,
+        longest_bootstrap_endpoint, parse_bgp_response, parse_bootstrap, parse_bundle,
+        parse_rdap_response, production_bgp_request_configuration, related_candidates,
+        validate_json_depth,
     };
 
     async fn mock_http_response(
@@ -1626,6 +2093,110 @@ mod tests {
             requests
         });
         (address, MockHttpRequests { stop, task })
+    }
+
+    async fn mock_concurrent_responses(
+        requests: usize,
+        delay: Duration,
+        body: &[u8],
+    ) -> (SocketAddr, JoinHandle<(Vec<String>, usize)>) {
+        let body = body.to_vec();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..requests {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                let active = active.clone();
+                let maximum = maximum.clone();
+                let captured = captured.clone();
+                let body = body.clone();
+                tasks.spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1_024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = socket
+                            .read(&mut chunk)
+                            .await
+                            .unwrap_or_else(|error| panic!("{error}"));
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    captured
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(String::from_utf8_lossy(&request).into_owned());
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap_or_else(|error| panic!("{error}"));
+            }
+            let requests = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            (requests, maximum.load(Ordering::SeqCst))
+        });
+        (address, task)
+    }
+
+    fn network_info(prefix: &str, mut asns: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "messages": [],
+            "version": "1.1",
+            "data_call_name": "network-info",
+            "data_call_status": "supported",
+            "status": "ok",
+            "status_code": 200,
+            "data": {"asns": asns.take(), "prefix": prefix}
+        }))
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn fixture_bgp_config(address: SocketAddr) -> BgpConfig<'static> {
+        let endpoint = Box::leak(
+            format!(
+                "http://stat.ripe.net:{}/data/network-info/data.json",
+                address.port()
+            )
+            .into_boxed_str(),
+        );
+        BgpConfig {
+            endpoint,
+            scheme: "http",
+            host: "stat.ripe.net",
+            port: Some(address.port()),
+            path: "/data/network-info/data.json",
+        }
+    }
+
+    fn bgp_fixture_clients(request_timeout: Duration, address: SocketAddr) -> PinnedClients {
+        PinnedClients::fixture(
+            request_timeout,
+            BTreeMap::from([("stat.ripe.net".to_owned(), vec![address])]),
+        )
     }
 
     fn report_with_dns(addresses: impl IntoIterator<Item = IpAddr>) -> ScanReport {
@@ -1783,7 +2354,7 @@ mod tests {
             .local_addr()
             .unwrap_or_else(|error| panic!("{error}"));
         let endpoint = format!("http://{server}/ipv4.json");
-        let mut report = report_with_dns(excluded);
+        let mut report = report_with_dns(excluded.clone());
         analyze_network_registrations_with(
             &mut report,
             Duration::from_millis(50),
@@ -1797,6 +2368,16 @@ mod tests {
             fixture_clients(Duration::from_millis(50), [server]),
         )
         .await;
+        let mut bgp_report = report_with_dns(excluded);
+        analyze_bgp_routes_with(
+            &mut bgp_report,
+            Duration::from_millis(50),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &tokio_util::sync::CancellationToken::new(),
+            fixture_bgp_config(server),
+            bgp_fixture_clients(Duration::from_millis(50), server),
+        )
+        .await;
 
         assert!(
             tokio::time::timeout(Duration::from_millis(30), listener.accept())
@@ -1806,6 +2387,9 @@ mod tests {
         assert_eq!(report.status, ScanStatus::Completed);
         assert_eq!(report.skipped_checks.len(), 1);
         assert_eq!(report.skipped_checks[0].check, "network_registration");
+        assert_eq!(bgp_report.status, ScanStatus::Completed);
+        assert_eq!(bgp_report.skipped_checks.len(), 1);
+        assert_eq!(bgp_report.skipped_checks[0].check, "bgp_origin");
     }
 
     #[test]
@@ -1822,12 +2406,211 @@ mod tests {
         let report = report_with_dns(addresses);
 
         let (eligible, truncated) = eligible_rdap_addresses(&report);
+        let (bgp_eligible, bgp_truncated) = eligible_bgp_addresses(&report);
 
         assert!(truncated);
         assert_eq!(eligible.len(), 8);
         assert!(eligible.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(eligible[0], IpAddr::V4(Ipv4Addr::new(8, 8, 8, 1)));
         assert_eq!(eligible[7], IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!((bgp_eligible, bgp_truncated), (eligible, truncated));
+    }
+
+    #[test]
+    fn production_bgp_policy_is_exact_and_locally_encodes_the_canonical_address() {
+        let (config, clients) = production_bgp_request_configuration(Duration::from_secs(1));
+        assert_eq!(
+            config.endpoint,
+            "https://stat.ripe.net/data/network-info/data.json"
+        );
+        assert_eq!(config.scheme, "https");
+        assert_eq!(config.host, "stat.ripe.net");
+        assert_eq!(config.port, None);
+        assert_eq!(config.path, "/data/network-info/data.json");
+        assert_eq!(
+            clients.policy(),
+            crate::passive_http::ClientPolicy::PublicHttpsPinnedDnsNoProxyNoRedirect
+        );
+
+        let ipv4 = construct_bgp_url(
+            config,
+            "8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}")),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            ipv4.as_str(),
+            "https://stat.ripe.net/data/network-info/data.json?resource=8.8.8.8"
+        );
+        let ipv6 = construct_bgp_url(
+            config,
+            "2001:4860:4860:0:0:0:0:8888"
+                .parse()
+                .unwrap_or_else(|error| panic!("{error}")),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            ipv6.as_str(),
+            "https://stat.ripe.net/data/network-info/data.json?resource=2001%3A4860%3A4860%3A%3A8888"
+        );
+    }
+
+    #[test]
+    fn bgp_parser_handles_no_route_duplicates_conflicts_and_truncation() {
+        let address = "8.8.8.8"
+            .parse::<IpAddr>()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let no_route = parse_bgp_response(&network_info("", serde_json::json!([])), address)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(no_route.complete);
+        assert!(no_route.prefix.is_none());
+        assert!(no_route.origin_asns.is_empty());
+
+        let single = parse_bgp_response(
+            &network_info("8.8.8.7/24", serde_json::json!(["15169", "15169"])),
+            address,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(single.complete);
+        assert_eq!(single.prefix.as_deref(), Some("8.8.8.0/24"));
+        assert_eq!(single.origin_asns, [15_169]);
+        assert_eq!(single.source, "RIPE RIS via RIPEstat");
+
+        let several = parse_bgp_response(
+            &network_info("8.8.8.0/24", serde_json::json!(["4", "2", "3", "1"])),
+            address,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(several.complete);
+        assert_eq!(several.origin_asns, [1, 2, 3, 4]);
+        assert!(
+            several
+                .limitations
+                .iter()
+                .any(|value| value.contains("multiple origin"))
+        );
+        assert!(
+            several
+                .limitations
+                .iter()
+                .any(|value| value.contains("observer-dependent"))
+        );
+
+        let truncated = parse_bgp_response(
+            &network_info("8.8.8.0/24", serde_json::json!(["4", "2", "3", "1", "5"])),
+            address,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!truncated.complete);
+        assert_eq!(truncated.origin_asns, [1, 2, 3, 4]);
+        assert!(
+            truncated
+                .limitations
+                .iter()
+                .any(|value| value.contains("multiple origin"))
+        );
+        assert!(
+            truncated
+                .limitations
+                .iter()
+                .any(|value| value.contains("limit reached"))
+        );
+        assert!(truncated.limitations.len() <= 3);
+        assert!(truncated.limitations.iter().all(|value| value.len() < 128));
+    }
+
+    #[test]
+    fn bgp_parser_rejects_invalid_asns_and_incoherent_prefixes() {
+        let address = "8.8.8.8"
+            .parse::<IpAddr>()
+            .unwrap_or_else(|error| panic!("{error}"));
+        for asns in [
+            serde_json::json!(["AS15169"]),
+            serde_json::json!([""]),
+            serde_json::json!(["0"]),
+            serde_json::json!(["4294967296"]),
+            serde_json::json!(["01"]),
+            serde_json::json!([15169]),
+        ] {
+            assert!(parse_bgp_response(&network_info("8.8.8.0/24", asns), address).is_err());
+        }
+        for prefix in ["not-a-prefix", "8.8.9.0/24", "2001:4860::/32"] {
+            assert!(
+                parse_bgp_response(&network_info(prefix, serde_json::json!(["15169"])), address)
+                    .is_err(),
+                "{prefix}"
+            );
+        }
+
+        let ipv6 = "2001:4860:4860::8888"
+            .parse::<IpAddr>()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let observation = parse_bgp_response(
+            &network_info("2001:4860:1::1/32", serde_json::json!(["15169"])),
+            ipv6,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(observation.prefix.as_deref(), Some("2001:4860::/32"));
+    }
+
+    #[test]
+    fn bgp_parser_treats_one_sided_attribution_as_indeterminate() {
+        let address = "8.8.8.8"
+            .parse::<IpAddr>()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let no_origins =
+            parse_bgp_response(&network_info("8.8.8.0/24", serde_json::json!([])), address)
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!no_origins.complete);
+        assert!(no_origins.origin_asns.is_empty());
+        let no_prefix =
+            parse_bgp_response(&network_info("", serde_json::json!(["15169"])), address)
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!no_prefix.complete);
+        assert!(no_prefix.prefix.is_none());
+        assert!(no_prefix.origin_asns.is_empty());
+    }
+
+    #[test]
+    fn bgp_parser_validates_the_success_envelope_without_retaining_messages() {
+        let address = "8.8.8.8"
+            .parse::<IpAddr>()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(parse_bgp_response(b"not-json", address).is_err());
+        for (field, value) in [
+            ("status", serde_json::json!("error")),
+            ("status_code", serde_json::json!(500)),
+            ("data_call_name", serde_json::json!("other")),
+            ("data_call_status", serde_json::json!("maintenance")),
+            ("version", serde_json::json!("2.0")),
+        ] {
+            let mut envelope: serde_json::Value =
+                serde_json::from_slice(&network_info("8.8.8.0/24", serde_json::json!(["15169"])))
+                    .unwrap_or_else(|error| panic!("{error}"));
+            envelope[field] = value;
+            assert!(
+                parse_bgp_response(
+                    &serde_json::to_vec(&envelope).unwrap_or_else(|error| panic!("{error}")),
+                    address
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&network_info("8.8.8.0/24", serde_json::json!(["15169"])))
+                .unwrap_or_else(|error| panic!("{error}"));
+        envelope["messages"] = serde_json::json!([["warning", "x".repeat(4_096)]]);
+        let observation = parse_bgp_response(
+            &serde_json::to_vec(&envelope).unwrap_or_else(|error| panic!("{error}")),
+            address,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            observation
+                .limitations
+                .iter()
+                .all(|value| value.len() < 128)
+        );
     }
 
     #[test]
@@ -2006,6 +2789,387 @@ mod tests {
         ] {
             assert!(parse_rdap_response(body, "8.8.8.8".parse().unwrap(), "ARIN").is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn bgp_request_uses_exact_host_path_query_and_only_primary_dns_addresses() {
+        let body = network_info("8.8.8.0/24", serde_json::json!(["15169", "13335", "15169"]));
+        let (server, requests) = mock_http_routes(1, move |_| {
+            BTreeMap::from([(
+                "/data/network-info/data.json?resource=8.8.8.8".to_owned(),
+                MockRoute {
+                    status: "200 OK",
+                    headers: String::new(),
+                    body,
+                    delay: Duration::ZERO,
+                },
+            )])
+        })
+        .await;
+        let mut report = report_with_dns(["8.8.8.8"
+            .parse::<IpAddr>()
+            .unwrap_or_else(|error| panic!("{error}"))]);
+        report.intelligence = Some(super::IntelligenceObservation {
+            networks: vec![super::NetworkMetadata {
+                address: "1.1.1.1".parse().unwrap_or_else(|error| panic!("{error}")),
+                prefix: "1.1.1.0/24".to_owned(),
+                asn: Some(13_335),
+                organization: Some("must not propagate".to_owned()),
+                country: None,
+            }],
+            network_registrations: vec![super::NetworkRegistrationObservation {
+                address: "9.9.9.9".parse().unwrap_or_else(|error| panic!("{error}")),
+                source: "RDAP".to_owned(),
+                registry: "TEST".to_owned(),
+                handle: Some("AS64500 CONTACT".to_owned()),
+                name: None,
+                network_type: None,
+                start_address: Some("9.9.9.0".parse().unwrap_or_else(|error| panic!("{error}"))),
+                end_address: Some(
+                    "9.9.9.255"
+                        .parse()
+                        .unwrap_or_else(|error| panic!("{error}")),
+                ),
+                registration_country: None,
+                statuses: Vec::new(),
+            }],
+            complete: true,
+            ..super::IntelligenceObservation::default()
+        });
+
+        analyze_bgp_routes_with(
+            &mut report,
+            Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+            fixture_bgp_config(server),
+            bgp_fixture_clients(Duration::from_secs(1), server),
+        )
+        .await;
+        let requests = requests.finish().await;
+
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .starts_with("GET /data/network-info/data.json?resource=8.8.8.8 HTTP/1.1\r\n")
+        );
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains(&format!("\r\nhost: stat.ripe.net:{}\r\n", server.port()))
+        );
+        assert_eq!(report.status, ScanStatus::Completed);
+        let routes = &report
+            .intelligence
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing intelligence"))
+            .bgp_routes;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes[0].address,
+            "8.8.8.8"
+                .parse::<IpAddr>()
+                .unwrap_or_else(|error| panic!("{error}"))
+        );
+        assert!(routes[0].complete);
+        assert_eq!(routes[0].prefix.as_deref(), Some("8.8.8.0/24"));
+        assert_eq!(routes[0].origin_asns, [13_335, 15_169]);
+        assert!(
+            routes[0]
+                .limitations
+                .iter()
+                .any(|value| value.contains("multiple origin"))
+        );
+        assert!(
+            routes[0]
+                .limitations
+                .iter()
+                .any(|value| value.contains("observer-dependent"))
+        );
+        assert!(report.skipped_checks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bgp_requests_are_sorted_deduplicated_capped_and_four_concurrent() {
+        let body = network_info("8.8.8.0/24", serde_json::json!(["15169"]));
+        let (server, server_task) =
+            mock_concurrent_responses(8, Duration::from_millis(50), &body).await;
+        let addresses = (1..=8)
+            .rev()
+            .flat_map(|last| {
+                let address = IpAddr::V4(Ipv4Addr::new(8, 8, 8, last));
+                [address, address]
+            })
+            .collect::<Vec<_>>();
+        let mut report = report_with_dns(addresses);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            analyze_bgp_routes_with(
+                &mut report,
+                Duration::from_secs(1),
+                tokio::time::Instant::now() + Duration::from_secs(2),
+                &tokio_util::sync::CancellationToken::new(),
+                fixture_bgp_config(server),
+                bgp_fixture_clients(Duration::from_secs(1), server),
+            ),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        let (requests, maximum) = server_task.await.unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(requests.len(), 8);
+        assert_eq!(maximum, 4);
+        let routes = &report
+            .intelligence
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing intelligence"))
+            .bgp_routes;
+        assert_eq!(routes.len(), 8);
+        assert!(
+            routes
+                .windows(2)
+                .all(|pair| pair[0].address < pair[1].address)
+        );
+        assert_eq!(report.status, ScanStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn truncated_bgp_success_is_retained_with_one_deduplicated_skip() {
+        let (server, requests) = mock_http_routes(2, |_| {
+            BTreeMap::from([
+                (
+                    "/data/network-info/data.json?resource=1.1.1.1".to_owned(),
+                    MockRoute {
+                        status: "200 OK",
+                        headers: String::new(),
+                        body: network_info("1.1.1.0/24", serde_json::json!(["13335"])),
+                        delay: Duration::ZERO,
+                    },
+                ),
+                (
+                    "/data/network-info/data.json?resource=8.8.8.8".to_owned(),
+                    MockRoute {
+                        status: "200 OK",
+                        headers: String::new(),
+                        body: network_info(
+                            "8.8.8.0/24",
+                            serde_json::json!(["5", "4", "3", "2", "1"]),
+                        ),
+                        delay: Duration::ZERO,
+                    },
+                ),
+            ])
+        })
+        .await;
+        let mut report = report_with_dns([
+            "8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}")),
+            "1.1.1.1".parse().unwrap_or_else(|error| panic!("{error}")),
+        ]);
+
+        analyze_bgp_routes_with(
+            &mut report,
+            Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+            fixture_bgp_config(server),
+            bgp_fixture_clients(Duration::from_secs(1), server),
+        )
+        .await;
+        let requests = requests.finish().await;
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(report.status, ScanStatus::Partial);
+        assert_eq!(report.skipped_checks.len(), 1);
+        assert_eq!(report.skipped_checks[0].check, "bgp_origin");
+        assert!(
+            report.skipped_checks[0]
+                .reason
+                .contains("incomplete BGP evidence")
+        );
+        let routes = &report
+            .intelligence
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing intelligence"))
+            .bgp_routes;
+        assert_eq!(routes.len(), 2);
+        let truncated_address = "8.8.8.8"
+            .parse::<IpAddr>()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let truncated = routes
+            .iter()
+            .find(|route| route.address == truncated_address)
+            .unwrap_or_else(|| panic!("missing truncated route"));
+        assert!(!truncated.complete);
+        assert_eq!(truncated.origin_asns, [1, 2, 3, 4]);
+        assert!(
+            truncated
+                .limitations
+                .iter()
+                .any(|value| value.contains("limit reached"))
+        );
+    }
+
+    #[tokio::test]
+    async fn bgp_redirect_and_oversize_fail_inside_the_pinned_boundary() {
+        let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let target_url = format!(
+            "http://{}/data/network-info/data.json",
+            target
+                .local_addr()
+                .unwrap_or_else(|error| panic!("{error}"))
+        );
+        let (redirect, requests) = mock_http_routes(1, move |_| {
+            BTreeMap::from([(
+                "/data/network-info/data.json?resource=8.8.8.8".to_owned(),
+                MockRoute {
+                    status: "302 Found",
+                    headers: format!("Location: {target_url}\r\n"),
+                    body: Vec::new(),
+                    delay: Duration::ZERO,
+                },
+            )])
+        })
+        .await;
+        let mut redirected =
+            report_with_dns(["8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}"))]);
+        analyze_bgp_routes_with(
+            &mut redirected,
+            Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+            fixture_bgp_config(redirect),
+            bgp_fixture_clients(Duration::from_secs(1), redirect),
+        )
+        .await;
+        assert_eq!(requests.finish().await.len(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), target.accept())
+                .await
+                .is_err()
+        );
+        assert!(redirected.skipped_checks[0].reason.contains("HTTP error"));
+
+        let (oversize, requests) = mock_http_routes(1, |_| {
+            BTreeMap::from([(
+                "/data/network-info/data.json?resource=8.8.8.8".to_owned(),
+                MockRoute {
+                    status: "200 OK",
+                    headers: String::new(),
+                    body: vec![b' '; MAX_BGP_RESPONSE_BYTES + 1],
+                    delay: Duration::ZERO,
+                },
+            )])
+        })
+        .await;
+        let mut oversized =
+            report_with_dns(["8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}"))]);
+        analyze_bgp_routes_with(
+            &mut oversized,
+            Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+            fixture_bgp_config(oversize),
+            bgp_fixture_clients(Duration::from_secs(1), oversize),
+        )
+        .await;
+        assert_eq!(requests.finish().await.len(), 1);
+        assert!(oversized.skipped_checks[0].reason.contains("128 KiB"));
+    }
+
+    #[tokio::test]
+    async fn bgp_timeout_deadline_and_cancellation_have_stable_lifecycle() {
+        async fn delayed(request_timeout: Duration, deadline: Duration) -> ScanReport {
+            let (server, requests) = mock_http_routes(1, |_| {
+                BTreeMap::from([(
+                    "/data/network-info/data.json?resource=8.8.8.8".to_owned(),
+                    MockRoute {
+                        status: "200 OK",
+                        headers: String::new(),
+                        body: network_info("8.8.8.0/24", serde_json::json!(["15169"])),
+                        delay: Duration::from_millis(100),
+                    },
+                )])
+            })
+            .await;
+            let mut report =
+                report_with_dns(["8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}"))]);
+            analyze_bgp_routes_with(
+                &mut report,
+                request_timeout,
+                tokio::time::Instant::now() + deadline,
+                &tokio_util::sync::CancellationToken::new(),
+                fixture_bgp_config(server),
+                bgp_fixture_clients(request_timeout, server),
+            )
+            .await;
+            let _ = requests.finish().await;
+            report
+        }
+
+        let timed_out = delayed(Duration::from_millis(10), Duration::from_secs(1)).await;
+        assert_eq!(timed_out.status, ScanStatus::Partial);
+        assert!(timed_out.skipped_checks[0].reason.contains("timed out"));
+        let deadline = delayed(Duration::from_secs(1), Duration::from_millis(10)).await;
+        assert_eq!(deadline.status, ScanStatus::Partial);
+        assert_eq!(deadline.skipped_checks[0].reason, "global timeout expired");
+
+        let (server, requests) = mock_http_routes(1, |_| BTreeMap::new()).await;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let mut cancelled =
+            report_with_dns(["8.8.8.8".parse().unwrap_or_else(|error| panic!("{error}"))]);
+        analyze_bgp_routes_with(
+            &mut cancelled,
+            Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &cancellation,
+            fixture_bgp_config(server),
+            bgp_fixture_clients(Duration::from_secs(1), server),
+        )
+        .await;
+        assert_eq!(cancelled.status, ScanStatus::Interrupted);
+        assert_eq!(cancelled.skipped_checks[0].reason, "scan interrupted");
+        assert!(requests.finish().await.is_empty());
+    }
+
+    #[test]
+    fn bgp_skip_is_deduplicated_and_preserves_terminal_states() {
+        let mut report = report_with_dns([]);
+        finish_bgp_routes(
+            &mut report,
+            Vec::new(),
+            BTreeSet::from(["RIPEstat request failed"]),
+            None,
+        );
+        finish_bgp_routes(
+            &mut report,
+            Vec::new(),
+            BTreeSet::from(["RIPEstat request timed out"]),
+            None,
+        );
+        assert_eq!(report.skipped_checks.len(), 1);
+        assert_eq!(report.status, ScanStatus::Partial);
+
+        report.status = ScanStatus::Failed;
+        finish_bgp_routes(
+            &mut report,
+            Vec::new(),
+            BTreeSet::new(),
+            Some(BgpStop::Cancelled),
+        );
+        assert_eq!(report.status, ScanStatus::Failed);
+        report.status = ScanStatus::Interrupted;
+        finish_bgp_routes(
+            &mut report,
+            Vec::new(),
+            BTreeSet::from(["RIPEstat request failed"]),
+            None,
+        );
+        assert_eq!(report.status, ScanStatus::Interrupted);
+        assert_eq!(report.skipped_checks.len(), 1);
     }
 
     #[tokio::test]
@@ -2378,6 +3542,7 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("{error}"));
         assert!(observation.network_registrations.is_empty());
+        assert!(observation.bgp_routes.is_empty());
     }
 
     #[test]
