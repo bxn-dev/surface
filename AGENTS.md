@@ -28,3 +28,17 @@
 - Schema versions 2 and 3 contain unused hosted-server tables retained solely for compatibility. `PLAN.md` is historical and does not describe the current executable architecture.
 - Report output must remain deterministic and must escape target-controlled HTML. Without `--output`, a scan prints its selected format and also creates ignored `surface-<SCAN_ID>.html` in the current directory.
 - Scan exit codes are meaningful: `2` means a report with high/critical findings; `3` means incomplete/interrupted output. Do not treat every nonzero scan exit as a process crash.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked in GitHub Issues for `bxn-dev/surface`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Triage uses the five canonical label names. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Domain documentation uses the single-context layout. See `docs/agents/domain.md`.
