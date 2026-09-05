@@ -47,7 +47,7 @@ Example addresses are documentation-only; tests and CI never scan public infrast
 - deterministic file/history diffs and versioned exposure scoring
 - resolver-returned CNAME-chain reporting with deduplicated scanning of resolved target addresses
 - live stage progress on stderr and complete self-contained HTML reports
-- default bounded CertSpotter Certificate Transparency discovery, supplied passive subdomain/DKIM observations, optional exact-pair reverse-NS correlation, and offline network/CVE correlation
+- default bounded CertSpotter Certificate Transparency discovery with passive current/historical DNS classification, supplied passive subdomain/DKIM observations, optional exact-pair reverse-NS correlation, and offline network/CVE correlation
 - detached Ed25519 report signatures and verified SQLite backup/restore
 
 No raw packets, stealth, brute force, exploitation, crawling, directory enumeration, authentication, rate-limit bypass, or unrelated-host discovery is implemented.

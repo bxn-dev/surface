@@ -44,12 +44,12 @@ pub use findings::{
 pub use http::{CookieObservation, HstsState, HttpObservation, RedirectObservation, analyze_http};
 #[doc(inline)]
 pub use intelligence::{
-    BgpRouteObservation, CertificateTransparencyCandidate, CertificateTransparencyObservation,
-    CveCandidate, DkimObservation, IntelligenceBundle, IntelligenceObservation, NetworkEntry,
-    NetworkMetadata, NetworkRegistrationObservation, RelatedDomainCandidate,
-    RelatedDomainsObservation, SubdomainObservation, VulnerabilityEntry, analyze_bgp_routes,
-    analyze_certificate_transparency, analyze_intelligence, analyze_network_registrations,
-    analyze_related_domains, parse_bundle,
+    BgpRouteObservation, CertificateTransparencyCandidate, CertificateTransparencyDnsStatus,
+    CertificateTransparencyObservation, CveCandidate, DkimObservation, IntelligenceBundle,
+    IntelligenceObservation, NetworkEntry, NetworkMetadata, NetworkRegistrationObservation,
+    RelatedDomainCandidate, RelatedDomainsObservation, SubdomainObservation, VulnerabilityEntry,
+    analyze_bgp_routes, analyze_certificate_transparency, analyze_intelligence,
+    analyze_network_registrations, analyze_related_domains, parse_bundle,
 };
 #[doc(inline)]
 pub use ports::{PortSelection, PortSpecError, parse_ports, parse_udp_ports};

@@ -7,7 +7,7 @@ mod signing;
 
 use std::fmt::Write;
 
-use surface_core::{HstsState, ScanReport, Severity};
+use surface_core::{CertificateTransparencyDnsStatus, HstsState, ScanReport, Severity};
 
 #[doc(inline)]
 pub use diff::{
@@ -379,20 +379,31 @@ pub fn render_terminal(report: &ScanReport) -> String {
         );
         let _ = writeln!(
             output,
-            "  Certificate names are passive evidence and were not scanned automatically."
+            "  Non-wildcard names received only a bounded passive DNS address lookup; they were not actively scanned."
         );
-        for candidate in &certificate_transparency.candidates {
-            let _ = writeln!(
-                output,
-                "  {:<8} {}  issuances={}",
-                if candidate.wildcard {
-                    "wildcard"
-                } else {
-                    "name"
-                },
-                clean_terminal(&candidate.name),
-                candidate.issuance_count
-            );
+        for (status, label) in CT_DNS_GROUPS {
+            let mut group = certificate_transparency
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.dns_status == status)
+                .peekable();
+            if group.peek().is_none() {
+                continue;
+            }
+            let _ = writeln!(output, "  {label}");
+            for candidate in group {
+                let _ = writeln!(
+                    output,
+                    "    {:<8} {}  issuances={}",
+                    if candidate.wildcard {
+                        "wildcard"
+                    } else {
+                        "name"
+                    },
+                    clean_terminal(&candidate.name),
+                    candidate.issuance_count
+                );
+            }
         }
         for error in &certificate_transparency.errors {
             let _ = writeln!(output, "  Limitation: {}", clean_terminal(error));
@@ -968,16 +979,25 @@ pub fn render_html(report: &ScanReport) -> String {
         .map_or_else(
             || "<p>Not available.</p>".to_owned(),
             |observation| {
-                let candidates = observation
-                    .candidates
+                let candidates = CT_DNS_GROUPS
                     .iter()
-                    .map(|candidate| {
-                        format!(
-                            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
-                            escape_html(&candidate.name),
-                            if candidate.wildcard { "yes" } else { "no" },
-                            candidate.issuance_count
-                        )
+                    .filter_map(|(status, label)| {
+                        let rows = observation
+                            .candidates
+                            .iter()
+                            .filter(|candidate| candidate.dns_status == *status)
+                            .map(|candidate| {
+                                format!(
+                                    "<tr><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+                                    escape_html(&candidate.name),
+                                    if candidate.wildcard { "yes" } else { "no" },
+                                    candidate.issuance_count
+                                )
+                            })
+                            .collect::<String>();
+                        (!rows.is_empty()).then(|| {
+                            format!("<tr><th colspan=\"3\">{label}</th></tr>{rows}")
+                        })
                     })
                     .collect::<String>();
                 let limitations = observation
@@ -986,7 +1006,7 @@ pub fn render_html(report: &ScanReport) -> String {
                     .map(|error| format!("<li>{}</li>", escape_html(error)))
                     .collect::<String>();
                 format!(
-                    "<p><strong>Source:</strong> {} · <strong>Issuances:</strong> {} · <strong>Pages:</strong> {} · <strong>Complete:</strong> {}</p><p>Certificate names are passive evidence and were not scanned automatically.</p><table><thead><tr><th>Name</th><th>Wildcard</th><th>Issuances</th></tr></thead><tbody>{}</tbody></table><ul class=\"error\">{}</ul>",
+                    "<p><strong>Source:</strong> {} · <strong>Issuances:</strong> {} · <strong>Pages:</strong> {} · <strong>Complete:</strong> {}</p><p>Non-wildcard names received only a bounded passive DNS address lookup; they were not actively scanned.</p><table><thead><tr><th>Name</th><th>Wildcard</th><th>Issuances</th></tr></thead><tbody>{}</tbody></table><ul class=\"error\">{}</ul>",
                     escape_html(&observation.source),
                     observation.issuance_count,
                     observation.pages_fetched,
@@ -1200,22 +1220,45 @@ fn severity_class(severity: Severity) -> &'static str {
     }
 }
 
+const CT_DNS_GROUPS: [(CertificateTransparencyDnsStatus, &str); 5] = [
+    (
+        CertificateTransparencyDnsStatus::Resolved,
+        "Currently resolved",
+    ),
+    (
+        CertificateTransparencyDnsStatus::NoAddress,
+        "No current address record",
+    ),
+    (
+        CertificateTransparencyDnsStatus::NxDomain,
+        "Historical certificate names",
+    ),
+    (
+        CertificateTransparencyDnsStatus::Indeterminate,
+        "DNS verification indeterminate",
+    ),
+    (
+        CertificateTransparencyDnsStatus::NotChecked,
+        "Wildcard or unverified certificate names",
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use surface_core::{
         AuthoritativeAxfrObservation, AxfrAttempt, AxfrOutcome, CertificateTransparencyCandidate,
-        CertificateTransparencyObservation, CnameHop, DanglingCnameObservation,
-        DanglingCnameStatus, DetectionConfidence, DnsObservation, DnssecObservation,
-        DnssecRecordType, DnssecRrsetObservation, DnssecStatus, HostObservation, HttpObservation,
-        IntelligenceObservation, MailObservation, PartialSshAlgorithmSelections, PortObservation,
-        PortState, RedirectObservation, RelatedDomainCandidate, RelatedDomainsObservation,
-        ScanConfiguration, ScanError, ScanErrorKind, ScanReport, ScanStage, ScanStatus,
-        ServiceKind, ServiceObservation, SkippedCheck, SpfObservation, SshAlgorithmSelections,
-        SshIdentification, SshPosture, SshPostureOutcome, TlsObservation, TransportProtocol,
-        WildcardDnsObservation, WildcardDnsRecordType, WildcardDnsStatus, calculate_exposure,
-        normalize_target,
+        CertificateTransparencyDnsStatus, CertificateTransparencyObservation, CnameHop,
+        DanglingCnameObservation, DanglingCnameStatus, DetectionConfidence, DnsObservation,
+        DnssecObservation, DnssecRecordType, DnssecRrsetObservation, DnssecStatus, HostObservation,
+        HttpObservation, IntelligenceObservation, MailObservation, PartialSshAlgorithmSelections,
+        PortObservation, PortState, RedirectObservation, RelatedDomainCandidate,
+        RelatedDomainsObservation, ScanConfiguration, ScanError, ScanErrorKind, ScanReport,
+        ScanStage, ScanStatus, ServiceKind, ServiceObservation, SkippedCheck, SpfObservation,
+        SshAlgorithmSelections, SshIdentification, SshPosture, SshPostureOutcome, TlsObservation,
+        TransportProtocol, WildcardDnsObservation, WildcardDnsRecordType, WildcardDnsStatus,
+        calculate_exposure, normalize_target,
     };
 
     use super::{render_html, render_json, render_terminal};
@@ -1610,11 +1653,20 @@ mod tests {
             complete: false,
             certificate_transparency: Some(CertificateTransparencyObservation {
                 source: "CertSpotter".to_owned(),
-                candidates: vec![CertificateTransparencyCandidate {
-                    name: "<api.example.com>".to_owned(),
-                    wildcard: false,
-                    issuance_count: 2,
-                }],
+                candidates: vec![
+                    CertificateTransparencyCandidate {
+                        name: "<api.example.com>".to_owned(),
+                        wildcard: false,
+                        issuance_count: 2,
+                        dns_status: CertificateTransparencyDnsStatus::Resolved,
+                    },
+                    CertificateTransparencyCandidate {
+                        name: "old.example.com".to_owned(),
+                        wildcard: false,
+                        issuance_count: 1,
+                        dns_status: CertificateTransparencyDnsStatus::NxDomain,
+                    },
+                ],
                 issuance_count: 2,
                 pages_fetched: 1,
                 complete: false,
@@ -1623,10 +1675,15 @@ mod tests {
             ..IntelligenceObservation::default()
         });
 
+        let terminal = render_terminal(&report);
         let html = render_html(&report);
 
+        assert!(terminal.contains("Currently resolved"));
+        assert!(terminal.contains("Historical certificate names"));
         assert!(html.contains("&lt;api.example.com&gt;"));
-        assert!(html.contains("were not scanned automatically"));
+        assert!(html.contains("Currently resolved"));
+        assert!(html.contains("Historical certificate names"));
+        assert!(html.contains("were not actively scanned"));
         assert!(!html.contains("<api.example.com>"));
     }
 

@@ -6,6 +6,11 @@ use std::{
 };
 
 use futures::StreamExt;
+use hickory_proto::op::ResponseCode;
+use hickory_resolver::{
+    TokioResolver,
+    net::{DnsError, NetError},
+};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,6 +35,7 @@ const MAX_REVERSE_NS_RESPONSE_BYTES: usize = 1_048_576;
 const REVERSE_NS_ENDPOINT: &str = "https://reverse-ns.whoisxmlapi.com/api/v1";
 const MAX_CT_PAGES: usize = 3;
 const MAX_CT_CANDIDATES: usize = 1_000;
+const MAX_CT_DNS_CONCURRENCY: usize = 16;
 const MAX_CT_RESPONSE_BYTES: usize = 1_048_576;
 const CERTSPOTTER_ENDPOINT: &str = "https://api.certspotter.com/v1/issuances";
 
@@ -203,6 +209,35 @@ pub struct CertificateTransparencyCandidate {
     pub name: String,
     pub wildcard: bool,
     pub issuance_count: usize,
+    /// Current passive DNS state; absent in older reports.
+    #[serde(default)]
+    pub dns_status: CertificateTransparencyDnsStatus,
+}
+
+/// Current passive DNS state for a Certificate Transparency name.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificateTransparencyDnsStatus {
+    /// Older report or wildcard certificate evidence that was not queried.
+    #[default]
+    NotChecked,
+    /// The current lookup returned at least one address.
+    Resolved,
+    /// The current lookup conclusively returned no address records.
+    NoAddress,
+    /// The current lookup conclusively returned `NXDOMAIN`.
+    #[serde(rename = "nxdomain")]
+    NxDomain,
+    /// The current lookup failed, timed out, or was interrupted.
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtDnsLookupResult {
+    Address,
+    NoAddress,
+    NxDomain,
+    Failed,
 }
 
 /// Authoritative administrative registration evidence for one primary DNS address.
@@ -1493,7 +1528,7 @@ pub async fn analyze_certificate_transparency(
     cancellation: &CancellationToken,
 ) -> Result<CertificateTransparencyObservation, String> {
     let mut clients = PinnedClients::new(request_timeout);
-    analyze_certificate_transparency_at(
+    let mut observation = analyze_certificate_transparency_at(
         report,
         api_key,
         request_timeout,
@@ -1502,7 +1537,21 @@ pub async fn analyze_certificate_transparency(
         CERTSPOTTER_ENDPOINT,
         &mut clients,
     )
+    .await?;
+    if !verify_ct_candidates(
+        &mut observation.candidates,
+        request_timeout,
+        deadline,
+        cancellation,
+    )
     .await
+    {
+        observation.complete = false;
+        observation
+            .errors
+            .push("certificate transparency DNS verification was incomplete".to_owned());
+    }
+    Ok(observation)
 }
 
 #[derive(Clone, Copy)]
@@ -1593,6 +1642,106 @@ async fn analyze_certificate_transparency_at(
     })
 }
 
+async fn verify_ct_candidates(
+    candidates: &mut [CertificateTransparencyCandidate],
+    request_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> bool {
+    if candidates.iter().all(|candidate| candidate.wildcard) {
+        return true;
+    }
+    let Ok(resolver) =
+        TokioResolver::builder_tokio().and_then(hickory_resolver::ResolverBuilder::build)
+    else {
+        for candidate in candidates
+            .iter_mut()
+            .filter(|candidate| !candidate.wildcard)
+        {
+            candidate.dns_status = CertificateTransparencyDnsStatus::Indeterminate;
+        }
+        return false;
+    };
+    verify_ct_candidates_with(
+        candidates,
+        request_timeout,
+        deadline,
+        cancellation,
+        move |name| {
+            let resolver = resolver.clone();
+            async move {
+                match resolver.lookup_ip(format!("{name}.")).await {
+                    Ok(addresses) if addresses.iter().next().is_some() => {
+                        CtDnsLookupResult::Address
+                    }
+                    Ok(_) => CtDnsLookupResult::NoAddress,
+                    Err(NetError::Dns(DnsError::NoRecordsFound(no_records))) => {
+                        match no_records.response_code {
+                            ResponseCode::NXDomain => CtDnsLookupResult::NxDomain,
+                            ResponseCode::NoError => CtDnsLookupResult::NoAddress,
+                            _ => CtDnsLookupResult::Failed,
+                        }
+                    }
+                    Err(_) => CtDnsLookupResult::Failed,
+                }
+            }
+        },
+    )
+    .await
+}
+
+async fn verify_ct_candidates_with<F, Fut>(
+    candidates: &mut [CertificateTransparencyCandidate],
+    request_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    lookup: F,
+) -> bool
+where
+    F: Fn(String) -> Fut + Clone,
+    Fut: Future<Output = CtDnsLookupResult>,
+{
+    let results = futures::stream::iter(
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| !candidate.wildcard)
+            .map(|(index, candidate)| (index, candidate.name.clone())),
+    )
+    .map(|(index, name)| {
+        let lookup = lookup.clone();
+        async move {
+            let query_deadline = deadline.min(Instant::now() + request_timeout);
+            let result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => CtDnsLookupResult::Failed,
+                result = tokio::time::timeout_at(query_deadline, lookup(name)) => {
+                    result.unwrap_or(CtDnsLookupResult::Failed)
+                }
+            };
+            (index, result)
+        }
+    })
+    .buffer_unordered(MAX_CT_DNS_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut complete = true;
+    for (index, result) in results {
+        let status = match result {
+            CtDnsLookupResult::Address => CertificateTransparencyDnsStatus::Resolved,
+            CtDnsLookupResult::NoAddress => CertificateTransparencyDnsStatus::NoAddress,
+            CtDnsLookupResult::NxDomain => CertificateTransparencyDnsStatus::NxDomain,
+            CtDnsLookupResult::Failed => {
+                complete = false;
+                CertificateTransparencyDnsStatus::Indeterminate
+            }
+        };
+        candidates[index].dns_status = status;
+    }
+    complete
+}
+
 async fn fetch_certspotter_page(
     clients: &mut PinnedClients,
     endpoint: &str,
@@ -1681,6 +1830,7 @@ fn ct_candidates(
                 name,
                 wildcard,
                 issuance_count,
+                dns_status: CertificateTransparencyDnsStatus::NotChecked,
             },
         )
         .collect();
@@ -2104,17 +2254,19 @@ mod tests {
     };
 
     use super::{
-        AllowedRdapBase, BgpConfig, BgpStop, CertSpotterIssuance, MAX_BGP_RESPONSE_BYTES,
-        MAX_BOOTSTRAP_BYTES, MAX_CT_RESPONSE_BYTES, MAX_RDAP_RESPONSE_BYTES, OFFICIAL_RDAP_BASES,
-        PinnedClients, RdapConfig, RdapStop, RequestBounds, analyze_bgp_routes_with,
-        analyze_certificate_transparency_at, analyze_intelligence,
-        analyze_network_registrations_with, approved_rdap_base, canonical_external_address,
-        coherent_range, construct_bgp_url, construct_rdap_url, correlate_cves, correlate_networks,
-        ct_candidates, eligible_bgp_addresses, eligible_rdap_addresses, fetch_certspotter_page,
-        finish_bgp_routes, finish_network_registrations, identify_nameserver_provider,
-        longest_bootstrap_endpoint, parse_bgp_response, parse_bootstrap, parse_bundle,
-        parse_rdap_response, production_bgp_request_configuration, record_dkim_result,
-        related_candidates, validate_json_depth,
+        AllowedRdapBase, BgpConfig, BgpStop, CertSpotterIssuance, CertificateTransparencyCandidate,
+        CertificateTransparencyDnsStatus, CtDnsLookupResult, MAX_BGP_RESPONSE_BYTES,
+        MAX_BOOTSTRAP_BYTES, MAX_CT_DNS_CONCURRENCY, MAX_CT_RESPONSE_BYTES,
+        MAX_RDAP_RESPONSE_BYTES, OFFICIAL_RDAP_BASES, PinnedClients, RdapConfig, RdapStop,
+        RequestBounds, analyze_bgp_routes_with, analyze_certificate_transparency_at,
+        analyze_intelligence, analyze_network_registrations_with, approved_rdap_base,
+        canonical_external_address, coherent_range, construct_bgp_url, construct_rdap_url,
+        correlate_cves, correlate_networks, ct_candidates, eligible_bgp_addresses,
+        eligible_rdap_addresses, fetch_certspotter_page, finish_bgp_routes,
+        finish_network_registrations, identify_nameserver_provider, longest_bootstrap_endpoint,
+        parse_bgp_response, parse_bootstrap, parse_bundle, parse_rdap_response,
+        production_bgp_request_configuration, record_dkim_result, related_candidates,
+        validate_json_depth, verify_ct_candidates_with,
     };
 
     async fn mock_http_response(
@@ -3936,6 +4088,133 @@ mod tests {
         assert_eq!(observation.pages_fetched, 1);
         assert!(!observation.complete);
         assert!(observation.errors[0].contains("HTTP 503"));
+    }
+
+    #[tokio::test]
+    async fn certspotter_dns_verification_classifies_candidates_conservatively() {
+        let mut candidates = [
+            CertificateTransparencyCandidate {
+                name: "current.example.com".to_owned(),
+                wildcard: false,
+                issuance_count: 1,
+                dns_status: CertificateTransparencyDnsStatus::NotChecked,
+            },
+            CertificateTransparencyCandidate {
+                name: "addressless.example.com".to_owned(),
+                wildcard: false,
+                issuance_count: 1,
+                dns_status: CertificateTransparencyDnsStatus::NotChecked,
+            },
+            CertificateTransparencyCandidate {
+                name: "historic.example.com".to_owned(),
+                wildcard: false,
+                issuance_count: 1,
+                dns_status: CertificateTransparencyDnsStatus::NotChecked,
+            },
+            CertificateTransparencyCandidate {
+                name: "unknown.example.com".to_owned(),
+                wildcard: false,
+                issuance_count: 1,
+                dns_status: CertificateTransparencyDnsStatus::NotChecked,
+            },
+        ];
+        let answers = Arc::new(BTreeMap::from([
+            ("current.example.com".to_owned(), CtDnsLookupResult::Address),
+            (
+                "addressless.example.com".to_owned(),
+                CtDnsLookupResult::NoAddress,
+            ),
+            (
+                "historic.example.com".to_owned(),
+                CtDnsLookupResult::NxDomain,
+            ),
+            ("unknown.example.com".to_owned(), CtDnsLookupResult::Failed),
+        ]));
+        let cancellation = CancellationToken::new();
+
+        let complete = verify_ct_candidates_with(
+            &mut candidates,
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(2),
+            &cancellation,
+            move |name| {
+                let answers = answers.clone();
+                async move { answers[&name] }
+            },
+        )
+        .await;
+
+        assert!(!complete);
+        assert_eq!(
+            candidates.map(|candidate| candidate.dns_status),
+            [
+                CertificateTransparencyDnsStatus::Resolved,
+                CertificateTransparencyDnsStatus::NoAddress,
+                CertificateTransparencyDnsStatus::NxDomain,
+                CertificateTransparencyDnsStatus::Indeterminate,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn certspotter_dns_verification_is_bounded_and_cancellable() {
+        let mut candidates = (0..32)
+            .map(|index| CertificateTransparencyCandidate {
+                name: format!("host-{index}.example.com"),
+                wildcard: false,
+                issuance_count: 1,
+                dns_status: CertificateTransparencyDnsStatus::NotChecked,
+            })
+            .collect::<Vec<_>>();
+        let current = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let current_for_lookup = current.clone();
+        let maximum_for_lookup = maximum.clone();
+        let verification = verify_ct_candidates_with(
+            &mut candidates,
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(2),
+            &cancellation,
+            move |_| {
+                let current = current_for_lookup.clone();
+                let maximum = maximum_for_lookup.clone();
+                async move {
+                    let active = current.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(active, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    CtDnsLookupResult::Address
+                }
+            },
+        );
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            cancel.cancel();
+        });
+
+        let complete = verification.await;
+        cancel_task.await.expect("cancellation task must finish");
+
+        assert!(!complete);
+        assert!(maximum.load(Ordering::SeqCst) <= MAX_CT_DNS_CONCURRENCY);
+        assert!(candidates.iter().all(|candidate| {
+            candidate.dns_status == CertificateTransparencyDnsStatus::Indeterminate
+        }));
+    }
+
+    #[test]
+    fn older_certspotter_candidates_default_to_not_checked() {
+        let candidate: CertificateTransparencyCandidate = serde_json::from_str(
+            r#"{"name":"api.example.com","wildcard":false,"issuance_count":2}"#,
+        )
+        .expect("older candidate must remain readable");
+
+        assert_eq!(
+            candidate.dns_status,
+            CertificateTransparencyDnsStatus::NotChecked
+        );
     }
 
     #[tokio::test]

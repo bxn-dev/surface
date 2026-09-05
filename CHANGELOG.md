@@ -6,6 +6,7 @@ All notable changes are documented here.
 
 ### Changed
 
+- Classify bounded CertSpotter names as currently resolved, lacking an address, historical NXDOMAIN, or indeterminate using passive DNS only; discovered addresses never become active scan targets.
 - Changed report schema to `0.4.0` with typed complete, partial, and indeterminate SSH posture; legacy SSH maps remain readable but are not interpreted or diffed against typed reports.
 - Unified scan finalization, preserved partial stage and passive-intelligence evidence, and made terminal, HTML, SARIF, CycloneDX, and semantic-diff lifecycle semantics consistent.
 - Removed the hosted server/control plane in favor of direct CLI scans and complete self-contained HTML reports.
