@@ -10,9 +10,9 @@ use indicatif::{ProgressBar, ProgressDrawTarget};
 use surface_core::{
     IntelligenceObservation, ScanConfiguration, ScanProgress, ScanReport, ScanSelection, ScanStage,
     ScanStatus, Severity, SkippedCheck, analyze_bgp_routes, analyze_certificate_transparency,
-    analyze_intelligence, analyze_network_registrations, analyze_related_domains,
-    calculate_exposure, normalize_target, parse_bundle, parse_ports, parse_udp_ports,
-    run_scan_selected_until_with_progress,
+    analyze_intelligence, analyze_network_registrations, analyze_related_domains, finalize_report,
+    normalize_target, parse_bundle, parse_ports, parse_udp_ports,
+    run_scan_selected_until_with_progress_deferred,
 };
 use surface_report::{
     decode_key, diff_reports, render_cyclonedx, render_diff_html, render_diff_json,
@@ -448,7 +448,7 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
     });
     let progress = progress_bar(arguments.quiet);
     let scan_progress = progress.clone();
-    let mut report = run_scan_selected_until_with_progress(
+    let mut report = run_scan_selected_until_with_progress_deferred(
         target,
         configuration,
         cancellation.clone(),
@@ -487,6 +487,8 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
                     &arguments.dkim_selectors,
                     bundle.as_ref(),
                     arguments.request_timeout,
+                    scan_deadline,
+                    &cancellation,
                 )
                 .await
                 .map_err(|error| AppError::new(error, EXIT_INVALID_INPUT))
@@ -548,42 +550,40 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
     let passive_results = if ct_applicable || related_configured {
         let passive_progress = progress_bar(arguments.quiet);
         passive_progress.set_message("Passive intelligence");
-        let results = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => None,
-            result = tokio::time::timeout_at(scan_deadline, async {
-                tokio::join!(
-                    async {
-                        if ct_applicable {
-                            Some(
-                                analyze_certificate_transparency(
-                                    &report,
-                                    certspotter_api_key.as_deref(),
-                                    arguments.request_timeout,
-                                )
-                                .await,
-                            )
-                        } else {
-                            None
-                        }
-                    },
-                    async {
-                        if let Some(api_key) = reverse_ns_api_key.as_deref() {
-                            Some(
-                                analyze_related_domains(
-                                    &report,
-                                    api_key,
-                                    arguments.request_timeout,
-                                )
-                                .await,
-                            )
-                        } else {
-                            None
-                        }
-                    }
-                )
-            }) => result.ok(),
-        };
+        let results = Some(tokio::join!(
+            async {
+                if ct_applicable {
+                    Some(
+                        analyze_certificate_transparency(
+                            &report,
+                            certspotter_api_key.as_deref(),
+                            arguments.request_timeout,
+                            scan_deadline,
+                            &cancellation,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                }
+            },
+            async {
+                if let Some(api_key) = reverse_ns_api_key.as_deref() {
+                    Some(
+                        analyze_related_domains(
+                            &report,
+                            api_key,
+                            arguments.request_timeout,
+                            scan_deadline,
+                            &cancellation,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                }
+            }
+        ));
         passive_progress.finish_and_clear();
         results
     } else {
@@ -608,11 +608,11 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
                     }
                 }
                 Err(reason) => {
-                    report.skipped_checks.push(SkippedCheck {
-                        check: "certificate_transparency".to_owned(),
-                        reason,
-                    });
-                    mark_intelligence_partial(&mut report);
+                    mark_intelligence_source_error(
+                        &mut report,
+                        "certificate_transparency",
+                        &reason,
+                    );
                 }
             }
         }
@@ -634,11 +634,7 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
                     }
                 }
                 Err(reason) => {
-                    report.skipped_checks.push(SkippedCheck {
-                        check: "related_domains".to_owned(),
-                        reason,
-                    });
-                    mark_intelligence_partial(&mut report);
+                    mark_intelligence_source_error(&mut report, "related_domains", &reason);
                 }
             }
         }
@@ -652,6 +648,10 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
             ],
         );
     }
+    if cancellation.is_cancelled() {
+        report.status = ScanStatus::Interrupted;
+        "scan interrupted".clone_into(&mut report.message);
+    }
     if intelligence_selected && !ct_applicable {
         report.skipped_checks.push(SkippedCheck {
             check: "certificate_transparency".to_owned(),
@@ -664,8 +664,7 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
         intelligence_selected,
         related_configured,
     );
-    refresh_exposure_score(&mut report);
-    report.completed_at = Some(time::OffsetDateTime::now_utc());
+    finalize_report(&mut report, &cancellation, scan_deadline, |_| {});
     signal_task.abort();
     if arguments.persist {
         let database = arguments.database.as_ref().ok_or_else(|| {
@@ -1052,8 +1051,9 @@ fn report_exit_error(report: &ScanReport) -> Option<AppError> {
         })
 }
 
+#[cfg(test)]
 fn refresh_exposure_score(report: &mut ScanReport) {
-    report.exposure_score = Some(calculate_exposure(report));
+    report.exposure_score = Some(surface_core::calculate_exposure(report));
 }
 
 fn mark_intelligence_partial(report: &mut ScanReport) {
@@ -1061,6 +1061,31 @@ fn mark_intelligence_partial(report: &mut ScanReport) {
         report.status = ScanStatus::Partial;
         "Scan completed with incomplete intelligence.".clone_into(&mut report.message);
     }
+}
+
+fn mark_intelligence_source_error(report: &mut ScanReport, check: &str, reason: &str) {
+    let intelligence = report
+        .intelligence
+        .get_or_insert_with(|| IntelligenceObservation {
+            complete: true,
+            ..IntelligenceObservation::default()
+        });
+    intelligence.complete = false;
+    let error = format!("{check}: {reason}");
+    if !intelligence.errors.contains(&error) {
+        intelligence.errors.push(error);
+    }
+    if !report
+        .skipped_checks
+        .iter()
+        .any(|skipped| skipped.check == check)
+    {
+        report.skipped_checks.push(SkippedCheck {
+            check: check.to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
+    mark_intelligence_partial(report);
 }
 
 fn mark_intelligence_stopped(report: &mut ScanReport, cancelled: bool, checks: &[(&str, bool)]) {
@@ -1201,8 +1226,8 @@ mod tests {
 
     use super::{
         Cli, Command, EXIT_INVALID_INPUT, EXIT_SCAN_FAILED, ScanPart, mark_intelligence_partial,
-        mark_intelligence_stopped, parse_duration, parse_retention_duration,
-        refresh_exposure_score, report_exit_error, run,
+        mark_intelligence_source_error, mark_intelligence_stopped, parse_duration,
+        parse_retention_duration, refresh_exposure_score, report_exit_error, run,
     };
 
     #[test]
@@ -1287,6 +1312,32 @@ mod tests {
         mark_intelligence_stopped(&mut report, true, &[("related_domains", true)]);
         assert_eq!(report.status, surface_core::ScanStatus::Interrupted);
         assert_eq!(report.skipped_checks[1].reason, "scan interrupted");
+    }
+
+    #[test]
+    fn intelligence_source_error_marks_root_observation_incomplete() {
+        let mut report = surface_core::ScanReport::not_started(
+            surface_core::normalize_target("example.com").unwrap_or_else(|error| panic!("{error}")),
+            surface_core::ScanConfiguration {
+                ports: vec![80],
+                udp_ports: Vec::new(),
+                concurrency: 1,
+                connect_timeout_ms: 100,
+                request_timeout_ms: 100,
+                global_timeout_ms: 1_000,
+                ipv4_only: false,
+                ipv6_only: false,
+                authorization_acknowledged: true,
+            },
+        );
+        report.status = surface_core::ScanStatus::Completed;
+
+        mark_intelligence_source_error(&mut report, "certificate_transparency", "HTTP 503");
+
+        let intelligence = report.intelligence.expect("intelligence observation");
+        assert!(!intelligence.complete);
+        assert_eq!(intelligence.errors, ["certificate_transparency: HTTP 503"]);
+        assert_eq!(report.status, surface_core::ScanStatus::Partial);
     }
 
     #[tokio::test]

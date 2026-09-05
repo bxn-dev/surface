@@ -99,6 +99,37 @@ pub struct HttpObservation {
     pub error: Option<String>,
 }
 
+/// Security state of the final observed HTTP response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HstsState {
+    /// The final response was HTTPS and included HSTS.
+    Present,
+    /// The final response was HTTPS but omitted HSTS.
+    Missing,
+    /// The final response was not HTTPS.
+    NotApplicable,
+}
+
+impl HttpObservation {
+    /// Returns the final observed URL, falling back to the initial URL.
+    #[must_use]
+    pub fn effective_url(&self) -> &str {
+        self.final_url.as_deref().unwrap_or(&self.url)
+    }
+
+    /// Interprets HSTS against the final observed response.
+    #[must_use]
+    pub fn hsts_state(&self) -> HstsState {
+        if !self.effective_url().starts_with("https://") {
+            HstsState::NotApplicable
+        } else if self.headers.contains_key("strict-transport-security") {
+            HstsState::Present
+        } else {
+            HstsState::Missing
+        }
+    }
+}
+
 /// Inspects discovered HTTP candidates with bounded concurrency.
 #[must_use]
 pub async fn analyze_http(
@@ -480,6 +511,7 @@ mod tests {
             confidence: DetectionConfidence::High,
             banner: None,
             protocol_details: BTreeMap::new(),
+            ssh: None,
         };
         let observations = analyze_http(
             &target,
@@ -526,6 +558,7 @@ mod tests {
             confidence: DetectionConfidence::High,
             banner: None,
             protocol_details: BTreeMap::new(),
+            ssh: None,
         };
         let observations = analyze_http(
             &normalize_target("localhost").unwrap_or_else(|error| panic!("{error}")),

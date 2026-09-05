@@ -13,9 +13,13 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    DnsObservation, ScanReport, ScanStatus, SkippedCheck, analyze_dns, lookup_txt,
-    normalize_target,
-    passive_http::{FetchError, PinnedClients, get_bounded, is_public_destination},
+    DnsObservation, ScanReport, ScanStatus, SkippedCheck, analyze_dns, lookup_txt, normalize_target,
+};
+
+mod http;
+
+use self::http::{
+    FetchError, PinnedClients, get_bounded, get_bounded_with_bearer, is_public_destination,
 };
 
 const MAX_SUBDOMAINS: usize = 32;
@@ -390,6 +394,8 @@ pub async fn analyze_intelligence(
     selectors: &[String],
     bundle: Option<&IntelligenceBundle>,
     timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<IntelligenceObservation, String> {
     let primary = report
         .target
@@ -406,6 +412,9 @@ pub async fn analyze_intelligence(
     };
     let mut names = BTreeSet::new();
     for input in subdomains {
+        if stop_supplied_intelligence(&mut observation, deadline, cancellation) {
+            break;
+        }
         let target =
             normalize_target(input).map_err(|_| "invalid supplied subdomain".to_owned())?;
         let name = target
@@ -417,14 +426,22 @@ pub async fn analyze_intelligence(
                 "supplied subdomain is outside the primary domain or duplicated".to_owned(),
             );
         }
-        match analyze_dns(
-            &normalize_target(&name).map_err(|_| "invalid supplied subdomain".to_owned())?,
-            timeout,
-            false,
-            false,
+        let dns_target =
+            normalize_target(&name).map_err(|_| "invalid supplied subdomain".to_owned())?;
+        let result = match await_supplied(
+            analyze_dns(&dns_target, timeout, false, false),
+            deadline,
+            cancellation,
         )
         .await
         {
+            Ok(result) => result,
+            Err(message) => {
+                record_intelligence_stop(&mut observation, message);
+                break;
+            }
+        };
+        match result {
             Ok(dns) => observation.subdomains.push(SubdomainObservation {
                 name,
                 dns: Some(dns),
@@ -441,13 +458,24 @@ pub async fn analyze_intelligence(
         }
     }
     for selector in selectors {
+        if stop_supplied_intelligence(&mut observation, deadline, cancellation) {
+            break;
+        }
         validate_selector(selector)?;
-        let records = lookup_txt(&format!("{selector}._domainkey.{primary}"), timeout)
-            .await
-            .unwrap_or_default();
-        observation.dkim.push(parse_dkim(selector, &records));
+        let query_name = format!("{selector}._domainkey.{primary}");
+        let result =
+            match await_supplied(lookup_txt(&query_name, timeout), deadline, cancellation).await {
+                Ok(result) => result,
+                Err(message) => {
+                    record_intelligence_stop(&mut observation, message);
+                    break;
+                }
+            };
+        record_dkim_result(&mut observation, selector, result);
     }
-    if let Some(bundle) = bundle {
+    if observation.complete
+        && let Some(bundle) = bundle
+    {
         observation.networks = correlate_networks(report, bundle);
         observation.cve_candidates = correlate_cves(report, bundle);
     }
@@ -458,6 +486,59 @@ pub async fn analyze_intelligence(
         .dkim
         .sort_by(|left, right| left.selector.cmp(&right.selector));
     Ok(observation)
+}
+
+async fn await_supplied<T>(
+    future: impl Future<Output = Result<T, String>>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Result<T, String>, &'static str> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err("intelligence collection was cancelled"),
+        result = tokio::time::timeout_at(deadline, future) => result
+            .map_err(|_| "intelligence collection deadline elapsed"),
+    }
+}
+
+fn stop_supplied_intelligence(
+    observation: &mut IntelligenceObservation,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> bool {
+    if cancellation.is_cancelled() {
+        record_intelligence_stop(observation, "intelligence collection was cancelled");
+        true
+    } else if Instant::now() >= deadline {
+        record_intelligence_stop(observation, "intelligence collection deadline elapsed");
+        true
+    } else {
+        false
+    }
+}
+
+fn record_intelligence_stop(observation: &mut IntelligenceObservation, reason: &str) {
+    observation.complete = false;
+    if !observation.errors.iter().any(|error| error == reason) {
+        observation.errors.push(reason.to_owned());
+    }
+}
+
+fn record_dkim_result(
+    observation: &mut IntelligenceObservation,
+    selector: &str,
+    result: Result<Vec<String>, String>,
+) {
+    match result {
+        Ok(records) => observation.dkim.push(parse_dkim(selector, &records)),
+        Err(error) => {
+            observation.complete = false;
+            observation
+                .errors
+                .push(format!("DKIM selector {selector}: {error}"));
+            observation.dkim.push(parse_dkim(selector, &[]));
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1408,48 +1489,90 @@ pub async fn analyze_certificate_transparency(
     report: &ScanReport,
     api_key: Option<&str>,
     request_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<CertificateTransparencyObservation, String> {
-    analyze_certificate_transparency_at(report, api_key, request_timeout, CERTSPOTTER_ENDPOINT)
-        .await
+    let mut clients = PinnedClients::new(request_timeout);
+    analyze_certificate_transparency_at(
+        report,
+        api_key,
+        request_timeout,
+        deadline,
+        cancellation,
+        CERTSPOTTER_ENDPOINT,
+        &mut clients,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct RequestBounds<'a> {
+    timeout: Duration,
+    deadline: Instant,
+    cancellation: &'a CancellationToken,
 }
 
 async fn analyze_certificate_transparency_at(
     report: &ScanReport,
     api_key: Option<&str>,
     request_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
     endpoint: &str,
+    clients: &mut PinnedClients,
 ) -> Result<CertificateTransparencyObservation, String> {
     let primary = report.target.hostname.as_deref().ok_or_else(|| {
         "certificate transparency discovery requires a hostname target".to_owned()
     })?;
-    let client = Client::builder()
-        .timeout(request_timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("surface/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|_| "could not initialize certificate transparency client".to_owned())?;
     let mut issuances = Vec::new();
     let mut after = None;
     let mut complete = false;
     let mut pages_fetched = 0;
+    let mut errors = Vec::new();
+    let bounds = RequestBounds {
+        timeout: request_timeout,
+        deadline,
+        cancellation,
+    };
     for _ in 0..MAX_CT_PAGES {
-        let page =
-            fetch_certspotter_page(&client, endpoint, primary, api_key, after.as_deref()).await?;
-        pages_fetched += 1;
+        let page = match fetch_certspotter_page(
+            clients,
+            endpoint,
+            primary,
+            api_key,
+            after.as_deref(),
+            bounds,
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(error) if !issuances.is_empty() => {
+                errors.push(error);
+                break;
+            }
+            Err(error) => return Err(error),
+        };
         if page.is_empty() {
+            pages_fetched += 1;
             complete = true;
             break;
         }
-        after = page.last().map(|issuance| issuance.id.clone());
-        if after.as_deref().is_none_or(str::is_empty) {
-            return Err("certificate transparency response lacked a pagination ID".to_owned());
+        let next_after = page.last().map(|issuance| issuance.id.clone());
+        if next_after.as_deref().is_none_or(str::is_empty) {
+            let error = "certificate transparency response lacked a pagination ID".to_owned();
+            if issuances.is_empty() {
+                return Err(error);
+            }
+            errors.push(error);
+            break;
         }
+        pages_fetched += 1;
+        after = next_after;
         issuances.extend(page);
     }
     let issuance_count = issuances.len();
     let (candidates, candidates_truncated) = ct_candidates(primary, &issuances);
-    let mut errors = Vec::new();
-    if !complete {
+    if !complete && errors.is_empty() {
         errors.push(format!(
             "certificate transparency pagination stopped after {MAX_CT_PAGES} pages"
         ));
@@ -1471,11 +1594,12 @@ async fn analyze_certificate_transparency_at(
 }
 
 async fn fetch_certspotter_page(
-    client: &Client,
+    clients: &mut PinnedClients,
     endpoint: &str,
     domain: &str,
     api_key: Option<&str>,
     after: Option<&str>,
+    bounds: RequestBounds<'_>,
 ) -> Result<Vec<CertSpotterIssuance>, String> {
     let mut url = Url::parse(endpoint).map_err(|_| "invalid CertSpotter endpoint".to_owned())?;
     {
@@ -1489,31 +1613,40 @@ async fn fetch_certspotter_page(
             query.append_pair("after", after);
         }
     }
-    let mut request = client.get(url);
-    if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
-        request = request.bearer_auth(api_key);
-    }
-    let response = request
-        .send()
+    let client = clients
+        .client_for(&url, bounds.deadline, bounds.cancellation)
         .await
-        .map_err(|_| "certificate transparency request failed".to_owned())?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "certificate transparency service returned HTTP {}",
-            response.status().as_u16()
-        ));
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| "certificate transparency response failed".to_owned())?;
-        if body.len().saturating_add(chunk.len()) > MAX_CT_RESPONSE_BYTES {
-            return Err("certificate transparency response exceeded 1 MiB".to_owned());
-        }
-        body.extend_from_slice(&chunk);
-    }
+        .map_err(certificate_transparency_fetch_error)?;
+    let body = get_bounded_with_bearer(
+        &client,
+        url,
+        MAX_CT_RESPONSE_BYTES,
+        bounds.timeout,
+        bounds.deadline,
+        bounds.cancellation,
+        api_key,
+    )
+    .await
+    .map_err(certificate_transparency_fetch_error)?;
     serde_json::from_slice(&body)
         .map_err(|_| "certificate transparency response was invalid".to_owned())
+}
+
+fn certificate_transparency_fetch_error(error: FetchError) -> String {
+    match error {
+        FetchError::Cancelled => "certificate transparency request was cancelled".to_owned(),
+        FetchError::Deadline => "certificate transparency deadline elapsed".to_owned(),
+        FetchError::Timeout => "certificate transparency request timed out".to_owned(),
+        FetchError::Resolution => "certificate transparency host resolution failed".to_owned(),
+        FetchError::Destination => {
+            "certificate transparency resolved to a non-public destination".to_owned()
+        }
+        FetchError::Request => "certificate transparency request failed".to_owned(),
+        FetchError::Http(status) => {
+            format!("certificate transparency service returned HTTP {status}")
+        }
+        FetchError::TooLarge => "certificate transparency response exceeded 1 MiB".to_owned(),
+    }
 }
 
 fn ct_candidates(
@@ -1565,15 +1698,30 @@ pub async fn analyze_related_domains(
     report: &ScanReport,
     api_key: &str,
     request_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<RelatedDomainsObservation, String> {
-    analyze_related_domains_at(report, api_key, request_timeout, REVERSE_NS_ENDPOINT).await
+    let mut clients = PinnedClients::new(request_timeout);
+    analyze_related_domains_at(
+        report,
+        api_key,
+        request_timeout,
+        deadline,
+        cancellation,
+        REVERSE_NS_ENDPOINT,
+        &mut clients,
+    )
+    .await
 }
 
 async fn analyze_related_domains_at(
     report: &ScanReport,
     api_key: &str,
     request_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
     endpoint: &str,
+    clients: &mut PinnedClients,
 ) -> Result<RelatedDomainsObservation, String> {
     if api_key.trim().is_empty() {
         return Err("SURFACE_WHOISXML_API_KEY is empty".to_owned());
@@ -1601,14 +1749,15 @@ async fn analyze_related_domains_at(
         );
     }
 
-    let client = Client::builder()
-        .timeout(request_timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "could not initialize reverse-NS client".to_owned())?;
+    let left_url = reverse_ns_url(endpoint, api_key, &nameservers[0])?;
+    let right_url = reverse_ns_url(endpoint, api_key, &nameservers[1])?;
+    let client = clients
+        .client_for(&left_url, deadline, cancellation)
+        .await
+        .map_err(reverse_ns_fetch_error)?;
     let (left, right) = tokio::join!(
-        fetch_reverse_ns(&client, endpoint, api_key, &nameservers[0]),
-        fetch_reverse_ns(&client, endpoint, api_key, &nameservers[1])
+        fetch_reverse_ns(&client, left_url, request_timeout, deadline, cancellation),
+        fetch_reverse_ns(&client, right_url, request_timeout, deadline, cancellation)
     );
     let mut observation = RelatedDomainsObservation {
         nameservers: nameservers.clone(),
@@ -1640,34 +1789,32 @@ async fn analyze_related_domains_at(
     Ok(observation)
 }
 
-async fn fetch_reverse_ns(
-    client: &Client,
-    endpoint: &str,
-    api_key: &str,
-    nameserver: &str,
-) -> Result<(BTreeSet<String>, bool), String> {
+fn reverse_ns_url(endpoint: &str, api_key: &str, nameserver: &str) -> Result<Url, String> {
     let mut url = Url::parse(endpoint).map_err(|_| "invalid reverse-NS endpoint".to_owned())?;
     url.query_pairs_mut()
         .append_pair("apiKey", api_key)
         .append_pair("ns", nameserver)
         .append_pair("outputFormat", "JSON");
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| "reverse-NS request failed".to_owned())?;
-    if !response.status().is_success() {
-        return Err("reverse-NS service returned an error".to_owned());
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| "reverse-NS response failed".to_owned())?;
-        if body.len().saturating_add(chunk.len()) > MAX_REVERSE_NS_RESPONSE_BYTES {
-            return Err("reverse-NS response exceeded 1 MiB".to_owned());
-        }
-        body.extend_from_slice(&chunk);
-    }
+    Ok(url)
+}
+
+async fn fetch_reverse_ns(
+    client: &Client,
+    url: Url,
+    request_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(BTreeSet<String>, bool), String> {
+    let body = get_bounded(
+        client,
+        url,
+        MAX_REVERSE_NS_RESPONSE_BYTES,
+        request_timeout,
+        deadline,
+        cancellation,
+    )
+    .await
+    .map_err(reverse_ns_fetch_error)?;
     let response: ReverseNsResponse =
         serde_json::from_slice(&body).map_err(|_| "reverse-NS response was invalid".to_owned())?;
     let truncated = response.result.len() >= MAX_RELATED_DOMAINS;
@@ -1682,6 +1829,19 @@ async fn fetch_reverse_ns(
         })
         .collect();
     Ok((names, truncated))
+}
+
+fn reverse_ns_fetch_error(error: FetchError) -> String {
+    match error {
+        FetchError::Cancelled => "reverse-NS request was cancelled".to_owned(),
+        FetchError::Deadline => "reverse-NS deadline elapsed".to_owned(),
+        FetchError::Timeout => "reverse-NS request timed out".to_owned(),
+        FetchError::Resolution => "reverse-NS host resolution failed".to_owned(),
+        FetchError::Destination => "reverse-NS resolved to a non-public destination".to_owned(),
+        FetchError::Request => "reverse-NS request failed".to_owned(),
+        FetchError::Http(status) => format!("reverse-NS service returned HTTP {status}"),
+        FetchError::TooLarge => "reverse-NS response exceeded 1 MiB".to_owned(),
+    }
 }
 
 fn related_candidates(
@@ -1928,12 +2088,14 @@ mod tests {
         time::Duration,
     };
 
-    use reqwest::Client;
+    use reqwest::Url;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
         task::JoinHandle,
+        time::Instant,
     };
+    use tokio_util::sync::CancellationToken;
 
     use crate::{
         AddressSource, DetectionConfidence, DnsObservation, HostObservation, MailObservation,
@@ -1944,15 +2106,15 @@ mod tests {
     use super::{
         AllowedRdapBase, BgpConfig, BgpStop, CertSpotterIssuance, MAX_BGP_RESPONSE_BYTES,
         MAX_BOOTSTRAP_BYTES, MAX_CT_RESPONSE_BYTES, MAX_RDAP_RESPONSE_BYTES, OFFICIAL_RDAP_BASES,
-        PinnedClients, RdapConfig, RdapStop, analyze_bgp_routes_with,
+        PinnedClients, RdapConfig, RdapStop, RequestBounds, analyze_bgp_routes_with,
         analyze_certificate_transparency_at, analyze_intelligence,
         analyze_network_registrations_with, approved_rdap_base, canonical_external_address,
         coherent_range, construct_bgp_url, construct_rdap_url, correlate_cves, correlate_networks,
         ct_candidates, eligible_bgp_addresses, eligible_rdap_addresses, fetch_certspotter_page,
         finish_bgp_routes, finish_network_registrations, identify_nameserver_provider,
         longest_bootstrap_endpoint, parse_bgp_response, parse_bootstrap, parse_bundle,
-        parse_rdap_response, production_bgp_request_configuration, related_candidates,
-        validate_json_depth,
+        parse_rdap_response, production_bgp_request_configuration, record_dkim_result,
+        related_candidates, validate_json_depth,
     };
 
     async fn mock_http_response(
@@ -1997,6 +2159,27 @@ mod tests {
             String::from_utf8_lossy(&request).into_owned()
         });
         (format!("http://{address}/v1/issuances"), task)
+    }
+
+    fn ct_fixture_clients(endpoint: &str) -> PinnedClients {
+        let url = Url::parse(endpoint).unwrap_or_else(|error| panic!("{error}"));
+        let host = url.host_str().unwrap_or_else(|| panic!("missing host"));
+        let address = SocketAddr::new(
+            host.parse().unwrap_or_else(|error| panic!("{error}")),
+            url.port_or_known_default().unwrap_or(80),
+        );
+        PinnedClients::fixture(
+            Duration::from_secs(1),
+            BTreeMap::from([(host.to_owned(), vec![address])]),
+        )
+    }
+
+    fn request_bounds(cancellation: &CancellationToken) -> RequestBounds<'_> {
+        RequestBounds {
+            timeout: Duration::from_secs(1),
+            deadline: Instant::now() + Duration::from_secs(2),
+            cancellation,
+        }
     }
 
     #[derive(Clone)]
@@ -2271,6 +2454,7 @@ mod tests {
             confidence: DetectionConfidence::High,
             banner: Some("SSH-2.0-OpenSSH_9.3p1".to_owned()),
             protocol_details: BTreeMap::default(),
+            ssh: None,
         });
         report
     }
@@ -2429,7 +2613,7 @@ mod tests {
         assert_eq!(config.path, "/data/network-info/data.json");
         assert_eq!(
             clients.policy(),
-            crate::passive_http::ClientPolicy::PublicHttpsPinnedDnsNoProxyNoRedirect
+            super::http::ClientPolicy::PublicHttpsPinnedDnsNoProxyNoRedirect
         );
 
         let ipv4 = construct_bgp_url(
@@ -3563,6 +3747,27 @@ mod tests {
         assert_eq!(correlate_cves(&report, &bundle).len(), 1);
     }
 
+    #[test]
+    fn dkim_resolver_error_marks_supplied_evidence_incomplete() {
+        let mut observation = super::IntelligenceObservation {
+            complete: true,
+            ..super::IntelligenceObservation::default()
+        };
+
+        record_dkim_result(
+            &mut observation,
+            "selector",
+            Err("DNS lookup failed".to_owned()),
+        );
+
+        assert!(!observation.complete);
+        assert_eq!(observation.dkim.len(), 1);
+        assert_eq!(
+            observation.errors,
+            ["DKIM selector selector: DNS lookup failed"]
+        );
+    }
+
     #[tokio::test]
     async fn certspotter_request_uses_bearer_and_pagination_cursor() {
         let (endpoint, request) = mock_http_response(
@@ -3571,17 +3776,16 @@ mod tests {
             br#"[{"id":"next","dns_names":["api.example.com"]}]"#.to_vec(),
         )
         .await;
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap_or_else(|error| panic!("{error}"));
+        let mut clients = ct_fixture_clients(&endpoint);
+        let cancellation = CancellationToken::new();
 
         let page = fetch_certspotter_page(
-            &client,
+            &mut clients,
             &endpoint,
             "example.com",
             Some("secret"),
             Some("cursor-1"),
+            request_bounds(&cancellation),
         )
         .await
         .unwrap_or_else(|error| panic!("{error}"));
@@ -3611,11 +3815,16 @@ mod tests {
             Vec::new(),
         )
         .await;
+        let mut clients = ct_fixture_clients(&redirect);
+        let cancellation = CancellationToken::new();
         let error = analyze_certificate_transparency_at(
             &report(),
             Some("secret"),
             std::time::Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(2),
+            &cancellation,
             &redirect,
+            &mut clients,
         )
         .await
         .expect_err("redirect must not be followed");
@@ -3629,32 +3838,153 @@ mod tests {
             vec![b' '; MAX_CT_RESPONSE_BYTES + 1],
         )
         .await;
-        let client = Client::new();
-        let error = fetch_certspotter_page(&client, &oversized, "example.com", None, None)
-            .await
-            .expect_err("oversized response must fail");
+        let mut clients = ct_fixture_clients(&oversized);
+        let error = fetch_certspotter_page(
+            &mut clients,
+            &oversized,
+            "example.com",
+            None,
+            None,
+            request_bounds(&cancellation),
+        )
+        .await
+        .expect_err("oversized response must fail");
         assert!(error.contains("exceeded 1 MiB"));
         let _ = oversized_task.await;
     }
 
     #[tokio::test]
     async fn certspotter_reports_http_and_malformed_response_errors() {
-        let client = Client::new();
+        let cancellation = CancellationToken::new();
         let (rate_limited, rate_task) =
             mock_http_response("429 Too Many Requests", "", Vec::new()).await;
-        let error = fetch_certspotter_page(&client, &rate_limited, "example.com", None, None)
-            .await
-            .expect_err("HTTP error must fail");
+        let mut clients = ct_fixture_clients(&rate_limited);
+        let error = fetch_certspotter_page(
+            &mut clients,
+            &rate_limited,
+            "example.com",
+            None,
+            None,
+            request_bounds(&cancellation),
+        )
+        .await
+        .expect_err("HTTP error must fail");
         assert!(error.contains("HTTP 429"));
         let _ = rate_task.await;
 
         let (malformed, malformed_task) =
             mock_http_response("200 OK", "", b"not-json".to_vec()).await;
-        let error = fetch_certspotter_page(&client, &malformed, "example.com", None, None)
-            .await
-            .expect_err("malformed JSON must fail");
+        let mut clients = ct_fixture_clients(&malformed);
+        let error = fetch_certspotter_page(
+            &mut clients,
+            &malformed,
+            "example.com",
+            None,
+            None,
+            request_bounds(&cancellation),
+        )
+        .await
+        .expect_err("malformed JSON must fail");
         assert!(error.contains("response was invalid"));
         let _ = malformed_task.await;
+    }
+
+    #[tokio::test]
+    async fn certspotter_retains_earlier_pages_when_a_later_page_fails() {
+        let (address, server) = mock_http_routes(2, |_| {
+            BTreeMap::from([
+                (
+                    "/v1/issuances?domain=example.com&include_subdomains=true&match_wildcards=true&expand=dns_names".to_owned(),
+                    MockRoute {
+                        status: "200 OK",
+                        headers: "Content-Type: application/json\r\n".to_owned(),
+                        body: br#"[{"id":"next","dns_names":["api.example.com"]}]"#.to_vec(),
+                        delay: Duration::ZERO,
+                    },
+                ),
+                (
+                    "/v1/issuances?domain=example.com&include_subdomains=true&match_wildcards=true&expand=dns_names&after=next".to_owned(),
+                    MockRoute {
+                        status: "503 Service Unavailable",
+                        headers: String::new(),
+                        body: Vec::new(),
+                        delay: Duration::ZERO,
+                    },
+                ),
+            ])
+        })
+        .await;
+        let endpoint = format!("http://{address}/v1/issuances");
+        let mut clients = ct_fixture_clients(&endpoint);
+        let cancellation = CancellationToken::new();
+
+        let observation = analyze_certificate_transparency_at(
+            &report(),
+            None,
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(2),
+            &cancellation,
+            &endpoint,
+            &mut clients,
+        )
+        .await
+        .expect("earlier CT evidence must survive a later page error");
+        let requests = server.finish().await;
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(observation.candidates[0].name, "api.example.com");
+        assert_eq!(observation.pages_fetched, 1);
+        assert!(!observation.complete);
+        assert!(observation.errors[0].contains("HTTP 503"));
+    }
+
+    #[tokio::test]
+    async fn certspotter_retains_earlier_pages_when_a_later_page_lacks_an_id() {
+        let (address, server) = mock_http_routes(2, |_| {
+            BTreeMap::from([
+                (
+                    "/v1/issuances?domain=example.com&include_subdomains=true&match_wildcards=true&expand=dns_names".to_owned(),
+                    MockRoute {
+                        status: "200 OK",
+                        headers: "Content-Type: application/json\r\n".to_owned(),
+                        body: br#"[{"id":"next","dns_names":["api.example.com"]}]"#.to_vec(),
+                        delay: Duration::ZERO,
+                    },
+                ),
+                (
+                    "/v1/issuances?domain=example.com&include_subdomains=true&match_wildcards=true&expand=dns_names&after=next".to_owned(),
+                    MockRoute {
+                        status: "200 OK",
+                        headers: "Content-Type: application/json\r\n".to_owned(),
+                        body: br#"[{"id":"","dns_names":["www.example.com"]}]"#.to_vec(),
+                        delay: Duration::ZERO,
+                    },
+                ),
+            ])
+        })
+        .await;
+        let endpoint = format!("http://{address}/v1/issuances");
+        let mut clients = ct_fixture_clients(&endpoint);
+        let cancellation = CancellationToken::new();
+
+        let observation = analyze_certificate_transparency_at(
+            &report(),
+            None,
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(2),
+            &cancellation,
+            &endpoint,
+            &mut clients,
+        )
+        .await
+        .expect("earlier CT evidence must survive a malformed later page");
+        let requests = server.finish().await;
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(observation.candidates[0].name, "api.example.com");
+        assert_eq!(observation.pages_fetched, 1);
+        assert!(!observation.complete);
+        assert!(observation.errors[0].contains("pagination ID"));
     }
 
     #[test]
@@ -3717,6 +4047,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supplied_intelligence_returns_partial_evidence_when_cancelled() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let observation = analyze_intelligence(
+            &report(),
+            &["api.example.com".to_owned()],
+            &[],
+            None,
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(2),
+            &cancellation,
+        )
+        .await
+        .expect("cancellation must return retained intelligence evidence");
+
+        assert!(!observation.complete);
+        assert!(observation.subdomains.is_empty());
+        assert_eq!(
+            observation.errors,
+            ["intelligence collection was cancelled"]
+        );
+    }
+
+    #[tokio::test]
     async fn supplied_subdomain_scope_fails_before_dns() {
         let error = analyze_intelligence(
             &report(),
@@ -3724,6 +4079,8 @@ mod tests {
             &[],
             None,
             std::time::Duration::from_millis(10),
+            Instant::now() + Duration::from_secs(1),
+            &CancellationToken::new(),
         )
         .await
         .expect_err("sibling must fail");

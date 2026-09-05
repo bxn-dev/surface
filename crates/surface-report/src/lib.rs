@@ -2,11 +2,12 @@
 
 mod diff;
 mod exports;
+mod projection;
 mod signing;
 
 use std::fmt::Write;
 
-use surface_core::{PortState, ScanReport, ServiceKind, ServiceObservation, Severity};
+use surface_core::{HstsState, ScanReport, Severity};
 
 #[doc(inline)]
 pub use diff::{
@@ -21,15 +22,6 @@ pub use signing::{SignatureEnvelope, VerificationError, decode_key, sign_bytes, 
 
 /// Maximum characters rendered for one externally supplied SSH text value.
 const SSH_DISPLAY_CHARS: usize = 255;
-const SSH_SELECTION_KEYS: [&str; 6] = [
-    "ssh_kex",
-    "ssh_host_key_algorithm",
-    "ssh_cipher_c2s",
-    "ssh_cipher_s2c",
-    "ssh_mac_c2s",
-    "ssh_mac_s2c",
-];
-
 /// Renders a report as human-readable plain text.
 #[must_use]
 #[expect(
@@ -38,6 +30,7 @@ const SSH_SELECTION_KEYS: [&str; 6] = [
 )]
 pub fn render_terminal(report: &ScanReport) -> String {
     let mut output = String::new();
+    let lifecycle = projection::lifecycle(report);
     let _ = writeln!(
         output,
         "Surface {}",
@@ -198,55 +191,34 @@ pub fn render_terminal(report: &ScanReport) -> String {
         let _ = writeln!(output, "Hosts");
         for host in &report.hosts {
             let _ = writeln!(output, "  {}", host.ip);
-            for port in host.ports.iter().filter(|port| {
-                port.state == PortState::Open
-                    || (port.state == PortState::OpenFiltered
-                        && report.services.iter().any(|service| {
-                            service.address == port.address && service.transport == port.transport
-                        }))
-            }) {
-                let service = report
-                    .services
-                    .iter()
-                    .find(|service| {
-                        service.address == port.address && service.transport == port.transport
-                    })
-                    .map_or_else(
-                        || "unknown".to_owned(),
-                        |service| service.service.to_string(),
-                    );
-                let state = if port.state == PortState::Open {
-                    "open"
-                } else {
-                    "open|filtered"
-                };
+            for port in projection::ports(report, host) {
                 let _ = writeln!(
                     output,
-                    "    {}/{}  {state}  {service}",
-                    port.address.port(),
-                    port.transport.as_str()
+                    "    {}/{}  {}  {}",
+                    port.number, port.transport, port.state, port.service
                 );
             }
         }
         output.push('\n');
     }
 
-    if report.services.iter().any(has_ssh_posture) {
+    if report.services.iter().any(|service| service.ssh.is_some()) {
         let _ = writeln!(output, "SSH posture");
         for service in report
             .services
             .iter()
-            .filter(|service| has_ssh_posture(service))
+            .filter(|service| service.ssh.is_some())
         {
-            let detail =
-                |key| bounded_ssh_value(service.protocol_details.get(key).map(String::as_str));
+            let Some(posture) = projection::ssh(service) else {
+                continue;
+            };
             let _ = writeln!(
                 output,
                 "  {}  protocol={}  software={}  status={}",
                 service.address,
-                clean_terminal(&detail("ssh_protocol")),
-                clean_terminal(&detail("ssh_software")),
-                clean_terminal(&detail("ssh_analysis_status"))
+                clean_terminal(&bounded_ssh_value(posture.protocol)),
+                clean_terminal(&bounded_ssh_value(posture.software)),
+                posture.status
             );
             if let Some(banner) = service.banner.as_deref() {
                 let _ = writeln!(
@@ -255,25 +227,26 @@ pub fn render_terminal(report: &ScanReport) -> String {
                     clean_terminal(&bounded_ssh_value(Some(banner)))
                 );
             }
-            if has_complete_ssh_inference(service) {
+            if posture.selections.kex.is_some() {
                 let _ = writeln!(
                     output,
-                    "    KEXINIT-inferred selections (no completed key exchange): KEX={}  host-key={}",
-                    clean_terminal(&detail("ssh_kex")),
-                    clean_terminal(&detail("ssh_host_key_algorithm"))
+                    "    KEXINIT-inferred selections ({}; no completed key exchange): KEX={}  host-key={}",
+                    posture.status,
+                    clean_terminal(&bounded_ssh_value(posture.selections.kex)),
+                    clean_terminal(&bounded_ssh_value(posture.selections.host_key))
                 );
                 let _ = writeln!(
                     output,
                     "      cipher c2s={}  s2c={}  MAC c2s={}  s2c={}",
-                    clean_terminal(&detail("ssh_cipher_c2s")),
-                    clean_terminal(&detail("ssh_cipher_s2c")),
-                    clean_terminal(&detail("ssh_mac_c2s")),
-                    clean_terminal(&detail("ssh_mac_s2c"))
+                    clean_terminal(&bounded_ssh_value(posture.selections.cipher_c2s)),
+                    clean_terminal(&bounded_ssh_value(posture.selections.cipher_s2c)),
+                    clean_terminal(&bounded_ssh_value(posture.selections.mac_c2s)),
+                    clean_terminal(&bounded_ssh_value(posture.selections.mac_s2c))
                 );
             } else {
                 let _ = writeln!(output, "    No inferred selections available.");
             }
-            if let Some(reason) = service.protocol_details.get("ssh_skip_reason") {
+            if let Some(reason) = posture.reason {
                 let _ = writeln!(
                     output,
                     "    Skip reason (bounded): {}",
@@ -287,7 +260,6 @@ pub fn render_terminal(report: &ScanReport) -> String {
     if !report.http.is_empty() {
         let _ = writeln!(output, "HTTP");
         for http in &report.http {
-            let effective_url = http.final_url.as_deref().unwrap_or(&http.url);
             let _ = write!(
                 output,
                 "  {}  status={}",
@@ -295,16 +267,8 @@ pub fn render_terminal(report: &ScanReport) -> String {
                 http.status
                     .map_or_else(|| "error".to_owned(), |status| status.to_string()),
             );
-            if effective_url.starts_with("https://") {
-                let _ = write!(
-                    output,
-                    "  HSTS={}",
-                    if http.headers.contains_key("strict-transport-security") {
-                        "present"
-                    } else {
-                        "missing"
-                    }
-                );
+            if http.hsts_state() != HstsState::NotApplicable {
+                let _ = write!(output, "  HSTS={}", hsts_label(http.hsts_state()));
             }
             let _ = writeln!(output, "  security.txt={}", option_bool(http.security_txt));
             for redirect in &http.redirects {
@@ -517,8 +481,8 @@ pub fn render_terminal(report: &ScanReport) -> String {
             .count();
         let _ = writeln!(output, "  {severity:?}: {count}");
     }
-    if !report.errors.is_empty() {
-        let _ = writeln!(output, "  Partial errors: {}", report.errors.len());
+    if lifecycle.errors > 0 {
+        let _ = writeln!(output, "  {:?} errors: {}", report.status, lifecycle.errors);
     }
     output
 }
@@ -540,6 +504,7 @@ pub fn render_json(report: &ScanReport) -> Result<String, serde_json::Error> {
     reason = "small bounded report fragments favor one auditable escaped template"
 )]
 pub fn render_html(report: &ScanReport) -> String {
+    let lifecycle = projection::lifecycle(report);
     let mut findings = String::new();
     for finding in &report.findings {
         let evidence = finding
@@ -787,27 +752,15 @@ pub fn render_html(report: &ScanReport) -> String {
         .hosts
         .iter()
         .map(|host| {
-            let ports = host
-                .ports
-                .iter()
-                .filter(|port| {
-                    port.state == PortState::Open
-                        || (port.state == PortState::OpenFiltered
-                            && report.services.iter().any(|service| {
-                                service.address == port.address
-                                    && service.transport == port.transport
-                            }))
-                })
+            let ports = projection::ports(report, host)
+                .into_iter()
                 .map(|port| {
-                    let state = if port.state == PortState::Open {
-                        "open"
-                    } else {
-                        "open|filtered"
-                    };
                     format!(
-                        "<li>{}/{} {state}</li>",
-                        port.address.port(),
-                        port.transport.as_str()
+                        "<li>{}/{} {} {}</li>",
+                        port.number,
+                        port.transport,
+                        port.state,
+                        escape_html(&port.service)
                     )
                 })
                 .collect::<String>();
@@ -824,9 +777,6 @@ pub fn render_html(report: &ScanReport) -> String {
             let details = service
                 .protocol_details
                 .iter()
-                .filter(|(key, _)| {
-                    has_complete_ssh_inference(service) || !is_ssh_selection_key(key)
-                })
                 .map(|(key, value)| {
                     format!(
                         "{}={}",
@@ -849,30 +799,24 @@ pub fn render_html(report: &ScanReport) -> String {
     let ssh_entries = report
         .services
         .iter()
-        .filter(|service| has_ssh_posture(service))
-        .map(|service| {
-            let detail = |key| {
-                escape_html(&bounded_ssh_value(
-                    service.protocol_details.get(key).map(String::as_str),
-                ))
-            };
-            let selections = if has_complete_ssh_inference(service) {
+        .filter_map(|service| projection::ssh(service).map(|posture| (service, posture)))
+        .map(|(service, posture)| {
+            let detail = |value| escape_html(&bounded_ssh_value(value));
+            let selections = if posture.selections.kex.is_some() {
                 format!(
-                    "<p><strong>KEXINIT-inferred selections (no completed key exchange):</strong> KEX <code>{}</code> · host key <code>{}</code> · cipher c2s/s2c <code>{}</code>/<code>{}</code> · MAC c2s/s2c <code>{}</code>/<code>{}</code></p>",
-                    detail("ssh_kex"),
-                    detail("ssh_host_key_algorithm"),
-                    detail("ssh_cipher_c2s"),
-                    detail("ssh_cipher_s2c"),
-                    detail("ssh_mac_c2s"),
-                    detail("ssh_mac_s2c")
+                    "<p><strong>KEXINIT-inferred selections ({}; no completed key exchange):</strong> KEX <code>{}</code> · host key <code>{}</code> · cipher c2s/s2c <code>{}</code>/<code>{}</code> · MAC c2s/s2c <code>{}</code>/<code>{}</code></p>",
+                    posture.status,
+                    detail(posture.selections.kex),
+                    detail(posture.selections.host_key),
+                    detail(posture.selections.cipher_c2s),
+                    detail(posture.selections.cipher_s2c),
+                    detail(posture.selections.mac_c2s),
+                    detail(posture.selections.mac_s2c)
                 )
             } else {
                 "<p><strong>No inferred selections available.</strong></p>".to_owned()
             };
-            let skip_reason = service
-                .protocol_details
-                .get("ssh_skip_reason")
-                .map_or_else(String::new, |reason| {
+            let skip_reason = posture.reason.map_or_else(String::new, |reason| {
                     format!(
                         "<p><strong>Skip reason (bounded):</strong> <code>{}</code></p>",
                         escape_html(&bounded_ssh_value(Some(reason)))
@@ -881,9 +825,9 @@ pub fn render_html(report: &ScanReport) -> String {
             format!(
                 "<details class=\"card\"><summary><code>{}</code> · status <code>{}</code></summary><p><strong>Protocol:</strong> <code>{}</code> · <strong>Software:</strong> <code>{}</code> · <strong>Banner:</strong> <code>{}</code></p>{selections}{skip_reason}</details>",
                 escape_html(&service.address.to_string()),
-                detail("ssh_analysis_status"),
-                detail("ssh_protocol"),
-                detail("ssh_software"),
+                posture.status,
+                detail(posture.protocol),
+                detail(posture.software),
                 escape_html(&bounded_ssh_value(service.banner.as_deref())),
             )
         })
@@ -897,16 +841,8 @@ pub fn render_html(report: &ScanReport) -> String {
         .http
         .iter()
         .map(|http| {
-            let effective_url = http.final_url.as_deref().unwrap_or(&http.url);
-            let hsts_state = if effective_url.starts_with("https://") {
-                if http.headers.contains_key("strict-transport-security") {
-                    "present"
-                } else {
-                    "missing"
-                }
-            } else {
-                "not applicable"
-            };
+            let effective_url = http.effective_url();
+            let hsts_state = hsts_label(http.hsts_state());
             let redirects = http
                 .redirects
                 .iter()
@@ -1123,8 +1059,13 @@ pub fn render_html(report: &ScanReport) -> String {
                     )
                 })
                 .collect::<String>();
+            let incomplete = if lifecycle.score_incomplete {
+                "<p><strong>Incomplete scan: score interpretation is limited.</strong></p>"
+            } else {
+                ""
+            };
             format!(
-                "<p><strong>{}/100</strong> ({:?}, model {})</p><ul>{deductions}</ul>",
+                "<p><strong>{}/100</strong> ({:?}, model {})</p>{incomplete}<ul>{deductions}</ul>",
                 score.value,
                 score.classification,
                 escape_html(&score.model_version)
@@ -1190,21 +1131,6 @@ pub fn render_html(report: &ScanReport) -> String {
     )
 }
 
-fn has_ssh_posture(service: &ServiceObservation) -> bool {
-    service.service == ServiceKind::Ssh
-}
-
-fn has_complete_ssh_inference(service: &ServiceObservation) -> bool {
-    service
-        .protocol_details
-        .get("ssh_analysis_status")
-        .is_some_and(|status| status == "complete_inferred")
-}
-
-fn is_ssh_selection_key(key: &str) -> bool {
-    SSH_SELECTION_KEYS.contains(&key)
-}
-
 fn bounded_ssh_value(value: Option<&str>) -> String {
     value
         .unwrap_or("unknown")
@@ -1248,6 +1174,14 @@ fn option_bool(value: Option<bool>) -> &'static str {
     }
 }
 
+const fn hsts_label(state: HstsState) -> &'static str {
+    match state {
+        HstsState::Present => "present",
+        HstsState::Missing => "missing",
+        HstsState::NotApplicable => "not applicable",
+    }
+}
+
 fn option_yes_no(value: Option<bool>) -> &'static str {
     match value {
         Some(true) => "yes",
@@ -1274,11 +1208,14 @@ mod tests {
         AuthoritativeAxfrObservation, AxfrAttempt, AxfrOutcome, CertificateTransparencyCandidate,
         CertificateTransparencyObservation, CnameHop, DanglingCnameObservation,
         DanglingCnameStatus, DetectionConfidence, DnsObservation, DnssecObservation,
-        DnssecRecordType, DnssecRrsetObservation, DnssecStatus, HttpObservation,
-        IntelligenceObservation, MailObservation, RedirectObservation, RelatedDomainCandidate,
-        RelatedDomainsObservation, ScanConfiguration, ScanReport, ServiceKind, ServiceObservation,
-        SkippedCheck, SpfObservation, TlsObservation, TransportProtocol, WildcardDnsObservation,
-        WildcardDnsRecordType, WildcardDnsStatus, calculate_exposure, normalize_target,
+        DnssecRecordType, DnssecRrsetObservation, DnssecStatus, HostObservation, HttpObservation,
+        IntelligenceObservation, MailObservation, PartialSshAlgorithmSelections, PortObservation,
+        PortState, RedirectObservation, RelatedDomainCandidate, RelatedDomainsObservation,
+        ScanConfiguration, ScanError, ScanErrorKind, ScanReport, ScanStage, ScanStatus,
+        ServiceKind, ServiceObservation, SkippedCheck, SpfObservation, SshAlgorithmSelections,
+        SshIdentification, SshPosture, SshPostureOutcome, TlsObservation, TransportProtocol,
+        WildcardDnsObservation, WildcardDnsRecordType, WildcardDnsStatus, calculate_exposure,
+        normalize_target,
     };
 
     use super::{render_html, render_json, render_terminal};
@@ -1300,11 +1237,7 @@ mod tests {
         )
     }
 
-    fn ssh_service(
-        port: u16,
-        banner: Option<&str>,
-        protocol_details: BTreeMap<String, String>,
-    ) -> ServiceObservation {
+    fn ssh_service(port: u16, banner: Option<&str>, ssh: Option<SshPosture>) -> ServiceObservation {
         ServiceObservation {
             transport: TransportProtocol::Tcp,
             address: format!("127.0.0.1:{port}")
@@ -1313,7 +1246,19 @@ mod tests {
             service: ServiceKind::Ssh,
             confidence: DetectionConfidence::High,
             banner: banner.map(str::to_owned),
-            protocol_details,
+            protocol_details: BTreeMap::new(),
+            ssh,
+        }
+    }
+
+    fn ssh_selections() -> SshAlgorithmSelections {
+        SshAlgorithmSelections {
+            kex: "<kex>".to_owned(),
+            host_key: "<host-key>".to_owned(),
+            cipher_c2s: "<cipher-c2s>".to_owned(),
+            cipher_s2c: "<cipher-s2c>".to_owned(),
+            mac_c2s: "<mac-c2s>".to_owned(),
+            mac_s2c: "<mac-s2c>".to_owned(),
         }
     }
 
@@ -1323,9 +1268,77 @@ mod tests {
         assert!(render_terminal(&report).contains("Status: NotStarted"));
         let json = render_json(&report).unwrap_or_default();
         assert!(json.contains("\"status\": \"not_started\""));
-        assert!(json.contains("\"schema_version\": \"0.3.0\""));
+        assert!(json.contains("\"schema_version\": \"0.4.0\""));
         assert!(!render_terminal(&report).contains("\nSSH posture\n"));
         assert!(!render_html(&report).contains("<h2>SSH posture</h2>"));
+    }
+
+    #[test]
+    fn human_renderers_expose_exact_failure_and_incomplete_score() {
+        let mut report = report("example.com");
+        report.status = ScanStatus::Failed;
+        report.errors.push(ScanError::new(
+            ScanStage::Preflight,
+            None,
+            ScanErrorKind::Configuration,
+            "invalid configuration",
+            false,
+        ));
+        let mut score = calculate_exposure(&report);
+        score.incomplete = true;
+        report.exposure_score = Some(score);
+
+        let terminal = render_terminal(&report);
+        let html = render_html(&report);
+
+        assert!(terminal.contains("Failed errors: 1"));
+        assert!(!terminal.contains("Partial errors"));
+        assert!(html.contains("Incomplete scan: score interpretation is limited."));
+    }
+
+    #[test]
+    fn human_renderers_share_visible_port_semantics() {
+        let mut report = report("example.com");
+        let ip = "192.0.2.1"
+            .parse()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let port = |number, transport, state| PortObservation {
+            transport,
+            address: (ip, number).into(),
+            state,
+            latency_ms: None,
+            error: None,
+        };
+        report.hosts.push(HostObservation {
+            ip,
+            ports: vec![
+                port(80, TransportProtocol::Tcp, PortState::Open),
+                port(53, TransportProtocol::Udp, PortState::OpenFiltered),
+                port(54, TransportProtocol::Udp, PortState::OpenFiltered),
+                port(81, TransportProtocol::Tcp, PortState::Closed),
+            ],
+        });
+        report.services.push(ServiceObservation {
+            transport: TransportProtocol::Udp,
+            address: (ip, 53).into(),
+            service: ServiceKind::Dns,
+            confidence: DetectionConfidence::High,
+            banner: None,
+            protocol_details: BTreeMap::new(),
+            ssh: None,
+        });
+
+        let terminal = render_terminal(&report);
+        let html = render_html(&report);
+
+        assert!(terminal.contains("80/tcp  open  unknown"));
+        assert!(terminal.contains("53/udp  open|filtered  DNS"));
+        assert!(!terminal.contains("54/udp"));
+        assert!(!terminal.contains("81/tcp"));
+        assert!(html.contains("<li>80/tcp open unknown</li>"));
+        assert!(html.contains("<li>53/udp open|filtered DNS</li>"));
+        assert!(!html.contains("54/udp"));
+        assert!(!html.contains("81/tcp"));
     }
 
     #[test]
@@ -1387,31 +1400,28 @@ mod tests {
         report.services.push(ssh_service(
             22,
             Some("SSH-2.0-<banner>\u{1b}[31m"),
-            BTreeMap::from([
-                ("ssh_protocol".to_owned(), "2.0".to_owned()),
-                ("ssh_software".to_owned(), "<software>&\u{7}".to_owned()),
-                ("ssh_kex".to_owned(), "<kex>".to_owned()),
-                ("ssh_host_key_algorithm".to_owned(), "<host-key>".to_owned()),
-                ("ssh_cipher_c2s".to_owned(), "<cipher-c2s>".to_owned()),
-                ("ssh_cipher_s2c".to_owned(), "<cipher-s2c>".to_owned()),
-                ("ssh_mac_c2s".to_owned(), "<mac-c2s>".to_owned()),
-                ("ssh_mac_s2c".to_owned(), "<mac-s2c>".to_owned()),
-                (
-                    "ssh_analysis_status".to_owned(),
-                    "complete_inferred".to_owned(),
-                ),
-            ]),
+            Some(SshPosture {
+                identification: Some(SshIdentification {
+                    protocol: "2.0".to_owned(),
+                    software: "<software>&\u{7}".to_owned(),
+                }),
+                outcome: SshPostureOutcome::Complete {
+                    selections: ssh_selections(),
+                },
+            }),
         ));
 
         let terminal = render_terminal(&report);
         assert!(terminal.contains("127.0.0.1:22  protocol=2.0"));
-        assert!(terminal.contains("status=complete_inferred"));
-        assert!(terminal.contains("KEXINIT-inferred selections (no completed key exchange)"));
+        assert!(terminal.contains("status=complete"));
+        assert!(
+            terminal.contains("KEXINIT-inferred selections (complete; no completed key exchange)")
+        );
         assert!(!terminal.contains('\u{1b}'));
         assert!(!terminal.contains('\u{7}'));
 
         let html = render_html(&report);
-        assert!(html.contains("KEXINIT-inferred selections (no completed key exchange)"));
+        assert!(html.contains("KEXINIT-inferred selections (complete; no completed key exchange)"));
         for escaped in [
             "&lt;banner&gt;",
             "&lt;software&gt;&amp;",
@@ -1435,28 +1445,30 @@ mod tests {
         report.services.push(ssh_service(
             2222,
             None,
-            BTreeMap::from([
-                ("ssh_protocol".to_owned(), "2.0".to_owned()),
-                ("ssh_software".to_owned(), "OpenSSH_<9>&".to_owned()),
-                ("ssh_analysis_status".to_owned(), "indeterminate".to_owned()),
-                (
-                    "ssh_skip_reason".to_owned(),
-                    format!("<request timeout>\u{1b}[31m{}END", "x".repeat(300)),
-                ),
-            ]),
+            Some(SshPosture {
+                identification: Some(SshIdentification {
+                    protocol: "2.0".to_owned(),
+                    software: "OpenSSH_<9>&".to_owned(),
+                }),
+                outcome: SshPostureOutcome::Indeterminate {
+                    reason: format!("<request timeout>\u{1b}[31m{}END", "x".repeat(300)),
+                },
+            }),
         ));
         report.services.push(ssh_service(
             2200,
             None,
-            BTreeMap::from([(
-                "ssh_skip_reason".to_owned(),
-                "identification timeout".to_owned(),
-            )]),
+            Some(SshPosture {
+                identification: None,
+                outcome: SshPostureOutcome::Indeterminate {
+                    reason: "identification timeout".to_owned(),
+                },
+            }),
         ));
 
         let terminal = render_terminal(&report);
         assert!(terminal.contains("protocol=2.0  software=OpenSSH_<9>&  status=indeterminate"));
-        assert!(terminal.contains("status=unknown"));
+        assert_eq!(terminal.matches("status=indeterminate").count(), 2);
         assert_eq!(
             terminal
                 .matches("No inferred selections available.")
@@ -1470,7 +1482,7 @@ mod tests {
 
         let html = render_html(&report);
         assert!(html.contains("status <code>indeterminate</code>"));
-        assert!(html.contains("status <code>unknown</code>"));
+        assert_eq!(html.matches("status <code>indeterminate</code>").count(), 2);
         assert_eq!(html.matches("No inferred selections available.").count(), 2);
         assert!(html.contains("OpenSSH_&lt;9&gt;&amp;"));
         assert!(html.contains("&lt;request timeout&gt;"));
@@ -1480,27 +1492,28 @@ mod tests {
     }
 
     #[test]
-    fn stale_ssh_selections_are_suppressed_when_status_is_not_complete() {
+    fn partial_ssh_selections_are_rendered_as_incomplete() {
         let mut report = report("example.com");
         report.services.push(ssh_service(
             22,
             None,
-            BTreeMap::from([
-                ("ssh_analysis_status".to_owned(), "indeterminate".to_owned()),
-                ("ssh_kex".to_owned(), "stale-kex".to_owned()),
-                (
-                    "ssh_host_key_algorithm".to_owned(),
-                    "stale-host-key".to_owned(),
-                ),
-                ("ssh_cipher_c2s".to_owned(), "stale-cipher".to_owned()),
-                ("ssh_mac_c2s".to_owned(), "stale-mac".to_owned()),
-            ]),
+            Some(SshPosture {
+                identification: None,
+                outcome: SshPostureOutcome::Partial {
+                    selections: PartialSshAlgorithmSelections {
+                        kex: Some("partial-kex".to_owned()),
+                        host_key: Some("partial-host-key".to_owned()),
+                        ..PartialSshAlgorithmSelections::default()
+                    },
+                    reason: "no common cipher".to_owned(),
+                },
+            }),
         ));
 
         for rendered in [render_terminal(&report), render_html(&report)] {
-            assert!(rendered.contains("No inferred selections available."));
-            assert!(!rendered.contains("stale-"));
-            assert!(!rendered.contains("KEXINIT"));
+            assert!(rendered.contains("partial-kex"));
+            assert!(rendered.contains("partial-host-key"));
+            assert!(rendered.contains("no common cipher"));
         }
     }
 
@@ -1516,6 +1529,7 @@ mod tests {
             confidence: DetectionConfidence::Medium,
             banner: None,
             protocol_details: BTreeMap::new(),
+            ssh: None,
         });
         let mut value = serde_json::to_value(report).unwrap_or_else(|error| panic!("{error}"));
         value["schema_version"] = serde_json::json!("0.2.0");

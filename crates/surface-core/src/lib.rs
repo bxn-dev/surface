@@ -6,7 +6,7 @@ mod exposure;
 mod findings;
 mod http;
 mod intelligence;
-mod passive_http;
+mod lifecycle;
 mod ports;
 mod scanner;
 mod service;
@@ -28,7 +28,8 @@ pub use dns::{
 };
 #[doc(inline)]
 pub use engine::{
-    run_scan, run_scan_selected_until_with_progress, run_scan_selected_with_progress,
+    finalize_report, run_scan, run_scan_selected_until_with_progress,
+    run_scan_selected_until_with_progress_deferred, run_scan_selected_with_progress,
     run_scan_with_progress,
 };
 #[doc(inline)]
@@ -40,7 +41,7 @@ pub use findings::{
     Evidence, Finding, FindingCategory, FindingConfidence, Severity, generate_findings,
 };
 #[doc(inline)]
-pub use http::{CookieObservation, HttpObservation, RedirectObservation, analyze_http};
+pub use http::{CookieObservation, HstsState, HttpObservation, RedirectObservation, analyze_http};
 #[doc(inline)]
 pub use intelligence::{
     BgpRouteObservation, CertificateTransparencyCandidate, CertificateTransparencyObservation,
@@ -58,7 +59,9 @@ pub use scanner::{
 };
 #[doc(inline)]
 pub use service::{
-    DetectionConfidence, ServiceKind, ServiceObservation, detect_services, sanitize_banner,
+    DetectionConfidence, PartialSshAlgorithmSelections, ServiceKind, ServiceObservation,
+    SshAlgorithmSelections, SshIdentification, SshPosture, SshPostureOutcome, detect_services,
+    sanitize_banner,
 };
 #[doc(inline)]
 pub use target::{NormalizedTarget, TargetError, normalize_target};
@@ -87,6 +90,8 @@ pub enum ScanStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanStage {
+    /// Validation performed before scan work starts.
+    Preflight,
     /// Passive DNS collection.
     Dns,
     /// TCP connect and UDP response scanning.
@@ -119,6 +124,8 @@ pub enum ScanProgress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanErrorKind {
+    /// Invalid or conflicting scan configuration.
+    Configuration,
     /// DNS query failure.
     Dns,
     /// Operation deadline exceeded.
@@ -303,7 +310,7 @@ impl ScanReport {
     #[must_use]
     pub fn not_started(target: NormalizedTarget, configuration: ScanConfiguration) -> Self {
         Self {
-            schema_version: "0.3.0".to_owned(),
+            schema_version: "0.4.0".to_owned(),
             scanner_version: env!("CARGO_PKG_VERSION").to_owned(),
             scan_id: Uuid::new_v4(),
             started_at: OffsetDateTime::now_utc(),

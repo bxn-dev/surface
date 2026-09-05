@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::{
-    DnsObservation, HostObservation, HttpObservation, PortState, ServiceKind, ServiceObservation,
-    TlsObservation,
+    DnsObservation, HostObservation, HstsState, HttpObservation, PortState, ServiceKind,
+    ServiceObservation, TlsObservation,
 };
 
 // Rust guideline compliant 2026-02-21
@@ -398,41 +398,68 @@ fn exposure_findings(
 }
 
 fn ssh_legacy_finding(service: &ServiceObservation) -> Option<Finding> {
-    if service
-        .protocol_details
-        .get("ssh_analysis_status")
-        .is_none_or(|status| status != "complete_inferred")
-    {
+    let Some(crate::SshPosture {
+        outcome: crate::SshPostureOutcome::Complete { selections },
+        ..
+    }) = service.ssh.as_ref()
+    else {
         return None;
-    }
+    };
     let legacy = [
-        ("ssh_kex", "diffie-hellman-group14-sha1"),
-        ("ssh_kex", "diffie-hellman-group1-sha1"),
-        ("ssh_host_key_algorithm", "ssh-rsa"),
-        ("ssh_host_key_algorithm", "ssh-dss"),
-        ("ssh_cipher_c2s", "3des-cbc"),
-        ("ssh_cipher_c2s", "arcfour"),
-        ("ssh_cipher_c2s", "arcfour128"),
-        ("ssh_cipher_c2s", "arcfour256"),
-        ("ssh_cipher_s2c", "3des-cbc"),
-        ("ssh_cipher_s2c", "arcfour"),
-        ("ssh_cipher_s2c", "arcfour128"),
-        ("ssh_cipher_s2c", "arcfour256"),
-        ("ssh_mac_c2s", "hmac-sha1"),
-        ("ssh_mac_c2s", "hmac-md5"),
-        ("ssh_mac_c2s", "hmac-md5-96"),
-        ("ssh_mac_s2c", "hmac-sha1"),
-        ("ssh_mac_s2c", "hmac-md5"),
-        ("ssh_mac_s2c", "hmac-md5-96"),
+        (
+            "ssh_kex",
+            selections.kex.as_str(),
+            "diffie-hellman-group14-sha1",
+        ),
+        (
+            "ssh_kex",
+            selections.kex.as_str(),
+            "diffie-hellman-group1-sha1",
+        ),
+        (
+            "ssh_host_key_algorithm",
+            selections.host_key.as_str(),
+            "ssh-rsa",
+        ),
+        (
+            "ssh_host_key_algorithm",
+            selections.host_key.as_str(),
+            "ssh-dss",
+        ),
+        ("ssh_cipher_c2s", selections.cipher_c2s.as_str(), "3des-cbc"),
+        ("ssh_cipher_c2s", selections.cipher_c2s.as_str(), "arcfour"),
+        (
+            "ssh_cipher_c2s",
+            selections.cipher_c2s.as_str(),
+            "arcfour128",
+        ),
+        (
+            "ssh_cipher_c2s",
+            selections.cipher_c2s.as_str(),
+            "arcfour256",
+        ),
+        ("ssh_cipher_s2c", selections.cipher_s2c.as_str(), "3des-cbc"),
+        ("ssh_cipher_s2c", selections.cipher_s2c.as_str(), "arcfour"),
+        (
+            "ssh_cipher_s2c",
+            selections.cipher_s2c.as_str(),
+            "arcfour128",
+        ),
+        (
+            "ssh_cipher_s2c",
+            selections.cipher_s2c.as_str(),
+            "arcfour256",
+        ),
+        ("ssh_mac_c2s", selections.mac_c2s.as_str(), "hmac-sha1"),
+        ("ssh_mac_c2s", selections.mac_c2s.as_str(), "hmac-md5"),
+        ("ssh_mac_c2s", selections.mac_c2s.as_str(), "hmac-md5-96"),
+        ("ssh_mac_s2c", selections.mac_s2c.as_str(), "hmac-sha1"),
+        ("ssh_mac_s2c", selections.mac_s2c.as_str(), "hmac-md5"),
+        ("ssh_mac_s2c", selections.mac_s2c.as_str(), "hmac-md5-96"),
     ]
     .into_iter()
-    .filter(|(key, algorithm)| {
-        service
-            .protocol_details
-            .get(*key)
-            .is_some_and(|selected| selected == algorithm)
-    })
-    .map(|(key, algorithm)| format!("{key}={algorithm}"))
+    .filter(|(_, selected, legacy)| selected == legacy)
+    .map(|(key, _, algorithm)| format!("{key}={algorithm}"))
     .collect::<Vec<_>>();
     (!legacy.is_empty()).then(|| {
         with_references(
@@ -465,7 +492,7 @@ fn http_findings(target: &str, observations: &[HttpObservation], findings: &mut 
         .filter(|observation| observation.status.is_some())
     {
         let https = observation.url.starts_with("https://");
-        let location = observation.final_url.as_deref().unwrap_or(&observation.url);
+        let location = observation.effective_url();
         let redirects_to_https = observation
             .redirects
             .iter()
@@ -484,11 +511,7 @@ fn http_findings(target: &str, observations: &[HttpObservation], findings: &mut 
                 FindingConfidence::High,
             ));
         }
-        if https
-            && !observation
-                .headers
-                .contains_key("strict-transport-security")
-        {
+        if observation.hsts_state() == HstsState::Missing {
             findings.push(finding(
                 "HTTP-HSTS-MISSING",
                 "HSTS header missing",
@@ -735,14 +758,13 @@ fn finding(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::{FindingConfidence, Severity, generate_findings};
     use crate::{
         AddressSource, AuthoritativeAxfrObservation, AxfrAttempt, AxfrOutcome, CnameHop,
         DanglingCnameObservation, DanglingCnameStatus, DetectionConfidence, DnsObservation,
         DnsRecord, DnssecObservation, DnssecRecordType, DnssecRrsetObservation, DnssecStatus,
-        MailObservation, ResolvedHost, ServiceKind, ServiceObservation, SpfObservation,
+        HttpObservation, MailObservation, PartialSshAlgorithmSelections, ResolvedHost, ServiceKind,
+        ServiceObservation, SpfObservation, SshAlgorithmSelections, SshPosture, SshPostureOutcome,
         TlsObservation, TransportProtocol, WildcardDnsObservation, WildcardDnsRecordType,
         WildcardDnsStatus,
     };
@@ -775,7 +797,7 @@ mod tests {
         }
     }
 
-    fn ssh_service(protocol_details: BTreeMap<String, String>) -> ServiceObservation {
+    fn ssh_service(ssh: Option<SshPosture>) -> ServiceObservation {
         ServiceObservation {
             transport: TransportProtocol::Tcp,
             address: "127.0.0.1:22"
@@ -784,7 +806,38 @@ mod tests {
             service: ServiceKind::Ssh,
             confidence: DetectionConfidence::High,
             banner: Some("SSH-2.0-OpenSSH_7.2 CVE-2099-0001".to_owned()),
-            protocol_details,
+            protocol_details: std::collections::BTreeMap::new(),
+            ssh,
+        }
+    }
+
+    fn ssh_selections(field: &str, algorithm: &str) -> SshAlgorithmSelections {
+        let mut selections = SshAlgorithmSelections {
+            kex: "curve25519-sha256".to_owned(),
+            host_key: "ssh-ed25519".to_owned(),
+            cipher_c2s: "aes256-ctr".to_owned(),
+            cipher_s2c: "aes256-ctr".to_owned(),
+            mac_c2s: "hmac-sha2-512".to_owned(),
+            mac_s2c: "hmac-sha2-512".to_owned(),
+        };
+        match field {
+            "ssh_kex" => selections.kex = algorithm.to_owned(),
+            "ssh_host_key_algorithm" => selections.host_key = algorithm.to_owned(),
+            "ssh_cipher_c2s" => selections.cipher_c2s = algorithm.to_owned(),
+            "ssh_cipher_s2c" => selections.cipher_s2c = algorithm.to_owned(),
+            "ssh_mac_c2s" => selections.mac_c2s = algorithm.to_owned(),
+            "ssh_mac_s2c" => selections.mac_s2c = algorithm.to_owned(),
+            _ => panic!("unknown SSH selection field"),
+        }
+        selections
+    }
+
+    fn complete_ssh(field: &str, algorithm: &str) -> SshPosture {
+        SshPosture {
+            identification: None,
+            outcome: SshPostureOutcome::Complete {
+                selections: ssh_selections(field, algorithm),
+            },
         }
     }
 
@@ -829,6 +882,46 @@ mod tests {
         );
         assert_eq!(findings[0].severity, Severity::Medium);
         assert!(!findings[0].evidence.is_empty());
+    }
+
+    #[test]
+    fn final_https_response_without_hsts_generates_finding() {
+        let observation = HttpObservation {
+            address: "127.0.0.1:80"
+                .parse()
+                .unwrap_or_else(|error| panic!("{error}")),
+            url: "http://example.com/".to_owned(),
+            final_url: Some("https://example.com/".to_owned()),
+            status: Some(200),
+            version: Some("HTTP/1.1".to_owned()),
+            latency_ms: Some(1),
+            redirects: Vec::new(),
+            headers: std::collections::BTreeMap::new(),
+            cookies: Vec::new(),
+            title: None,
+            body_bytes: 0,
+            body_truncated: false,
+            robots_txt: None,
+            security_txt: None,
+            sitemap_xml: None,
+            error: None,
+        };
+
+        let findings = generate_findings(
+            "example.com",
+            None,
+            &[],
+            &[],
+            &[observation],
+            &[],
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.id == "HTTP-HSTS-MISSING")
+        );
     }
 
     #[test]
@@ -1110,13 +1203,7 @@ mod tests {
             ("ssh_mac_s2c", "hmac-md5-96"),
         ];
         for (field, algorithm) in legacy_cases {
-            let service = ssh_service(BTreeMap::from([
-                (
-                    "ssh_analysis_status".to_owned(),
-                    "complete_inferred".to_owned(),
-                ),
-                (field.to_owned(), algorithm.to_owned()),
-            ]));
+            let service = ssh_service(Some(complete_ssh(field, algorithm)));
             let findings = generate_findings(
                 "localhost",
                 None,
@@ -1162,13 +1249,7 @@ mod tests {
             ("ssh_mac_s2c", "hmac-md5-etm@openssh.com"),
         ];
         for (field, algorithm) in near_matches {
-            let service = ssh_service(BTreeMap::from([
-                (
-                    "ssh_analysis_status".to_owned(),
-                    "complete_inferred".to_owned(),
-                ),
-                (field.to_owned(), algorithm.to_owned()),
-            ]));
+            let service = ssh_service(Some(complete_ssh(field, algorithm)));
             let findings = generate_findings(
                 "localhost",
                 None,
@@ -1186,32 +1267,21 @@ mod tests {
         }
 
         let negatives = [
-            BTreeMap::from([
-                (
-                    "ssh_analysis_status".to_owned(),
-                    "complete_inferred".to_owned(),
-                ),
-                ("ssh_kex".to_owned(), "curve25519-sha256".to_owned()),
-                (
-                    "ssh_server_kex_algorithms".to_owned(),
-                    "diffie-hellman-group1-sha1".to_owned(),
-                ),
-            ]),
-            BTreeMap::from([
-                ("ssh_analysis_status".to_owned(), "indeterminate".to_owned()),
-                (
-                    "ssh_skip_reason".to_owned(),
-                    "no common required algorithm: ssh_kex".to_owned(),
-                ),
-                (
-                    "ssh_kex".to_owned(),
-                    "diffie-hellman-group1-sha1".to_owned(),
-                ),
-            ]),
-            BTreeMap::from([("ssh_host_key_algorithm".to_owned(), "ssh-dss".to_owned())]),
+            Some(complete_ssh("ssh_kex", "curve25519-sha256")),
+            Some(SshPosture {
+                identification: None,
+                outcome: SshPostureOutcome::Partial {
+                    selections: PartialSshAlgorithmSelections {
+                        kex: Some("diffie-hellman-group1-sha1".to_owned()),
+                        ..PartialSshAlgorithmSelections::default()
+                    },
+                    reason: "no common required algorithm: host_key".to_owned(),
+                },
+            }),
+            None,
         ];
-        for details in negatives {
-            let service = ssh_service(details);
+        for posture in negatives {
+            let service = ssh_service(posture);
             let findings = generate_findings(
                 "localhost",
                 None,
@@ -1373,6 +1443,7 @@ mod tests {
             confidence: DetectionConfidence::High,
             banner: None,
             protocol_details: std::collections::BTreeMap::new(),
+            ssh: None,
         };
         let generic = TlsObservation {
             address,
