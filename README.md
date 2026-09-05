@@ -97,7 +97,7 @@ A scan runs every applicable built-in check by default. `--only dns,http,tls` re
 ## Reports
 
 - **terminal** — concise observations, open ports, findings, and counts
-- **json** — schema `0.3.0`, complete transport-aware observations/findings/errors/score
+- **json** — schema `0.4.0`, complete transport-aware observations/findings/errors/score
 - **html** — responsive, print-friendly, self-contained, no remote assets or scripts
 - **sarif** — SARIF 2.1.0 findings for code-scanning integrations
 - **cyclonedx-json** — CycloneDX 1.6 observed-service inventory and vulnerabilities

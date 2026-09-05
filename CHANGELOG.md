@@ -6,6 +6,8 @@ All notable changes are documented here.
 
 ### Changed
 
+- Changed report schema to `0.4.0` with typed complete, partial, and indeterminate SSH posture; legacy SSH maps remain readable but are not interpreted or diffed against typed reports.
+- Unified scan finalization, preserved partial stage and passive-intelligence evidence, and made terminal, HTML, SARIF, CycloneDX, and semantic-diff lifecycle semantics consistent.
 - Removed the hosted server/control plane in favor of direct CLI scans and complete self-contained HTML reports.
 - Removed the `--acknowledge-authorization` gate; operators remain responsible for scanning only authorized targets.
 - Added `indicatif` stage progress, resolver-returned CNAME-chain evidence, default bounded CertSpotter Certificate Transparency discovery, optional passive exact-pair reverse-NS correlation, and truthful HTTP-to-HTTPS redirect rendering.

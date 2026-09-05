@@ -115,8 +115,14 @@ pub fn diff_reports(old: &ScanReport, new: &ScanReport) -> Result<ScanDiff, Diff
             "cannot compare different targets '{old_target}' and '{new_target}'"
         )));
     }
-    ensure_schema_supported(&old.schema_version)?;
-    ensure_schema_supported(&new.schema_version)?;
+    let old_schema_family = schema_family(&old.schema_version)?;
+    let new_schema_family = schema_family(&new.schema_version)?;
+    if old_schema_family != new_schema_family {
+        return Err(DiffError(format!(
+            "cannot compare report schema families '{}' and '{}'",
+            old.schema_version, new.schema_version
+        )));
+    }
 
     let network_changes = network_changes(old, new, &old_target);
     let service_changes = service_changes(old, new, &old_target);
@@ -282,13 +288,13 @@ pub fn render_diff_html(diff: &ScanDiff) -> String {
     )
 }
 
-fn ensure_schema_supported(version: &str) -> Result<(), DiffError> {
-    if matches!(version, "0.1.0" | "0.1.1" | "0.1.2" | "0.2.0" | "0.3.0") {
-        Ok(())
-    } else {
-        Err(DiffError(format!(
+fn schema_family(version: &str) -> Result<&'static str, DiffError> {
+    match version {
+        "0.1.0" | "0.1.1" | "0.1.2" | "0.2.0" | "0.3.0" => Ok("legacy-ssh-map"),
+        "0.4.0" => Ok("typed-ssh"),
+        _ => Err(DiffError(format!(
             "unsupported report schema version '{version}'"
-        )))
+        ))),
     }
 }
 
@@ -328,6 +334,7 @@ fn service_changes(old: &ScanReport, new: &ScanReport, target: &str) -> Vec<Chan
                     "confidence": service.confidence,
                     "banner": service.banner,
                     "protocol_details": service.protocol_details,
+                    "ssh": service.ssh,
                 });
                 (
                     format!("{:?}:{}", service.transport, service.address).to_ascii_lowercase(),
@@ -384,14 +391,8 @@ fn dns_changes(old: &ScanReport, new: &ScanReport, target: &str) -> Vec<Change> 
             "high",
         ));
     }
-    let old_intelligence = old
-        .intelligence
-        .as_ref()
-        .and_then(|value| serde_json::to_value(value).ok());
-    let new_intelligence = new
-        .intelligence
-        .as_ref()
-        .and_then(|value| serde_json::to_value(value).ok());
+    let old_intelligence = old.intelligence.as_ref().and_then(intelligence_value);
+    let new_intelligence = new.intelligence.as_ref().and_then(intelligence_value);
     if old_intelligence != new_intelligence {
         changes.push(change(
             "passive_intelligence",
@@ -408,6 +409,25 @@ fn dns_changes(old: &ScanReport, new: &ScanReport, target: &str) -> Vec<Change> 
 
 fn sort_changes(changes: &mut [Change]) {
     changes.sort_by(|left, right| (&left.category, &left.key).cmp(&(&right.category, &right.key)));
+}
+
+fn intelligence_value(observation: &surface_core::IntelligenceObservation) -> Option<Value> {
+    let mut value = serde_json::to_value(observation).ok()?;
+    let object = value.as_object_mut()?;
+    object.remove("errors");
+    if let Some(subdomains) = object.get_mut("subdomains").and_then(Value::as_array_mut) {
+        for subdomain in subdomains {
+            if let Some(subdomain) = subdomain.as_object_mut() {
+                subdomain.remove("error");
+            }
+        }
+    }
+    for source in ["related_domains", "certificate_transparency"] {
+        if let Some(source) = object.get_mut(source).and_then(Value::as_object_mut) {
+            source.remove("errors");
+        }
+    }
+    Some(value)
 }
 
 fn completeness_changes(old: &ScanReport, new: &ScanReport, target: &str) -> Vec<Change> {
@@ -517,7 +537,6 @@ fn http_map(report: &ScanReport) -> BTreeMap<String, Value> {
                 "robots_txt": http.robots_txt,
                 "security_txt": http.security_txt,
                 "sitemap_xml": http.sitemap_xml,
-                "error": http.error,
             });
             (http.url.clone(), value)
         })
@@ -672,14 +691,17 @@ fn json_key(value: &impl Serialize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::{
+        collections::BTreeMap,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+    };
 
     use surface_core::{
         DetectionConfidence, Evidence, Finding, FindingCategory, FindingConfidence,
-        HostObservation, PortObservation, PortState, ScanConfiguration, ScanError, ScanErrorKind,
-        ScanReport, ScanStage, ScanStatus, ServiceKind, ServiceObservation, Severity,
-        TlsObservation, TransportProtocol, normalize_target,
+        HostObservation, HttpObservation, IntelligenceObservation, PortObservation, PortState,
+        ScanConfiguration, ScanError, ScanErrorKind, ScanReport, ScanStage, ScanStatus,
+        ServiceKind, ServiceObservation, Severity, SshAlgorithmSelections, SshPosture,
+        SshPostureOutcome, TlsObservation, TransportProtocol, normalize_target,
     };
 
     use super::{Change, diff_reports, render_diff_json, render_diff_terminal};
@@ -703,7 +725,7 @@ mod tests {
         report
     }
 
-    fn ssh_service(protocol_details: BTreeMap<String, String>) -> ServiceObservation {
+    fn ssh_service(outcome: SshPostureOutcome) -> ServiceObservation {
         ServiceObservation {
             transport: TransportProtocol::Tcp,
             address: "192.0.2.1:22"
@@ -712,7 +734,45 @@ mod tests {
             service: ServiceKind::Ssh,
             confidence: DetectionConfidence::High,
             banner: Some("SSH-2.0-OpenSSH_9.9".to_owned()),
-            protocol_details,
+            protocol_details: BTreeMap::default(),
+            ssh: Some(SshPosture {
+                identification: None,
+                outcome,
+            }),
+        }
+    }
+
+    fn ssh_selections(kex: &str) -> SshAlgorithmSelections {
+        SshAlgorithmSelections {
+            kex: kex.to_owned(),
+            host_key: "ssh-ed25519".to_owned(),
+            cipher_c2s: "aes256-ctr".to_owned(),
+            cipher_s2c: "aes256-ctr".to_owned(),
+            mac_c2s: "hmac-sha2-512".to_owned(),
+            mac_s2c: "hmac-sha2-512".to_owned(),
+        }
+    }
+
+    fn http_observation(error: &str) -> HttpObservation {
+        HttpObservation {
+            address: "192.0.2.1:80"
+                .parse()
+                .unwrap_or_else(|parse_error| panic!("{parse_error}")),
+            url: "http://example.com/".to_owned(),
+            final_url: Some("http://example.com/".to_owned()),
+            status: None,
+            version: None,
+            latency_ms: None,
+            redirects: Vec::new(),
+            headers: BTreeMap::default(),
+            cookies: Vec::new(),
+            title: None,
+            body_bytes: 0,
+            body_truncated: false,
+            robots_txt: None,
+            security_txt: None,
+            sitemap_xml: None,
+            error: Some(error.to_owned()),
         }
     }
 
@@ -769,6 +829,40 @@ mod tests {
         assert!(rendered.contains("sec [2J tion entity property 雪"));
         assert!(rendered.contains("reason  [31m雪"));
         assert!(rendered.contains("warning     31m雪"));
+    }
+
+    #[test]
+    fn diff_rejects_reports_across_the_typed_ssh_schema_change() {
+        let mut old = report();
+        let new = report();
+        old.schema_version = "0.3.0".to_owned();
+
+        let error = diff_reports(&old, &new).expect_err("schema families must not be mixed");
+
+        assert!(error.to_string().contains("schema families"));
+    }
+
+    #[test]
+    fn semantic_diff_ignores_transient_http_and_intelligence_error_text() {
+        let mut old = report();
+        let mut new = report();
+        old.http.push(http_observation("connection reset"));
+        new.http.push(http_observation("request timeout"));
+        old.intelligence = Some(IntelligenceObservation {
+            complete: false,
+            errors: vec!["first provider message".to_owned()],
+            ..IntelligenceObservation::default()
+        });
+        new.intelligence = Some(IntelligenceObservation {
+            complete: false,
+            errors: vec!["second provider message".to_owned()],
+            ..IntelligenceObservation::default()
+        });
+
+        let diff = diff_reports(&old, &new).unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(diff.service_changes.is_empty());
+        assert!(diff.dns_changes.is_empty());
     }
 
     #[test]
@@ -850,48 +944,37 @@ mod tests {
     fn ssh_completion_and_status_changes_are_visible() {
         let mut old = report();
         let mut new = report();
-        old.services.push(ssh_service(BTreeMap::from([
-            ("ssh_analysis_status".to_owned(), "indeterminate".to_owned()),
-            ("ssh_skip_reason".to_owned(), "request timeout".to_owned()),
-        ])));
-        new.services.push(ssh_service(BTreeMap::from([
-            ("ssh_protocol".to_owned(), "2.0".to_owned()),
-            (
-                "ssh_analysis_status".to_owned(),
-                "complete_inferred".to_owned(),
-            ),
-            ("ssh_kex".to_owned(), "curve25519-sha256".to_owned()),
-        ])));
+        old.services
+            .push(ssh_service(SshPostureOutcome::Indeterminate {
+                reason: "request timeout".to_owned(),
+            }));
+        new.services.push(ssh_service(SshPostureOutcome::Complete {
+            selections: ssh_selections("curve25519-sha256"),
+        }));
 
         let diff = diff_reports(&old, &new).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(diff.service_changes.len(), 1);
         let new_details = &diff.service_changes[0]
             .new_value
             .as_ref()
-            .unwrap_or_else(|| panic!("new SSH service evidence missing"))["protocol_details"];
-        assert_eq!(new_details["ssh_analysis_status"], "complete_inferred");
-        assert_eq!(new_details["ssh_kex"], "curve25519-sha256");
-        assert!(new_details.get("ssh_skip_reason").is_none());
+            .unwrap_or_else(|| panic!("new SSH service evidence missing"))["ssh"];
+        assert_eq!(new_details["outcome"]["status"], "complete");
+        assert_eq!(
+            new_details["outcome"]["selections"]["kex"],
+            "curve25519-sha256"
+        );
     }
 
     #[test]
     fn ssh_algorithm_changes_are_visible() {
         let mut old = report();
         let mut new = report();
-        let details = BTreeMap::from([
-            (
-                "ssh_analysis_status".to_owned(),
-                "complete_inferred".to_owned(),
-            ),
-            ("ssh_kex".to_owned(), "curve25519-sha256".to_owned()),
-        ]);
-        old.services.push(ssh_service(details.clone()));
-        let mut changed = details;
-        changed.insert(
-            "ssh_kex".to_owned(),
-            "diffie-hellman-group14-sha256".to_owned(),
-        );
-        new.services.push(ssh_service(changed));
+        old.services.push(ssh_service(SshPostureOutcome::Complete {
+            selections: ssh_selections("curve25519-sha256"),
+        }));
+        new.services.push(ssh_service(SshPostureOutcome::Complete {
+            selections: ssh_selections("diffie-hellman-group14-sha256"),
+        }));
 
         let diff = diff_reports(&old, &new).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(diff.service_changes.len(), 1);
@@ -899,8 +982,8 @@ mod tests {
             diff.service_changes[0]
                 .new_value
                 .as_ref()
-                .unwrap_or_else(|| panic!("new SSH algorithm evidence missing"))["protocol_details"]
-                ["ssh_kex"],
+                .unwrap_or_else(|| panic!("new SSH algorithm evidence missing"))["ssh"]["outcome"]
+                ["selections"]["kex"],
             "diffie-hellman-group14-sha256"
         );
     }

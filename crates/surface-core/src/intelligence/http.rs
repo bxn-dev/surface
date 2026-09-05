@@ -1,4 +1,4 @@
-//! Bounded, destination-pinned HTTP reads for passive intelligence.
+//! Bounded, destination-pinned HTTP reads for intelligence sources.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -288,8 +288,33 @@ pub(crate) async fn get_bounded(
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<Vec<u8>, FetchError> {
+    get_bounded_with_bearer(
+        client,
+        url,
+        maximum_bytes,
+        request_timeout,
+        deadline,
+        cancellation,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn get_bounded_with_bearer(
+    client: &Client,
+    url: Url,
+    maximum_bytes: usize,
+    request_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    bearer: Option<&str>,
+) -> Result<Vec<u8>, FetchError> {
     let fetch = async {
-        let response = client.get(url).send().await.map_err(|error| {
+        let mut request = client.get(url);
+        if let Some(bearer) = bearer.filter(|value| !value.trim().is_empty()) {
+            request = request.bearer_auth(bearer);
+        }
+        let response = request.send().await.map_err(|error| {
             if error.is_timeout() {
                 FetchError::Timeout
             } else {

@@ -4,16 +4,17 @@ use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
+use crate::lifecycle;
+use crate::lifecycle::add_skipped_check;
 use crate::ssh::{SshAnalysisState, analyze_ssh};
 use crate::{
-    AxfrOutcome, DanglingCnameStatus, DnssecObservation, DnssecStatus, HostObservation,
-    NormalizedTarget, ScanConfiguration, ScanError, ScanErrorKind, ScanProgress, ScanReport,
-    ScanSelection, ScanStage, ScanStatus, SkippedCheck, WildcardDnsStatus, analyze_http,
-    analyze_tls, calculate_exposure, detect_services, generate_findings, scan_ports,
-    scan_udp_ports,
+    AxfrOutcome, DanglingCnameStatus, DnssecStatus, HostObservation, NormalizedTarget,
+    ScanConfiguration, ScanError, ScanErrorKind, ScanProgress, ScanReport, ScanSelection,
+    ScanStage, ScanStatus, WildcardDnsStatus, analyze_http, analyze_tls, detect_services,
+    scan_ports, scan_udp_ports,
 };
 
 // Rust guideline compliant 2026-02-21
@@ -41,7 +42,7 @@ pub async fn run_scan_with_progress(
     run_scan_selected_with_progress(
         target,
         configuration,
-        cancellation,
+        cancellation.clone(),
         ScanSelection::all(),
         progress,
     )
@@ -61,7 +62,7 @@ pub async fn run_scan_selected_with_progress(
     run_scan_selected_until_with_progress(
         target,
         configuration,
-        cancellation,
+        cancellation.clone(),
         selection,
         deadline,
         progress,
@@ -72,6 +73,29 @@ pub async fn run_scan_selected_with_progress(
 /// Runs selected stages against a caller-owned whole-scan deadline.
 #[must_use]
 pub async fn run_scan_selected_until_with_progress(
+    target: NormalizedTarget,
+    configuration: ScanConfiguration,
+    cancellation: CancellationToken,
+    selection: ScanSelection,
+    deadline: Instant,
+    progress: impl Fn(ScanProgress),
+) -> ScanReport {
+    let mut report = run_scan_inner(
+        target,
+        configuration,
+        cancellation.clone(),
+        selection,
+        deadline,
+        &progress,
+    )
+    .await;
+    finalize_report(&mut report, &cancellation, deadline, progress);
+    report
+}
+
+/// Runs selected core stages while deferring report finalization to the caller.
+#[must_use]
+pub async fn run_scan_selected_until_with_progress_deferred(
     target: NormalizedTarget,
     configuration: ScanConfiguration,
     cancellation: CancellationToken,
@@ -90,6 +114,16 @@ pub async fn run_scan_selected_until_with_progress(
     .await
 }
 
+/// Commits findings, exposure, and the final completion timestamp.
+pub fn finalize_report(
+    report: &mut ScanReport,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    progress: impl Fn(ScanProgress),
+) {
+    lifecycle::finalize(report, cancellation, deadline, &progress);
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "linear stages preserve partial observations and deadlines"
@@ -105,11 +139,13 @@ async fn run_scan_inner(
     let mut configuration = configuration;
     configuration.authorization_acknowledged = true;
     let mut report = ScanReport::not_started(target, configuration);
-    record_selection_skips(&mut report, selection);
+    lifecycle::record_selection_skips(&mut report, selection);
     if incompatible_address_family(&report) {
-        reject_before_scan(
+        lifecycle::terminate(
             &mut report,
-            ScanErrorKind::Other,
+            ScanStage::Preflight,
+            selection,
+            ScanErrorKind::Configuration,
             "explicit IP conflicts with the selected address family",
         );
         return report;
@@ -117,10 +153,11 @@ async fn run_scan_inner(
     "Scan started.".clone_into(&mut report.message);
 
     if Instant::now() >= deadline {
-        fail_timeout(
+        lifecycle::terminate(
             &mut report,
             ScanStage::Dns,
             selection,
+            ScanErrorKind::Timeout,
             "global timeout expired before DNS analysis",
         );
         return report;
@@ -137,7 +174,7 @@ async fn run_scan_inner(
     let dns = tokio::select! {
         biased;
         () = cancellation.cancelled() => {
-            interrupt(&mut report, ScanStage::Dns, selection, "scan interrupted during DNS analysis");
+            lifecycle::terminate(&mut report, ScanStage::Dns, selection, ScanErrorKind::Cancelled, "scan interrupted during DNS analysis");
             return report;
         }
         result = timeout_at(deadline, dns_future) => result,
@@ -159,10 +196,11 @@ async fn run_scan_inner(
             None
         }
         Err(_) => {
-            fail_timeout(
+            lifecycle::terminate(
                 &mut report,
                 ScanStage::Dns,
                 selection,
+                ScanErrorKind::Timeout,
                 "global timeout expired during DNS analysis",
             );
             return report;
@@ -185,23 +223,27 @@ async fn run_scan_inner(
         let dnssec = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                stop_after_dnssec(
-                    &mut report,
-                    selection,
-                    ScanErrorKind::Cancelled,
-                    ScanStatus::Interrupted,
-                    "scan interrupted during DNSSEC validation",
-                );
+                if let Some(dns) = report.dns.as_mut() {
+                    dns.dnssec = Some(crate::DnssecObservation { status: DnssecStatus::Indeterminate, limitations: vec!["scan interrupted during DNSSEC validation".to_owned()], ..crate::DnssecObservation::default() });
+                }
+                lifecycle::terminate(&mut report, ScanStage::Dns, selection, ScanErrorKind::Cancelled, "scan interrupted during DNSSEC validation");
                 return report;
             }
             result = timeout_at(deadline, dnssec_future) => result,
         };
         let Ok(observation) = dnssec else {
-            stop_after_dnssec(
+            if let Some(dns) = report.dns.as_mut() {
+                dns.dnssec = Some(crate::DnssecObservation {
+                    status: DnssecStatus::Indeterminate,
+                    limitations: vec!["global timeout expired during DNSSEC validation".to_owned()],
+                    ..crate::DnssecObservation::default()
+                });
+            }
+            lifecycle::terminate(
                 &mut report,
+                ScanStage::Dns,
                 selection,
                 ScanErrorKind::Timeout,
-                ScanStatus::Partial,
                 "global timeout expired during DNSSEC validation",
             );
             return report;
@@ -273,21 +315,21 @@ async fn run_scan_inner(
                 add_skipped_check(&mut report, "authoritative_axfr", reason);
             }
             crate::dns::AxfrCheckState::TimedOut => {
-                stop_after_axfr(
+                lifecycle::terminate(
                     &mut report,
+                    ScanStage::Dns,
                     selection,
                     ScanErrorKind::Timeout,
-                    ScanStatus::Partial,
                     "global timeout expired during authoritative AXFR checking",
                 );
                 return report;
             }
             crate::dns::AxfrCheckState::Cancelled => {
-                stop_after_axfr(
+                lifecycle::terminate(
                     &mut report,
+                    ScanStage::Dns,
                     selection,
                     ScanErrorKind::Cancelled,
-                    ScanStatus::Interrupted,
                     "scan interrupted during authoritative AXFR checking",
                 );
                 return report;
@@ -338,21 +380,21 @@ async fn run_scan_inner(
                 }
             }
             crate::dns::WildcardDnsCheckState::TimedOut => {
-                stop_after_wildcard_dns(
+                lifecycle::terminate(
                     &mut report,
+                    ScanStage::Dns,
                     selection,
                     ScanErrorKind::Timeout,
-                    ScanStatus::Partial,
                     "global timeout expired during wildcard DNS detection",
                 );
                 return report;
             }
             crate::dns::WildcardDnsCheckState::Cancelled => {
-                stop_after_wildcard_dns(
+                lifecycle::terminate(
                     &mut report,
+                    ScanStage::Dns,
                     selection,
                     ScanErrorKind::Cancelled,
-                    ScanStatus::Interrupted,
                     "scan interrupted during wildcard DNS detection",
                 );
                 return report;
@@ -406,21 +448,21 @@ async fn run_scan_inner(
                     }
                 }
                 crate::dns::DanglingCnameCheckState::TimedOut => {
-                    stop_after_dangling_cname(
+                    lifecycle::terminate(
                         &mut report,
+                        ScanStage::Dns,
                         selection,
                         ScanErrorKind::Timeout,
-                        ScanStatus::Partial,
                         "global timeout expired during CNAME destination checking",
                     );
                     return report;
                 }
                 crate::dns::DanglingCnameCheckState::Cancelled => {
-                    stop_after_dangling_cname(
+                    lifecycle::terminate(
                         &mut report,
+                        ScanStage::Dns,
                         selection,
                         ScanErrorKind::Cancelled,
-                        ScanStatus::Interrupted,
                         "scan interrupted during CNAME destination checking",
                     );
                     return report;
@@ -451,10 +493,11 @@ async fn run_scan_inner(
         return finish_selected_report(report, &cancellation, selection, None, progress);
     }
     if Instant::now() >= deadline {
-        fail_timeout(
+        lifecycle::terminate(
             &mut report,
             ScanStage::Ports,
             selection,
+            ScanErrorKind::Timeout,
             "global timeout expired before port scanning",
         );
         return report;
@@ -462,6 +505,12 @@ async fn run_scan_inner(
 
     progress(ScanProgress::Started(ScanStage::Ports));
     let probe_concurrency = report.configuration.concurrency.div_ceil(2).max(1);
+    let stage_cancellation = cancellation.child_token();
+    let deadline_cancellation = stage_cancellation.clone();
+    let deadline_task = tokio::spawn(async move {
+        sleep_until(deadline).await;
+        deadline_cancellation.cancel();
+    });
     let ports_future = async {
         let (tcp, udp) = tokio::join!(
             scan_ports(
@@ -469,37 +518,40 @@ async fn run_scan_inner(
                 &report.configuration.ports,
                 probe_concurrency,
                 Duration::from_millis(report.configuration.connect_timeout_ms),
-                &cancellation,
+                &stage_cancellation,
             ),
             scan_udp_ports(
                 &addresses,
                 &report.configuration.udp_ports,
                 probe_concurrency,
                 Duration::from_millis(report.configuration.connect_timeout_ms),
-                &cancellation,
+                &stage_cancellation,
             )
         );
         merge_hosts(tcp, udp)
     };
-    let hosts = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => {
-            interrupt(&mut report, ScanStage::Ports, selection, "scan interrupted during port scanning");
-            return report;
-        }
-        result = timeout_at(deadline, ports_future) => result,
-    };
-    if let Ok(hosts) = hosts {
-        report.hosts = hosts;
-        progress(ScanProgress::Completed {
-            stage: ScanStage::Ports,
-            observations: report.hosts.len(),
-        });
-    } else {
-        fail_timeout(
+    report.hosts = ports_future.await;
+    deadline_task.abort();
+    progress(ScanProgress::Completed {
+        stage: ScanStage::Ports,
+        observations: report.hosts.len(),
+    });
+    if cancellation.is_cancelled() {
+        lifecycle::terminate(
             &mut report,
             ScanStage::Ports,
             selection,
+            ScanErrorKind::Cancelled,
+            "scan interrupted during port scanning",
+        );
+        return report;
+    }
+    if Instant::now() >= deadline {
+        lifecycle::terminate(
+            &mut report,
+            ScanStage::Ports,
+            selection,
+            ScanErrorKind::Timeout,
             "global timeout expired during port scanning",
         );
         return report;
@@ -509,10 +561,11 @@ async fn run_scan_inner(
         return finish_selected_report(report, &cancellation, selection, None, progress);
     }
     if Instant::now() >= deadline {
-        fail_timeout(
+        lifecycle::terminate(
             &mut report,
             ScanStage::Services,
             selection,
+            ScanErrorKind::Timeout,
             "global timeout expired before service detection",
         );
         return report;
@@ -534,28 +587,32 @@ async fn run_scan_inner(
         ));
     }
     progress(ScanProgress::Started(ScanStage::Services));
-    let services_future = detect_services(
+    let (stage_cancellation, deadline_task) = stage_deadline_cancellation(&cancellation, deadline);
+    report.services = detect_services(
         &report.hosts,
         report.target.hostname.as_deref(),
         report.configuration.concurrency.min(32),
         Duration::from_millis(report.configuration.request_timeout_ms),
-        &cancellation,
-    );
-    let services = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => {
-            interrupt(&mut report, ScanStage::Services, selection, "scan interrupted during service detection");
-            return report;
-        }
-        result = timeout_at(deadline, services_future) => result,
-    };
-    if let Ok(services) = services {
-        report.services = services;
-    } else {
-        fail_timeout(
+        &stage_cancellation,
+    )
+    .await;
+    deadline_task.abort();
+    if cancellation.is_cancelled() {
+        lifecycle::terminate(
             &mut report,
             ScanStage::Services,
             selection,
+            ScanErrorKind::Cancelled,
+            "scan interrupted during service detection",
+        );
+        return report;
+    }
+    if Instant::now() >= deadline {
+        lifecycle::terminate(
+            &mut report,
+            ScanStage::Services,
+            selection,
+            ScanErrorKind::Timeout,
             "global timeout expired during service detection",
         );
         return report;
@@ -577,19 +634,21 @@ async fn run_scan_inner(
             });
         }
         SshAnalysisState::TimedOut => {
-            fail_timeout(
+            lifecycle::terminate(
                 &mut report,
                 ScanStage::Services,
                 selection,
+                ScanErrorKind::Timeout,
                 "global timeout expired during SSH analysis",
             );
             return report;
         }
         SshAnalysisState::Cancelled => {
-            interrupt(
+            lifecycle::terminate(
                 &mut report,
                 ScanStage::Services,
                 selection,
+                ScanErrorKind::Cancelled,
                 "scan interrupted during SSH analysis",
             );
             return report;
@@ -598,41 +657,47 @@ async fn run_scan_inner(
 
     if selection.http {
         if Instant::now() >= deadline {
-            fail_timeout(
+            lifecycle::terminate(
                 &mut report,
                 ScanStage::Http,
                 selection,
+                ScanErrorKind::Timeout,
                 "global timeout expired before HTTP analysis",
             );
             return report;
         }
         progress(ScanProgress::Started(ScanStage::Http));
-        let http_future = analyze_http(
+        let (stage_cancellation, deadline_task) =
+            stage_deadline_cancellation(&cancellation, deadline);
+        report.http = analyze_http(
             &report.target,
             &report.services,
             report.configuration.concurrency.min(16),
             Duration::from_millis(report.configuration.request_timeout_ms),
-            &cancellation,
-        );
-        let http = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                interrupt(&mut report, ScanStage::Http, selection, "scan interrupted during HTTP analysis");
-                return report;
-            }
-            result = timeout_at(deadline, http_future) => result,
-        };
-        if let Ok(http) = http {
-            report.http = http;
-            progress(ScanProgress::Completed {
-                stage: ScanStage::Http,
-                observations: report.http.len(),
-            });
-        } else {
-            fail_timeout(
+            &stage_cancellation,
+        )
+        .await;
+        deadline_task.abort();
+        progress(ScanProgress::Completed {
+            stage: ScanStage::Http,
+            observations: report.http.len(),
+        });
+        if cancellation.is_cancelled() {
+            lifecycle::terminate(
                 &mut report,
                 ScanStage::Http,
                 selection,
+                ScanErrorKind::Cancelled,
+                "scan interrupted during HTTP analysis",
+            );
+            return report;
+        }
+        if Instant::now() >= deadline {
+            lifecycle::terminate(
+                &mut report,
+                ScanStage::Http,
+                selection,
+                ScanErrorKind::Timeout,
                 "global timeout expired during HTTP analysis",
             );
             return report;
@@ -640,80 +705,66 @@ async fn run_scan_inner(
     }
 
     if selection.tls
+        && report.target.explicit_ip.is_none()
         && let Some(server_name) = report.target.hostname.as_deref()
     {
         if Instant::now() >= deadline {
-            fail_timeout(
+            lifecycle::terminate(
                 &mut report,
                 ScanStage::Tls,
                 selection,
+                ScanErrorKind::Timeout,
                 "global timeout expired before TLS analysis",
             );
             return report;
         }
         progress(ScanProgress::Started(ScanStage::Tls));
-        let tls_future = analyze_tls(
+        let (stage_cancellation, deadline_task) =
+            stage_deadline_cancellation(&cancellation, deadline);
+        report.tls = analyze_tls(
             &report.services,
             server_name,
             report.configuration.concurrency.min(16),
             Duration::from_millis(report.configuration.request_timeout_ms),
-            &cancellation,
-        );
-        let tls = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                interrupt(&mut report, ScanStage::Tls, selection, "scan interrupted during TLS analysis");
-                return report;
-            }
-            result = timeout_at(deadline, tls_future) => result,
-        };
-        if let Ok(tls) = tls {
-            report.tls = tls;
-            progress(ScanProgress::Completed {
-                stage: ScanStage::Tls,
-                observations: report.tls.len(),
-            });
-        } else {
-            fail_timeout(
+            &stage_cancellation,
+        )
+        .await;
+        deadline_task.abort();
+        progress(ScanProgress::Completed {
+            stage: ScanStage::Tls,
+            observations: report.tls.len(),
+        });
+        if cancellation.is_cancelled() {
+            lifecycle::terminate(
                 &mut report,
                 ScanStage::Tls,
                 selection,
+                ScanErrorKind::Cancelled,
+                "scan interrupted during TLS analysis",
+            );
+            return report;
+        }
+        if Instant::now() >= deadline {
+            lifecycle::terminate(
+                &mut report,
+                ScanStage::Tls,
+                selection,
+                ScanErrorKind::Timeout,
                 "global timeout expired during TLS analysis",
             );
             return report;
         }
     }
 
+    if selection.tls && (report.target.explicit_ip.is_some() || report.target.hostname.is_none()) {
+        add_skipped_check(
+            &mut report,
+            "tls",
+            "not applicable: TLS validation requires a hostname for SNI and certificate matching",
+        );
+    }
+
     finish_selected_report(report, &cancellation, selection, None, progress)
-}
-
-fn add_skipped_check(report: &mut ScanReport, check: &str, reason: &str) {
-    if !report
-        .skipped_checks
-        .iter()
-        .any(|skipped| skipped.check == check)
-    {
-        report.skipped_checks.push(SkippedCheck {
-            check: check.to_owned(),
-            reason: reason.to_owned(),
-        });
-    }
-}
-
-fn record_selection_skips(report: &mut ScanReport, selection: ScanSelection) {
-    for (check, selected) in [
-        ("ports", selection.ports),
-        ("services", selection.services),
-        ("http", selection.http),
-        ("tls", selection.tls),
-    ] {
-        if !selected {
-            report.skipped_checks.push(SkippedCheck {
-                check: check.to_owned(),
-                reason: "excluded by --only".to_owned(),
-            });
-        }
-    }
 }
 
 fn finish_selected_report(
@@ -721,57 +772,20 @@ fn finish_selected_report(
     cancellation: &CancellationToken,
     selection: ScanSelection,
     unfinished_stage: Option<ScanStage>,
-    progress: &impl Fn(ScanProgress),
+    _progress: &impl Fn(ScanProgress),
 ) -> ScanReport {
     if cancellation.is_cancelled() {
         let message = "scan interrupted before findings finalization";
-        report.status = ScanStatus::Interrupted;
-        message.clone_into(&mut report.message);
-        report.errors.push(ScanError::new(
-            ScanStage::Findings,
-            report.target.hostname.clone(),
+        lifecycle::terminate(
+            &mut report,
+            unfinished_stage.unwrap_or(ScanStage::Findings),
+            selection,
             ScanErrorKind::Cancelled,
             message,
-            true,
-        ));
-        if let Some(stage) = unfinished_stage {
-            record_unfinished_checks(&mut report, stage, selection, message);
-        }
-    } else if report.status != ScanStatus::Partial {
-        let dnssec_indeterminate = report
-            .dns
-            .as_ref()
-            .and_then(|dns| dns.dnssec.as_ref())
-            .is_some_and(|dnssec| dnssec.status == DnssecStatus::Indeterminate);
-        let wildcard_indeterminate = report
-            .dns
-            .as_ref()
-            .and_then(|dns| dns.wildcard_dns.as_ref())
-            .is_some_and(|wildcard| wildcard.status == WildcardDnsStatus::Indeterminate);
-        let dangling_indeterminate = report.dns.as_ref().is_some_and(|dns| {
-            dns.dangling_cnames
-                .iter()
-                .any(|observation| observation.status == DanglingCnameStatus::Indeterminate)
-        });
-        report.status = if report.errors.is_empty()
-            && !dnssec_indeterminate
-            && !wildcard_indeterminate
-            && !dangling_indeterminate
-        {
-            ScanStatus::Completed
-        } else {
-            ScanStatus::Partial
-        };
-        "Surface analyzed externally observable services and security-related configuration."
-            .clone_into(&mut report.message);
+        );
+    } else {
+        lifecycle::settle(&mut report);
     }
-    progress(ScanProgress::Started(ScanStage::Findings));
-    complete_findings(&mut report);
-    progress(ScanProgress::Completed {
-        stage: ScanStage::Findings,
-        observations: report.findings.len(),
-    });
-    report.completed_at = Some(time::OffsetDateTime::now_utc());
     report
 }
 
@@ -789,41 +803,24 @@ fn merge_hosts(mut tcp: Vec<HostObservation>, udp: Vec<HostObservation>) -> Vec<
     tcp
 }
 
+fn stage_deadline_cancellation(
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+    let stage_cancellation = cancellation.child_token();
+    let deadline_cancellation = stage_cancellation.clone();
+    let deadline_task = tokio::spawn(async move {
+        sleep_until(deadline).await;
+        deadline_cancellation.cancel();
+    });
+    (stage_cancellation, deadline_task)
+}
+
 fn incompatible_address_family(report: &ScanReport) -> bool {
     report.target.explicit_ip.is_some_and(|ip| {
         (report.configuration.ipv4_only && ip.is_ipv6())
             || (report.configuration.ipv6_only && ip.is_ipv4())
     })
-}
-
-fn reject_before_scan(report: &mut ScanReport, kind: ScanErrorKind, message: &str) {
-    report.status = ScanStatus::Failed;
-    message.clone_into(&mut report.message);
-    report.errors.push(ScanError::new(
-        ScanStage::Ports,
-        report.target.hostname.clone(),
-        kind,
-        message,
-        false,
-    ));
-    report.completed_at = Some(time::OffsetDateTime::now_utc());
-}
-
-fn complete_findings(report: &mut ScanReport) {
-    report.findings = generate_findings(
-        report
-            .target
-            .hostname
-            .as_deref()
-            .unwrap_or(&report.target.original),
-        report.dns.as_ref(),
-        &report.hosts,
-        &report.services,
-        &report.http,
-        &report.tls,
-        time::OffsetDateTime::now_utc(),
-    );
-    report.exposure_score = Some(calculate_exposure(report));
 }
 
 fn scan_addresses(report: &ScanReport) -> Vec<IpAddr> {
@@ -839,186 +836,6 @@ fn scan_addresses(report: &ScanReport) -> Vec<IpAddr> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn stop_after_dnssec(
-    report: &mut ScanReport,
-    selection: ScanSelection,
-    kind: ScanErrorKind,
-    status: ScanStatus,
-    message: &str,
-) {
-    report.status = status;
-    message.clone_into(&mut report.message);
-    report.errors.push(ScanError::new(
-        ScanStage::Dns,
-        report.target.hostname.clone(),
-        kind,
-        message,
-        true,
-    ));
-    if let Some(dns) = report.dns.as_mut() {
-        dns.dnssec = Some(DnssecObservation {
-            status: DnssecStatus::Indeterminate,
-            limitations: vec![message.to_owned()],
-            ..DnssecObservation::default()
-        });
-    }
-    add_skipped_check(report, "dnssec_validation", message);
-    add_skipped_check(report, "authoritative_axfr", message);
-    add_skipped_check(report, "wildcard_dns", message);
-    add_skipped_check(report, "dangling_cname", message);
-    record_unfinished_checks(report, ScanStage::Ports, selection, message);
-    complete_findings(report);
-    report.completed_at = Some(time::OffsetDateTime::now_utc());
-}
-
-fn stop_after_axfr(
-    report: &mut ScanReport,
-    selection: ScanSelection,
-    kind: ScanErrorKind,
-    status: ScanStatus,
-    message: &str,
-) {
-    report.status = status;
-    message.clone_into(&mut report.message);
-    report.errors.push(ScanError::new(
-        ScanStage::Dns,
-        report.target.hostname.clone(),
-        kind,
-        message,
-        true,
-    ));
-    add_skipped_check(report, "authoritative_axfr", message);
-    add_skipped_check(report, "wildcard_dns", message);
-    add_skipped_check(report, "dangling_cname", message);
-    record_unfinished_checks(report, ScanStage::Ports, selection, message);
-    complete_findings(report);
-    report.completed_at = Some(time::OffsetDateTime::now_utc());
-}
-
-fn stop_after_wildcard_dns(
-    report: &mut ScanReport,
-    selection: ScanSelection,
-    kind: ScanErrorKind,
-    status: ScanStatus,
-    message: &str,
-) {
-    report.status = status;
-    message.clone_into(&mut report.message);
-    report.errors.push(ScanError::new(
-        ScanStage::Dns,
-        report.target.hostname.clone(),
-        kind,
-        message,
-        true,
-    ));
-    add_skipped_check(report, "wildcard_dns", message);
-    add_skipped_check(report, "dangling_cname", message);
-    record_unfinished_checks(report, ScanStage::Ports, selection, message);
-    complete_findings(report);
-    report.completed_at = Some(time::OffsetDateTime::now_utc());
-}
-
-fn stop_after_dangling_cname(
-    report: &mut ScanReport,
-    selection: ScanSelection,
-    kind: ScanErrorKind,
-    status: ScanStatus,
-    message: &str,
-) {
-    report.status = status;
-    message.clone_into(&mut report.message);
-    report.errors.push(ScanError::new(
-        ScanStage::Dns,
-        report.target.hostname.clone(),
-        kind,
-        message,
-        true,
-    ));
-    add_skipped_check(report, "dangling_cname", message);
-    record_unfinished_checks(report, ScanStage::Ports, selection, message);
-    complete_findings(report);
-    report.completed_at = Some(time::OffsetDateTime::now_utc());
-}
-
-fn interrupt(report: &mut ScanReport, stage: ScanStage, selection: ScanSelection, message: &str) {
-    report.status = ScanStatus::Interrupted;
-    message.clone_into(&mut report.message);
-    report.errors.push(ScanError::new(
-        stage,
-        report.target.hostname.clone(),
-        ScanErrorKind::Cancelled,
-        message,
-        true,
-    ));
-    record_unfinished_checks(report, stage, selection, message);
-    complete_findings(report);
-    report.completed_at = Some(time::OffsetDateTime::now_utc());
-}
-
-fn fail_timeout(
-    report: &mut ScanReport,
-    stage: ScanStage,
-    selection: ScanSelection,
-    message: &str,
-) {
-    report.status = ScanStatus::Partial;
-    message.clone_into(&mut report.message);
-    report.errors.push(ScanError::new(
-        stage,
-        report.target.hostname.clone(),
-        ScanErrorKind::Timeout,
-        message,
-        true,
-    ));
-    record_unfinished_checks(report, stage, selection, message);
-    complete_findings(report);
-    report.completed_at = Some(time::OffsetDateTime::now_utc());
-}
-
-fn record_unfinished_checks(
-    report: &mut ScanReport,
-    failed_stage: ScanStage,
-    selection: ScanSelection,
-    reason: &str,
-) {
-    let failed_rank = stage_rank(failed_stage);
-    for (check, stage, selected) in [
-        ("dns", ScanStage::Dns, true),
-        ("dnssec_validation", ScanStage::Dns, true),
-        ("authoritative_axfr", ScanStage::Dns, true),
-        ("wildcard_dns", ScanStage::Dns, true),
-        ("dangling_cname", ScanStage::Dns, true),
-        ("ports", ScanStage::Ports, selection.ports),
-        ("services", ScanStage::Services, selection.services),
-        ("http", ScanStage::Http, selection.http),
-        ("tls", ScanStage::Tls, selection.tls),
-    ] {
-        if selected
-            && stage_rank(stage) >= failed_rank
-            && !report
-                .skipped_checks
-                .iter()
-                .any(|skipped| skipped.check == check)
-        {
-            report.skipped_checks.push(SkippedCheck {
-                check: check.to_owned(),
-                reason: reason.to_owned(),
-            });
-        }
-    }
-}
-
-const fn stage_rank(stage: ScanStage) -> u8 {
-    match stage {
-        ScanStage::Dns => 0,
-        ScanStage::Ports => 1,
-        ScanStage::Services => 2,
-        ScanStage::Http => 3,
-        ScanStage::Tls => 4,
-        ScanStage::Findings => 5,
-    }
 }
 
 #[cfg(test)]
@@ -1174,6 +991,14 @@ mod tests {
         ));
         assert_eq!(report.hosts[0].ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(report.configuration.authorization_acknowledged);
+        assert_eq!(
+            report
+                .skipped_checks
+                .iter()
+                .filter(|skipped| skipped.check == "tls")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1259,7 +1084,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(report.status, ScanStatus::Partial);
+        assert_eq!(report.status, ScanStatus::Failed);
         assert_eq!(report.errors[0].stage, ScanStage::Dns);
         assert!(
             report
@@ -1382,13 +1207,13 @@ mod tests {
         assert_eq!(report.services.len(), 1);
         assert_eq!(report.services[0].address, address);
         assert_eq!(report.services[0].service, crate::ServiceKind::Ssh);
-        assert_eq!(
+        assert!(matches!(
             report.services[0]
-                .protocol_details
-                .get("ssh_analysis_status")
-                .map(String::as_str),
-            Some("complete_inferred")
-        );
+                .ssh
+                .as_ref()
+                .map(|posture| &posture.outcome),
+            Some(crate::SshPostureOutcome::Complete { .. })
+        ));
         assert!(report.http.is_empty());
         assert!(report.tls.is_empty());
     }
@@ -1485,13 +1310,11 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(report.status, ScanStatus::Partial);
-        assert_eq!(
-            report.services[0]
-                .protocol_details
-                .get("ssh_skip_reason")
-                .map(String::as_str),
-            Some("caller deadline exceeded")
-        );
+        assert!(matches!(
+            report.services[0].ssh.as_ref().map(|posture| &posture.outcome),
+            Some(crate::SshPostureOutcome::Indeterminate { reason })
+                if reason == "caller deadline exceeded"
+        ));
         assert_eq!(report.services[0].address, address);
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1535,13 +1358,10 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(report.status, ScanStatus::Interrupted);
-        assert_eq!(
-            report.services[0]
-                .protocol_details
-                .get("ssh_skip_reason")
-                .map(String::as_str),
-            Some("cancelled")
-        );
+        assert!(matches!(
+            report.services[0].ssh.as_ref().map(|posture| &posture.outcome),
+            Some(crate::SshPostureOutcome::Indeterminate { reason }) if reason == "cancelled"
+        ));
         assert_eq!(report.services[0].address, address);
     }
 
@@ -1618,6 +1438,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the end-to-end fixture keeps lifecycle assertions in one behavior test"
+    )]
     async fn no_address_cancellation_preserves_completed_dns_observations() {
         let target = normalize_target("127.0.0.1").unwrap_or_else(|error| panic!("{error}"));
         let mut report = crate::ScanReport::not_started(
@@ -1671,12 +1495,18 @@ mod tests {
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
-        let report = super::finish_selected_report(
+        let mut report = super::finish_selected_report(
             report,
             &cancellation,
             ScanSelection::all(),
             Some(ScanStage::Ports),
             &|_| {},
+        );
+        super::finalize_report(
+            &mut report,
+            &cancellation,
+            Instant::now() + Duration::from_secs(1),
+            |_| {},
         );
 
         let dns = report.dns.as_ref().expect("DNS observation");
@@ -1751,8 +1581,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(report.status, ScanStatus::Completed);
-        assert!(report.errors.is_empty());
+        assert_eq!(report.status, ScanStatus::Interrupted);
+        assert_eq!(
+            report.errors.last().map(|error| error.kind),
+            Some(crate::ScanErrorKind::Cancelled)
+        );
         assert!(report.completed_at.is_some());
     }
 
@@ -1784,11 +1617,11 @@ mod tests {
             .observation,
         );
 
-        super::stop_after_dnssec(
+        crate::lifecycle::terminate(
             &mut report,
+            ScanStage::Dns,
             ScanSelection::all(),
             crate::ScanErrorKind::Cancelled,
-            ScanStatus::Interrupted,
             "scan interrupted during DNSSEC validation",
         );
 
@@ -1796,7 +1629,7 @@ mod tests {
         assert_eq!(dns.resolved_hosts.len(), 1);
         assert_eq!(
             dns.dnssec.as_ref().map(|dnssec| dnssec.status),
-            Some(crate::DnssecStatus::Indeterminate)
+            Some(crate::DnssecStatus::NotApplicable)
         );
         assert_eq!(
             report
@@ -1860,11 +1693,11 @@ mod tests {
         });
         report.dns = Some(dns);
 
-        super::stop_after_axfr(
+        crate::lifecycle::terminate(
             &mut report,
+            ScanStage::Dns,
             ScanSelection::all(),
             crate::ScanErrorKind::Timeout,
-            ScanStatus::Partial,
             "global timeout expired during authoritative AXFR checking",
         );
 
@@ -1892,7 +1725,7 @@ mod tests {
             report
                 .skipped_checks
                 .iter()
-                .all(|skipped| skipped.check != "dnssec_validation")
+                .any(|skipped| skipped.check == "dnssec_validation")
         );
         assert_eq!(
             report
@@ -1904,7 +1737,7 @@ mod tests {
         );
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.status, ScanStatus::Partial);
-        assert!(report.completed_at.is_some());
+        assert!(report.completed_at.is_none());
     }
 
     #[tokio::test]
@@ -1948,11 +1781,11 @@ mod tests {
         });
         report.dns = Some(dns);
 
-        super::stop_after_wildcard_dns(
+        crate::lifecycle::terminate(
             &mut report,
+            ScanStage::Dns,
             ScanSelection::all(),
             crate::ScanErrorKind::Cancelled,
-            ScanStatus::Interrupted,
             "scan interrupted during wildcard DNS detection",
         );
 
@@ -2044,11 +1877,11 @@ mod tests {
         ] {
             let mut report = crate::ScanReport::not_started(target.clone(), configuration.clone());
             report.dns = Some(dns.clone());
-            super::stop_after_dangling_cname(
+            crate::lifecycle::terminate(
                 &mut report,
+                ScanStage::Dns,
                 ScanSelection::all(),
                 kind,
-                status,
                 message,
             );
 
@@ -2177,5 +2010,7 @@ mod tests {
         .await;
         assert_eq!(report.status, ScanStatus::Failed);
         assert!(report.hosts.is_empty());
+        assert_eq!(report.errors[0].stage, ScanStage::Preflight);
+        assert_eq!(report.errors[0].kind, crate::ScanErrorKind::Configuration);
     }
 }

@@ -1,6 +1,6 @@
 //! Bounded SSH identification and KEXINIT posture analysis.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -11,7 +11,10 @@ use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{ServiceKind, ServiceObservation, TransportProtocol};
+use crate::{
+    PartialSshAlgorithmSelections, ServiceKind, ServiceObservation, SshAlgorithmSelections,
+    SshIdentification, SshPosture, SshPostureOutcome, TransportProtocol,
+};
 
 // Rust guideline compliant 2026-02-21
 
@@ -68,19 +71,6 @@ const MAC_ALGORITHMS: &[&str] = &[
     "hmac-md5-96",
 ];
 const COMPRESSION_ALGORITHMS: &[&str] = &["none"];
-const SSH_DETAIL_KEYS: &[&str] = &[
-    "ssh_protocol",
-    "ssh_software",
-    "ssh_kex",
-    "ssh_host_key_algorithm",
-    "ssh_cipher_c2s",
-    "ssh_cipher_s2c",
-    "ssh_mac_c2s",
-    "ssh_mac_s2c",
-    "ssh_analysis_status",
-    "ssh_skip_reason",
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SshAnalysisState {
     Completed,
@@ -91,7 +81,7 @@ pub(crate) enum SshAnalysisState {
 #[derive(Debug)]
 struct EndpointAnalysis {
     address: SocketAddr,
-    details: BTreeMap<String, String>,
+    posture: SshPosture,
     state: SshAnalysisState,
 }
 
@@ -99,6 +89,15 @@ struct EndpointAnalysis {
 struct Identification {
     protocol: &'static str,
     software: String,
+}
+
+impl From<&Identification> for SshIdentification {
+    fn from(value: &Identification) -> Self {
+        Self {
+            protocol: value.protocol.to_owned(),
+            software: value.software.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -112,21 +111,21 @@ struct ProtocolError(&'static str);
 #[derive(Debug)]
 struct ExchangeError {
     reason: &'static str,
-    details: BTreeMap<String, String>,
+    identification: Option<SshIdentification>,
 }
 
 impl ExchangeError {
     fn new(reason: &'static str) -> Self {
         Self {
             reason,
-            details: BTreeMap::new(),
+            identification: None,
         }
     }
 
     fn identified(reason: &'static str, identification: &Identification) -> Self {
         Self {
             reason,
-            details: identification_details(identification),
+            identification: Some(identification.into()),
         }
     }
 }
@@ -178,10 +177,7 @@ pub(crate) async fn analyze_ssh(
             .iter()
             .find(|analysis| analysis.address == service.address)
         {
-            for key in SSH_DETAIL_KEYS {
-                service.protocol_details.remove(*key);
-            }
-            service.protocol_details.extend(analysis.details.clone());
+            service.ssh = Some(analysis.posture.clone());
         }
     }
     state
@@ -201,16 +197,16 @@ async fn inspect(
         result = timeout_at(deadline, timeout(request_timeout, inspect_inner(address))) => result,
     };
     match result {
-        Ok(Ok(Ok(details))) => EndpointAnalysis {
+        Ok(Ok(Ok(posture))) => EndpointAnalysis {
             address,
-            details,
+            posture,
             state: SshAnalysisState::Completed,
         },
         Ok(Ok(Err(error))) => indeterminate_with_details(
             address,
             error.reason,
             SshAnalysisState::Completed,
-            error.details,
+            error.identification,
         ),
         Ok(Err(_)) => indeterminate(address, "request timeout", SshAnalysisState::Completed),
         Err(_) => indeterminate(
@@ -221,7 +217,7 @@ async fn inspect(
     }
 }
 
-async fn inspect_inner(address: SocketAddr) -> Result<BTreeMap<String, String>, ExchangeError> {
+async fn inspect_inner(address: SocketAddr) -> Result<SshPosture, ExchangeError> {
     let mut socket = TcpStream::connect(address)
         .await
         .map_err(|_| ExchangeError::new("TCP connection failed"))?;
@@ -240,7 +236,7 @@ async fn inspect_inner(address: SocketAddr) -> Result<BTreeMap<String, String>, 
     let kexinit = read_server_kexinit(&mut socket)
         .await
         .map_err(|error| ExchangeError::identified(error.0, &identification))?;
-    Ok(inferred_details(&identification, &kexinit))
+    Ok(inferred_posture(&identification, &kexinit))
 }
 
 fn indeterminate(
@@ -248,20 +244,23 @@ fn indeterminate(
     reason: &'static str,
     state: SshAnalysisState,
 ) -> EndpointAnalysis {
-    indeterminate_with_details(address, reason, state, BTreeMap::new())
+    indeterminate_with_details(address, reason, state, None)
 }
 
 fn indeterminate_with_details(
     address: SocketAddr,
     reason: &'static str,
     state: SshAnalysisState,
-    mut details: BTreeMap<String, String>,
+    identification: Option<SshIdentification>,
 ) -> EndpointAnalysis {
-    details.insert("ssh_analysis_status".to_owned(), "indeterminate".to_owned());
-    details.insert("ssh_skip_reason".to_owned(), reason.to_owned());
     EndpointAnalysis {
         address,
-        details,
+        posture: SshPosture {
+            identification,
+            outcome: SshPostureOutcome::Indeterminate {
+                reason: reason.to_owned(),
+            },
+        },
         state,
     }
 }
@@ -585,55 +584,85 @@ fn valid_domain_name(domain: &str) -> bool {
         })
 }
 
-fn identification_details(identification: &Identification) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        (
-            "ssh_protocol".to_owned(),
-            identification.protocol.to_owned(),
-        ),
-        ("ssh_software".to_owned(), identification.software.clone()),
-    ])
-}
-
-fn inferred_details(
-    identification: &Identification,
-    kexinit: &KexInit,
-) -> BTreeMap<String, String> {
-    let mut details = identification_details(identification);
+fn inferred_posture(identification: &Identification, kexinit: &KexInit) -> SshPosture {
     let required = [
-        ("ssh_kex", KEX_ALGORITHMS, 0_usize),
-        ("ssh_host_key_algorithm", HOST_KEY_ALGORITHMS, 1),
-        ("ssh_cipher_c2s", CIPHER_ALGORITHMS, 2),
-        ("ssh_cipher_s2c", CIPHER_ALGORITHMS, 3),
-        ("ssh_mac_c2s", MAC_ALGORITHMS, 4),
-        ("ssh_mac_s2c", MAC_ALGORITHMS, 5),
+        ("kex", KEX_ALGORITHMS, 0_usize),
+        ("host_key", HOST_KEY_ALGORITHMS, 1),
+        ("cipher_c2s", CIPHER_ALGORITHMS, 2),
+        ("cipher_s2c", CIPHER_ALGORITHMS, 3),
+        ("mac_c2s", MAC_ALGORITHMS, 4),
+        ("mac_s2c", MAC_ALGORITHMS, 5),
         ("compression_c2s", COMPRESSION_ALGORITHMS, 6),
         ("compression_s2c", COMPRESSION_ALGORITHMS, 7),
     ];
     let mut missing = None;
+    let mut selections = PartialSshAlgorithmSelections::default();
     for (key, client, index) in required {
         let selected = select_algorithm(client, &kexinit.lists[index]);
         if let Some(selected) = selected {
-            if key.starts_with("ssh_") {
-                details.insert(key.to_owned(), selected.to_owned());
+            match key {
+                "kex" => selections.kex = Some(selected.to_owned()),
+                "host_key" => selections.host_key = Some(selected.to_owned()),
+                "cipher_c2s" => selections.cipher_c2s = Some(selected.to_owned()),
+                "cipher_s2c" => selections.cipher_s2c = Some(selected.to_owned()),
+                "mac_c2s" => selections.mac_c2s = Some(selected.to_owned()),
+                "mac_s2c" => selections.mac_s2c = Some(selected.to_owned()),
+                _ => {}
             }
         } else if missing.is_none() {
             missing = Some(key);
         }
     }
-    if let Some(missing) = missing {
-        details.insert("ssh_analysis_status".to_owned(), "indeterminate".to_owned());
-        details.insert(
-            "ssh_skip_reason".to_owned(),
-            format!("no common required algorithm: {missing}"),
-        );
-    } else {
-        details.insert(
-            "ssh_analysis_status".to_owned(),
-            "complete_inferred".to_owned(),
-        );
+    let PartialSshAlgorithmSelections {
+        kex,
+        host_key,
+        cipher_c2s,
+        cipher_s2c,
+        mac_c2s,
+        mac_s2c,
+    } = selections;
+    let outcome = match (
+        missing, kex, host_key, cipher_c2s, cipher_s2c, mac_c2s, mac_s2c,
+    ) {
+        (
+            None,
+            Some(kex),
+            Some(host_key),
+            Some(cipher_c2s),
+            Some(cipher_s2c),
+            Some(mac_c2s),
+            Some(mac_s2c),
+        ) => SshPostureOutcome::Complete {
+            selections: SshAlgorithmSelections {
+                kex,
+                host_key,
+                cipher_c2s,
+                cipher_s2c,
+                mac_c2s,
+                mac_s2c,
+            },
+        },
+        (missing, kex, host_key, cipher_c2s, cipher_s2c, mac_c2s, mac_s2c) => {
+            SshPostureOutcome::Partial {
+                selections: PartialSshAlgorithmSelections {
+                    kex,
+                    host_key,
+                    cipher_c2s,
+                    cipher_s2c,
+                    mac_c2s,
+                    mac_s2c,
+                },
+                reason: missing.map_or_else(
+                    || "incomplete required algorithm selection".to_owned(),
+                    |missing| format!("no common required algorithm: {missing}"),
+                ),
+            }
+        }
+    };
+    SshPosture {
+        identification: Some(identification.into()),
+        outcome,
     }
-    details
 }
 
 fn select_algorithm<'a>(client: &[&'a str], server: &[String]) -> Option<&'a str> {
@@ -659,10 +688,13 @@ mod tests {
     use super::{
         CIPHER_ALGORITHMS, CLIENT_IDENTIFICATION, HOST_KEY_ALGORITHMS, Identification,
         KEX_ALGORITHMS, MAC_ALGORITHMS, MAX_IDENTIFICATION_BYTES, MAX_PACKET_LENGTH_FIELD_VALUE,
-        MAX_PRE_BANNER_BYTES, SshAnalysisState, analyze_ssh, inferred_details,
+        MAX_PRE_BANNER_BYTES, SshAnalysisState, analyze_ssh, inferred_posture,
         parse_identification, parse_kexinit, read_identification, read_server_kexinit,
     };
-    use crate::{DetectionConfidence, ServiceKind, ServiceObservation, TransportProtocol};
+    use crate::{
+        DetectionConfidence, ServiceKind, ServiceObservation, SshAlgorithmSelections, SshPosture,
+        SshPostureOutcome, TransportProtocol,
+    };
 
     const VALID_LISTS: [&str; 10] = [
         "diffie-hellman-group14-sha1,curve25519-sha256",
@@ -685,6 +717,27 @@ mod tests {
             confidence: DetectionConfidence::High,
             banner: Some("SSH-2.0-fixture".to_owned()),
             protocol_details: BTreeMap::new(),
+            ssh: None,
+        }
+    }
+
+    fn selection<'a>(selections: &'a SshAlgorithmSelections, key: &str) -> &'a str {
+        match key {
+            "ssh_kex" => &selections.kex,
+            "ssh_host_key_algorithm" => &selections.host_key,
+            "ssh_cipher_c2s" => &selections.cipher_c2s,
+            "ssh_cipher_s2c" => &selections.cipher_s2c,
+            "ssh_mac_c2s" => &selections.mac_c2s,
+            "ssh_mac_s2c" => &selections.mac_s2c,
+            _ => panic!("unknown SSH selection field"),
+        }
+    }
+
+    fn indeterminate_reason(posture: &SshPosture) -> Option<&str> {
+        match &posture.outcome {
+            SshPostureOutcome::Indeterminate { reason }
+            | SshPostureOutcome::Partial { reason, .. } => Some(reason),
+            SshPostureOutcome::Complete { .. } => None,
         }
     }
 
@@ -825,44 +878,33 @@ mod tests {
         .await;
         assert_eq!(state, SshAnalysisState::Completed);
         fixture.await.unwrap_or_else(|error| panic!("{error}"));
-        for details in services
+        for posture in services
             .iter()
-            .map(|observation| &observation.protocol_details)
+            .filter_map(|observation| observation.ssh.as_ref())
         {
-            assert_eq!(details.get("ssh_protocol").map(String::as_str), Some("2.0"));
             assert_eq!(
-                details.get("ssh_software").map(String::as_str),
+                posture
+                    .identification
+                    .as_ref()
+                    .map(|value| value.protocol.as_str()),
+                Some("2.0")
+            );
+            assert_eq!(
+                posture
+                    .identification
+                    .as_ref()
+                    .map(|value| value.software.as_str()),
                 Some("OpenSSH_9.9 fixture")
             );
-            assert_eq!(
-                details.get("ssh_kex").map(String::as_str),
-                Some("curve25519-sha256")
-            );
-            assert_eq!(
-                details.get("ssh_host_key_algorithm").map(String::as_str),
-                Some("rsa-sha2-256")
-            );
-            assert_eq!(
-                details.get("ssh_cipher_c2s").map(String::as_str),
-                Some("aes128-ctr")
-            );
-            assert_eq!(
-                details.get("ssh_cipher_s2c").map(String::as_str),
-                Some("aes256-ctr")
-            );
-            assert_eq!(
-                details.get("ssh_mac_c2s").map(String::as_str),
-                Some("hmac-sha2-256")
-            );
-            assert_eq!(
-                details.get("ssh_mac_s2c").map(String::as_str),
-                Some("hmac-sha2-512")
-            );
-            assert_eq!(
-                details.get("ssh_analysis_status").map(String::as_str),
-                Some("complete_inferred")
-            );
-            assert!(!details.contains_key("ssh_skip_reason"));
+            let SshPostureOutcome::Complete { selections } = &posture.outcome else {
+                panic!("expected complete SSH posture");
+            };
+            assert_eq!(selections.kex, "curve25519-sha256");
+            assert_eq!(selections.host_key, "rsa-sha2-256");
+            assert_eq!(selections.cipher_c2s, "aes128-ctr");
+            assert_eq!(selections.cipher_s2c, "aes256-ctr");
+            assert_eq!(selections.mac_c2s, "hmac-sha2-256");
+            assert_eq!(selections.mac_s2c, "hmac-sha2-512");
         }
     }
 
@@ -905,26 +947,19 @@ mod tests {
         .await;
         fixture.await.unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(state, SshAnalysisState::Completed);
+        let posture = services[0].ssh.as_ref().expect("SSH posture");
         assert_eq!(
-            services[0]
-                .protocol_details
-                .get("ssh_software")
-                .map(String::as_str),
+            posture
+                .identification
+                .as_ref()
+                .map(|value| value.software.as_str()),
             Some("server\"\\fixture")
         );
         assert_eq!(
-            services[0]
-                .protocol_details
-                .get("ssh_analysis_status")
-                .map(String::as_str),
-            Some("indeterminate")
-        );
-        assert_eq!(
-            services[0]
-                .protocol_details
-                .get("ssh_skip_reason")
-                .map(String::as_str),
-            Some("server packet is not KEXINIT")
+            posture.outcome,
+            SshPostureOutcome::Indeterminate {
+                reason: "server packet is not KEXINIT".to_owned()
+            }
         );
         let json = serde_json::to_string(&services[0]).unwrap_or_else(|error| panic!("{error}"));
         let round_trip: ServiceObservation =
@@ -1142,43 +1177,39 @@ mod tests {
             lists[index] = algorithm;
             let kexinit = parse_kexinit(&kex_payload(lists, 20, 0, 0, &[]))
                 .unwrap_or_else(|error| panic!("{}", error.0));
-            let details = inferred_details(
+            let posture = inferred_posture(
                 &Identification {
                     protocol: "2.0",
                     software: "legacy-fixture".to_owned(),
                 },
                 &kexinit,
             );
-            assert_eq!(
-                details.get("ssh_analysis_status").map(String::as_str),
-                Some("complete_inferred")
-            );
-            assert_eq!(details.get(key).map(String::as_str), Some(algorithm));
+            let SshPostureOutcome::Complete { selections } = posture.outcome else {
+                panic!("expected complete SSH posture");
+            };
+            assert_eq!(selection(&selections, key), algorithm);
         }
     }
 
     #[test]
-    fn no_common_required_algorithm_is_indeterminate() {
+    fn no_common_required_algorithm_retains_partial_selections() {
         let mut lists = VALID_LISTS;
         lists[0] = "unsupported-kex";
         let payload = kex_payload(lists, 20, 1, 0, &[]);
         let kexinit = parse_kexinit(&payload).unwrap_or_else(|error| panic!("{}", error.0));
-        let details = inferred_details(
+        let posture = inferred_posture(
             &Identification {
                 protocol: "2.0",
                 software: "fixture".to_owned(),
             },
             &kexinit,
         );
-        assert_eq!(
-            details.get("ssh_analysis_status").map(String::as_str),
-            Some("indeterminate")
-        );
-        assert_eq!(
-            details.get("ssh_skip_reason").map(String::as_str),
-            Some("no common required algorithm: ssh_kex")
-        );
-        assert!(!details.contains_key("ssh_kex"));
+        let SshPostureOutcome::Partial { selections, reason } = posture.outcome else {
+            panic!("expected partial SSH posture");
+        };
+        assert_eq!(reason, "no common required algorithm: kex");
+        assert_eq!(selections.kex, None);
+        assert_eq!(selections.host_key.as_deref(), Some("rsa-sha2-256"));
         assert_eq!(KEX_ALGORITHMS.last(), Some(&"diffie-hellman-group1-sha1"));
 
         let legacy_lists = [
@@ -1195,33 +1226,20 @@ mod tests {
         ];
         let payload = kex_payload(legacy_lists, 20, 0, 0, &[]);
         let kexinit = parse_kexinit(&payload).unwrap_or_else(|error| panic!("{}", error.0));
-        let details = inferred_details(
+        let posture = inferred_posture(
             &Identification {
                 protocol: "2.0",
                 software: "legacy-fixture".to_owned(),
             },
             &kexinit,
         );
-        assert_eq!(
-            details.get("ssh_analysis_status").map(String::as_str),
-            Some("complete_inferred")
-        );
-        assert_eq!(
-            details.get("ssh_kex").map(String::as_str),
-            Some("diffie-hellman-group1-sha1")
-        );
-        assert_eq!(
-            details.get("ssh_host_key_algorithm").map(String::as_str),
-            Some("ssh-dss")
-        );
-        assert_eq!(
-            details.get("ssh_cipher_c2s").map(String::as_str),
-            Some("arcfour")
-        );
-        assert_eq!(
-            details.get("ssh_mac_s2c").map(String::as_str),
-            Some("hmac-md5-96")
-        );
+        let SshPostureOutcome::Complete { selections } = posture.outcome else {
+            panic!("expected complete SSH posture");
+        };
+        assert_eq!(selections.kex, "diffie-hellman-group1-sha1");
+        assert_eq!(selections.host_key, "ssh-dss");
+        assert_eq!(selections.cipher_c2s, "arcfour");
+        assert_eq!(selections.mac_s2c, "hmac-md5-96");
     }
 
     #[tokio::test]
@@ -1238,10 +1256,7 @@ mod tests {
         .await;
         assert_eq!(state, SshAnalysisState::Completed);
         assert_eq!(
-            services[0]
-                .protocol_details
-                .get("ssh_skip_reason")
-                .map(String::as_str),
+            services[0].ssh.as_ref().and_then(indeterminate_reason),
             Some("request timeout")
         );
         fixture.await.unwrap_or_else(|error| panic!("{error}"));
@@ -1264,10 +1279,7 @@ mod tests {
         .await;
         assert_eq!(state, SshAnalysisState::Cancelled);
         assert_eq!(
-            services[0]
-                .protocol_details
-                .get("ssh_skip_reason")
-                .map(String::as_str),
+            services[0].ssh.as_ref().and_then(indeterminate_reason),
             Some("cancelled")
         );
         fixture.await.unwrap_or_else(|error| panic!("{error}"));
@@ -1284,10 +1296,7 @@ mod tests {
         .await;
         assert_eq!(state, SshAnalysisState::TimedOut);
         assert_eq!(
-            services[0]
-                .protocol_details
-                .get("ssh_skip_reason")
-                .map(String::as_str),
+            services[0].ssh.as_ref().and_then(indeterminate_reason),
             Some("caller deadline exceeded")
         );
         fixture.await.unwrap_or_else(|error| panic!("{error}"));
@@ -1312,6 +1321,7 @@ mod tests {
         .await;
         assert_eq!(state, SshAnalysisState::Completed);
         assert!(services[0].protocol_details.is_empty());
+        assert!(services[0].ssh.is_none());
         assert!(
             timeout(Duration::from_millis(50), listener.accept())
                 .await

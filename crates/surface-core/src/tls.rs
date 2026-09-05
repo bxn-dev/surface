@@ -673,6 +673,7 @@ mod tests {
             confidence: DetectionConfidence::High,
             banner: None,
             protocol_details: BTreeMap::new(),
+            ssh: None,
         }
     }
 

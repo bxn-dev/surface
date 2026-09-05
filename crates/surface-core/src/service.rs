@@ -145,6 +145,81 @@ pub enum DetectionConfidence {
     High,
 }
 
+/// SSH identification observed before key exchange.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshIdentification {
+    /// SSH protocol version from the server identification line.
+    pub protocol: String,
+    /// Sanitized server software identification.
+    pub software: String,
+}
+
+/// Complete client-first SSH algorithm selections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshAlgorithmSelections {
+    /// Key-exchange algorithm.
+    pub kex: String,
+    /// Server host-key algorithm.
+    pub host_key: String,
+    /// Client-to-server cipher.
+    pub cipher_c2s: String,
+    /// Server-to-client cipher.
+    pub cipher_s2c: String,
+    /// Client-to-server message authentication code.
+    pub mac_c2s: String,
+    /// Server-to-client message authentication code.
+    pub mac_s2c: String,
+}
+
+/// Available client-first selections from an incomplete SSH analysis.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialSshAlgorithmSelections {
+    /// Key-exchange algorithm, when selected.
+    pub kex: Option<String>,
+    /// Server host-key algorithm, when selected.
+    pub host_key: Option<String>,
+    /// Client-to-server cipher, when selected.
+    pub cipher_c2s: Option<String>,
+    /// Server-to-client cipher, when selected.
+    pub cipher_s2c: Option<String>,
+    /// Client-to-server message authentication code, when selected.
+    pub mac_c2s: Option<String>,
+    /// Server-to-client message authentication code, when selected.
+    pub mac_s2c: Option<String>,
+}
+
+/// Outcome of bounded SSH posture analysis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SshPostureOutcome {
+    /// Every required algorithm selection was inferred.
+    Complete {
+        /// Complete inferred selections.
+        selections: SshAlgorithmSelections,
+    },
+    /// Some selections were inferred before analysis became incomplete.
+    Partial {
+        /// Selections available before analysis stopped.
+        selections: PartialSshAlgorithmSelections,
+        /// Stable explanation of the incomplete analysis.
+        reason: String,
+    },
+    /// No algorithm selection could be inferred.
+    Indeterminate {
+        /// Stable explanation of the unavailable analysis.
+        reason: String,
+    },
+}
+
+/// Typed SSH protocol evidence for one endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshPosture {
+    /// Server identification, when available.
+    pub identification: Option<SshIdentification>,
+    /// Analysis outcome and inferred selections.
+    pub outcome: SshPostureOutcome,
+}
+
 /// Bounded service evidence for an open socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceObservation {
@@ -161,6 +236,9 @@ pub struct ServiceObservation {
     pub banner: Option<String>,
     /// Small deterministic protocol metadata.
     pub protocol_details: BTreeMap<String, String>,
+    /// Typed SSH posture for SSH services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshPosture>,
 }
 
 /// Probes open ports with bounded concurrency and safe payloads.
@@ -223,6 +301,7 @@ pub async fn detect_services(
                     },
                     banner: None,
                     protocol_details: BTreeMap::new(),
+                    ssh: None,
                 },
             )
         })
@@ -285,6 +364,7 @@ async fn probe_inner(address: SocketAddr, hostname: &str) -> Option<ServiceObser
         confidence,
         banner: (!banner.is_empty()).then_some(banner),
         protocol_details,
+        ssh: None,
     })
 }
 
@@ -329,6 +409,7 @@ fn hint_observation(address: SocketAddr) -> ServiceObservation {
         confidence: DetectionConfidence::Low,
         banner: None,
         protocol_details: BTreeMap::new(),
+        ssh: None,
     }
 }
 
@@ -434,9 +515,55 @@ pub fn sanitize_banner(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DetectionConfidence, ProbeBehavior, ServiceKind, classify_banner, hinted_service,
-        probe_behavior, sanitize_banner, smtp_details,
+        DetectionConfidence, PartialSshAlgorithmSelections, ProbeBehavior, ServiceKind,
+        SshAlgorithmSelections, SshIdentification, SshPosture, SshPostureOutcome, classify_banner,
+        hinted_service, probe_behavior, sanitize_banner, smtp_details,
     };
+
+    #[test]
+    fn ssh_posture_round_trips_complete_partial_and_indeterminate_outcomes() {
+        let identification = SshIdentification {
+            protocol: "2.0".to_owned(),
+            software: "OpenSSH_9.9".to_owned(),
+        };
+        let postures = [
+            SshPosture {
+                identification: Some(identification.clone()),
+                outcome: SshPostureOutcome::Complete {
+                    selections: SshAlgorithmSelections {
+                        kex: "curve25519-sha256".to_owned(),
+                        host_key: "ssh-ed25519".to_owned(),
+                        cipher_c2s: "aes256-ctr".to_owned(),
+                        cipher_s2c: "aes256-ctr".to_owned(),
+                        mac_c2s: "hmac-sha2-512".to_owned(),
+                        mac_s2c: "hmac-sha2-512".to_owned(),
+                    },
+                },
+            },
+            SshPosture {
+                identification: Some(identification),
+                outcome: SshPostureOutcome::Partial {
+                    selections: PartialSshAlgorithmSelections {
+                        kex: Some("curve25519-sha256".to_owned()),
+                        ..PartialSshAlgorithmSelections::default()
+                    },
+                    reason: "no common required algorithm: host_key".to_owned(),
+                },
+            },
+            SshPosture {
+                identification: None,
+                outcome: SshPostureOutcome::Indeterminate {
+                    reason: "identification timed out".to_owned(),
+                },
+            },
+        ];
+
+        for expected in postures {
+            let encoded = serde_json::to_string(&expected).expect("posture serializes");
+            let actual: SshPosture = serde_json::from_str(&encoded).expect("posture deserializes");
+            assert_eq!(actual, expected);
+        }
+    }
 
     #[test]
     fn classifies_protocol_evidence_not_only_ports() {
