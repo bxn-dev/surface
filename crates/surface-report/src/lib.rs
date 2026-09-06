@@ -44,149 +44,6 @@ pub fn render_terminal(report: &ScanReport) -> String {
     let _ = writeln!(output, "Started: {}", report.started_at);
     let _ = writeln!(output, "Status: {:?}\n", report.status);
 
-    if let Some(dns) = &report.dns {
-        let _ = writeln!(output, "DNS");
-        for record in &dns.records {
-            let _ = writeln!(output, "  {record:?}");
-        }
-        for hop in &dns.cname_chain {
-            let _ = writeln!(
-                output,
-                "  CNAME {} → {}",
-                clean_terminal(&hop.from),
-                clean_terminal(&hop.to)
-            );
-        }
-        if dns.dangling_cnames.is_empty() {
-            let _ = writeln!(output, "  CNAME destination indicators: none recorded");
-        } else {
-            let _ = writeln!(output, "  CNAME destination indicators");
-            for observation in &dns.dangling_cnames {
-                let _ = writeln!(
-                    output,
-                    "    {} -> {}: {}",
-                    clean_terminal(&observation.source_alias),
-                    clean_terminal(&observation.canonical_target),
-                    observation.status.as_str()
-                );
-                for evidence in &observation.evidence {
-                    let _ = writeln!(output, "      Evidence: {}", clean_terminal(evidence));
-                }
-                for error in &observation.errors {
-                    let _ = writeln!(output, "      Error: {}", clean_terminal(error));
-                }
-                for limitation in &observation.limitations {
-                    let _ = writeln!(output, "      Limitation: {}", clean_terminal(limitation));
-                }
-            }
-            let _ = writeln!(
-                output,
-                "    Destination addresses were not scanned; ownership, claimability, and takeover feasibility were not tested."
-            );
-        }
-        let _ = writeln!(output, "  SPF records: {}", dns.mail.spf.records.len());
-        let _ = writeln!(output, "  DMARC records: {}", dns.mail.dmarc.len());
-        if let Some(dnssec) = &dns.dnssec {
-            let _ = writeln!(output, "  DNSSEC status: {}", dnssec.status.as_str());
-            for rrset in &dnssec.checked_rrsets {
-                let _ = writeln!(
-                    output,
-                    "    {} {}: {}",
-                    clean_terminal(&rrset.name),
-                    rrset.record_type.as_str(),
-                    rrset.status.as_str()
-                );
-            }
-            for error in &dnssec.errors {
-                let _ = writeln!(output, "    Error: {}", clean_terminal(error));
-            }
-            for limitation in &dnssec.limitations {
-                let _ = writeln!(output, "    Limitation: {}", clean_terminal(limitation));
-            }
-        } else {
-            let _ = writeln!(output, "  DNSSEC status: not recorded (older report)");
-        }
-        if let Some(wildcard) = &dns.wildcard_dns {
-            let answer_types = wildcard
-                .answer_types
-                .iter()
-                .map(|record_type| record_type.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = writeln!(
-                output,
-                "  Wildcard DNS status: {}",
-                wildcard.status.as_str()
-            );
-            let _ = writeln!(
-                output,
-                "    Probes attempted: {}/2  answer types: {}  fingerprints: {}",
-                wildcard.probes_attempted,
-                if answer_types.is_empty() {
-                    "none"
-                } else {
-                    &answer_types
-                },
-                wildcard.answer_fingerprints.len()
-            );
-            for fingerprint in &wildcard.answer_fingerprints {
-                let _ = writeln!(output, "    Fingerprint: {}", clean_terminal(fingerprint));
-            }
-            for error in &wildcard.errors {
-                let _ = writeln!(output, "    Error: {}", clean_terminal(error));
-            }
-            for limitation in &wildcard.limitations {
-                let _ = writeln!(output, "    Limitation: {}", clean_terminal(limitation));
-            }
-            let _ = writeln!(
-                output,
-                "    Probe answers were not scanned or used as downstream targets."
-            );
-        } else {
-            let _ = writeln!(output, "  Wildcard DNS status: not recorded (older report)");
-        }
-        if let Some(axfr) = &dns.authoritative_axfr {
-            let _ = writeln!(
-                output,
-                "  Authoritative AXFR zone: {}",
-                clean_terminal(&axfr.zone)
-            );
-            let _ = writeln!(
-                output,
-                "    NS names={}/{}  IPs/NS<={}  endpoints={}/{}",
-                axfr.nameservers.len(),
-                axfr.limits.nameservers,
-                axfr.limits.ips_per_nameserver,
-                axfr.attempts.len(),
-                axfr.limits.endpoints
-            );
-            for attempt in &axfr.attempts {
-                let _ = writeln!(
-                    output,
-                    "    {}  {}  outcome={}  response={}  messages={}/{}  records={}/{}  bytes={}/{}",
-                    clean_terminal(&attempt.server),
-                    attempt.endpoint,
-                    attempt.outcome.as_str(),
-                    clean_terminal(attempt.response_code.as_deref().unwrap_or("none")),
-                    attempt.messages,
-                    axfr.limits.messages,
-                    attempt.records,
-                    axfr.limits.records,
-                    attempt.bytes,
-                    axfr.limits.bytes
-                );
-                if let Some(error) = &attempt.error {
-                    let _ = writeln!(output, "      Error: {}", clean_terminal(error));
-                }
-            }
-            let _ = writeln!(
-                output,
-                "    Transferred owner names and records were neither retained nor scanned."
-            );
-        }
-        output.push('\n');
-    }
-
     if !report.hosts.is_empty() {
         let _ = writeln!(output, "Hosts");
         for host in &report.hosts {
@@ -368,45 +225,27 @@ pub fn render_terminal(report: &ScanReport) -> String {
         .as_ref()
         .and_then(|intelligence| intelligence.certificate_transparency.as_ref())
     {
-        let _ = writeln!(output, "\nCertificate Transparency candidates");
+        let _ = writeln!(output, "\nVerified subdomains");
         let _ = writeln!(
             output,
-            "  Source: {} · issuances: {} · pages: {} · complete: {}",
+            "  Source: {} · pages: {} · complete: {}",
             clean_terminal(&certificate_transparency.source),
-            certificate_transparency.issuance_count,
             certificate_transparency.pages_fetched,
             certificate_transparency.complete
         );
         let _ = writeln!(
             output,
-            "  Non-wildcard names received only a bounded passive DNS address lookup; they were not actively scanned."
+            "  DNS verification is passive only; these names were not actively scanned."
         );
-        for (status, label) in CT_DNS_GROUPS {
-            let mut group = certificate_transparency
-                .candidates
-                .iter()
-                .filter(|candidate| candidate.dns_status == status)
-                .peekable();
-            if group.peek().is_none() {
-                continue;
-            }
-            let _ = writeln!(output, "  {label}");
-            for candidate in group {
-                let _ = writeln!(
-                    output,
-                    "    {:<8} {}  issuances={}",
-                    if candidate.wildcard {
-                        "wildcard"
-                    } else {
-                        "name"
-                    },
-                    clean_terminal(&candidate.name),
-                    candidate.issuance_count
-                );
-            }
-        }
-        for error in &certificate_transparency.errors {
-            let _ = writeln!(output, "  Limitation: {}", clean_terminal(error));
+        for candidate in certificate_transparency
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                !candidate.wildcard
+                    && candidate.dns_status == CertificateTransparencyDnsStatus::Resolved
+            })
+        {
+            let _ = writeln!(output, "  {}", clean_terminal(&candidate.name));
         }
     }
 
@@ -415,29 +254,8 @@ pub fn render_terminal(report: &ScanReport) -> String {
         .as_ref()
         .and_then(|intelligence| intelligence.related_domains.as_ref())
     {
-        let _ = writeln!(output, "\nRelated domain candidates");
-        let _ = writeln!(
-            output,
-            "  Nameservers: {}",
-            clean_terminal(&related.nameservers.join(", "))
-        );
         if let Some(provider) = &related.provider {
-            let _ = writeln!(output, "  Provider: {}", clean_terminal(provider));
-        }
-        let _ = writeln!(
-            output,
-            "  Shared DNS infrastructure does not prove common ownership."
-        );
-        for candidate in &related.candidates {
-            let _ = writeln!(
-                output,
-                "  {:<8} {}",
-                clean_terminal(&candidate.confidence.to_uppercase()),
-                clean_terminal(&candidate.name)
-            );
-        }
-        for error in &related.errors {
-            let _ = writeln!(output, "  Error: {}", clean_terminal(error));
+            let _ = writeln!(output, "\nProvider: {}", clean_terminal(provider));
         }
     }
 
@@ -1417,11 +1235,6 @@ mod tests {
         }));
         assert!(
             terminal
-                .lines()
-                .any(|line| line == "  MÉ [31M BAD   café.example")
-        );
-        assert!(
-            terminal
                 .chars()
                 .all(|character| character == '\n' || !character.is_control())
         );
@@ -1666,6 +1479,12 @@ mod tests {
                         issuance_count: 1,
                         dns_status: CertificateTransparencyDnsStatus::NxDomain,
                     },
+                    CertificateTransparencyCandidate {
+                        name: "wildcard.example.com".to_owned(),
+                        wildcard: true,
+                        issuance_count: 1,
+                        dns_status: CertificateTransparencyDnsStatus::Resolved,
+                    },
                 ],
                 issuance_count: 2,
                 pages_fetched: 1,
@@ -1678,8 +1497,15 @@ mod tests {
         let terminal = render_terminal(&report);
         let html = render_html(&report);
 
-        assert!(terminal.contains("Currently resolved"));
-        assert!(terminal.contains("Historical certificate names"));
+        assert!(terminal.contains("Verified subdomains"));
+        assert!(
+            terminal.contains(
+                "DNS verification is passive only; these names were not actively scanned."
+            )
+        );
+        assert!(terminal.contains("<api.example.com>"));
+        assert!(!terminal.contains("old.example.com"));
+        assert!(!terminal.contains("wildcard.example.com"));
         assert!(html.contains("&lt;api.example.com&gt;"));
         assert!(html.contains("Currently resolved"));
         assert!(html.contains("Historical certificate names"));
@@ -1804,22 +1630,14 @@ mod tests {
         );
 
         let terminal = render_terminal(&report);
-        assert!(terminal.contains("DNSSEC status: indeterminate"));
-        assert!(terminal.contains("<example.com> A: indeterminate"));
-        assert!(terminal.contains("<alias.example.com> -> <missing.example.net>: nxdomain"));
-        assert!(terminal.contains("takeover feasibility were not tested"));
-        assert!(terminal.contains("NS names=1/4  IPs/NS<=2  endpoints=1/8"));
-        assert!(terminal.contains("outcome=refused"));
-        assert!(terminal.contains("messages=1/64"));
-        assert!(terminal.contains("records=0/4096"));
-        assert!(terminal.contains("bytes=48/2097152"));
-        assert!(terminal.contains("neither retained nor scanned"));
-        assert!(terminal.contains("Wildcard DNS status: detected"));
-        assert!(terminal.contains("Probes attempted: 2/2"));
-        assert!(terminal.contains("answer types: A, CNAME"));
-        assert!(terminal.contains("fingerprints: 1"));
-        assert!(terminal.contains("Probe answers were not scanned"));
-        assert!(terminal.contains("dnssec_validation"));
+        assert!(terminal.contains("Findings"));
+        assert!(!terminal.contains("DNSSEC"));
+        assert!(!terminal.contains("AXFR"));
+        assert!(!terminal.contains("Wildcard DNS status"));
+        assert!(!terminal.contains("SPF records"));
+        assert!(!terminal.contains("DMARC records"));
+        assert!(!terminal.contains("<example.com> A: indeterminate"));
+        assert!(!terminal.contains("<alias.example.com> -> <missing.example.net>"));
 
         let json = render_json(&report).unwrap_or_else(|error| panic!("{error}"));
         assert!(json.contains("\"status\": \"indeterminate\""));
