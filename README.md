@@ -1,150 +1,286 @@
 # Surface
 
-Surface is an asynchronous command-line scanner that analyzes externally observable services and security-related configuration for a domain, hostname, HTTP(S) URL, or IP address.
+Surface is an asynchronous command-line scanner for the externally observable
+services and security-related configuration of a domain, hostname, HTTP(S)
+URL, or IP address.
 
-Surface is **not** a complete vulnerability scanner, penetration-testing framework, security certification, or proof that a target is secure.
+It is a bounded exposure-assessment tool—not a complete vulnerability scanner,
+penetration-testing framework, security certification, or proof that a target
+is secure.
 
-> [!IMPORTANT]
+> [!WARNING]
 > Use Surface only on systems you own or are explicitly authorized to assess.
 
-## Example
+## Quick start
 
-```text
-Surface 0.3.0
-Target: example.com
-Status: Completed
-
-Hosts
-  203.0.113.10
-    80/tcp  open  Http
-    443/tcp  open  Https
-    465/tcp  open  SMTPS
-    51820/udp open|filtered Wireguard
-
-Findings
-  MEDIUM   HSTS header missing — example.com
-  INFO     security.txt not found — example.com
-```
-
-Example addresses are documentation-only; tests and CI never scan public infrastructure.
-
-## Features
-
-- IDNA-aware domain, URL, IPv4, and IPv6 normalization
-- A, AAAA, CNAME, NS, MX, TXT, and CAA observations
-- conservative dangling-CNAME indicators for at most 16 directly observed primary-chain destinations, without destination scanning or takeover claims
-- conservative wildcard-DNS detection with exactly two UUID-v4 child probes, hashed answer summaries, and no probe-name retention or downstream scanning
-- exact-zone authoritative TCP AXFR checks with bounded counts and no transferred-name retention or scanning
-- conservative SPF, DMARC, MTA-STS, and TLS-RPT interpretation
-- bounded Tokio TCP connect and UDP response scanning across selectable or complete port ranges
-- graceful Ctrl+C cancellation with partial reports
-- centralized bounded probes and curated service hints for web, mail, databases, VPNs, infrastructure, and game servers
-- bounded SSH identification and one KEXINIT intersection for already identified SSH services, reported as inferred before key exchange with no authentication, host-key retrieval, commands, or banner-based CVE inference
-- bounded HTTP redirects/bodies, selected headers, cookie flags, title and well-known files
-- one validating Rustls handshake per deduplicated implicit-TLS endpoint, with negotiated cipher and bounded chain/SAN, leaf SHA-256, and key evidence retained even when the unchanged verifier rejects a presented certificate
-- evidence-backed findings separated from raw observations
-- deterministic terminal, versioned JSON, self-contained escaped HTML, SARIF 2.1.0, and CycloneDX 1.6 reports
-- deterministic file/history diffs and versioned exposure scoring
-- resolver-returned CNAME-chain reporting with deduplicated scanning of resolved target addresses
-- live stage progress on stderr and complete self-contained HTML reports
-- default bounded CertSpotter Certificate Transparency discovery with passive current/historical DNS classification, supplied passive subdomain/DKIM observations, optional exact-pair reverse-NS correlation, and offline network/CVE correlation
-- detached Ed25519 report signatures and verified SQLite backup/restore
-
-No raw packets, stealth, brute force, exploitation, crawling, directory enumeration, authentication, rate-limit bypass, or unrelated-host discovery is implemented.
-
-## Installation
+Surface requires Rust 1.85 or newer.
 
 ```bash
 git clone https://github.com/bxn-dev/surface.git surface-rs
 cd surface-rs
-cargo build --release
-./target/release/surface version
+cargo install --path crates/surface-cli
+surface version
+surface scan 127.0.0.1
 ```
 
-## Usage
+The examples below use the loopback address, so they do not probe public
+infrastructure. Replace it only with a system you own or are authorized to
+assess. A typical scan uses the `common` TCP and UDP port presets:
 
 ```bash
-surface scan example.com
-surface scan example.com --only dns,http,tls
-surface scan https://example.com/path --ports 80,443,8000-8100
+surface scan 127.0.0.1 --only dns,http,tls
+surface scan http://127.0.0.1/path --ports 80,443,8000-8100
 surface scan 127.0.0.1 --ports 1-1000 --udp-ports 1-1000 --global-timeout 30s
-surface scan 127.0.0.1 --ports all --udp-ports all --concurrency 512 --global-timeout 120m
-surface scan example.com --format json --output report.json
-surface scan example.com --format html --output report.html
-surface scan example.com --format sarif --output report.sarif.json
+```
+
+## Preview
+
+> [!NOTE]
+> Future screenshots will be added here.
+
+![Terminal scan report](docs/assets/screenshots/terminal-report.png)
+
+![HTML scan report](docs/assets/screenshots/html-report.png)
+
+## Features
+
+- IDNA-aware normalization of domains, hostnames, HTTP(S) URLs, IPv4, and IPv6.
+- DNS, mail-policy, DNSSEC, wildcard-DNS, dangling-CNAME, and bounded
+  authoritative AXFR observations.
+- Bounded TCP connect and UDP response scanning with selectable or complete
+  port ranges and centralized service probes.
+- Read-only HTTP analysis of same-origin, address-pinned endpoints, including
+  selected headers, cookies, metadata, redirects, bodies, and well-known files.
+- One normal validating TLS handshake per applicable implicit-TLS endpoint,
+  with bounded certificate evidence.
+- Bounded SSH identification and one KEXINIT exchange for already
+  identified SSH services; no authentication or completed key exchange.
+- Passive Certificate Transparency, supplied subdomain and DKIM observations,
+  administrative RDAP evidence, RIPE RIS route evidence, and offline
+  network/CVE correlations.
+- Evidence-backed findings kept separate from raw observations, deterministic
+  exposure scoring, and semantic report diffs.
+- Terminal, versioned JSON, self-contained HTML, SARIF 2.1.0, and CycloneDX 1.6
+  output, plus detached Ed25519 signatures.
+- Optional immutable SQLite history with retention, audit events, and verified
+  backup and restore.
+
+Surface does not implement raw packets, stealth, evasion, brute force,
+exploitation, crawling, directory enumeration, authentication, rate-limit
+bypass, or unrelated-host discovery.
+
+## Scanning
+
+By default, Surface runs every applicable built-in check. `--only` restricts a
+scan to selected groups; values are repeatable or comma-separated:
+`dns`, `ports`, `services`, `http`, `tls`, and `intelligence`. Required
+prerequisites are added automatically.
+
+Useful scan options:
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `--ports` | `common`, `top-100`, `all`, comma-separated ports, or ranges | `common` |
+| `--udp-ports` | `common`, `top-100`, `all`, comma-separated ports, or ranges | `common` |
+| `--concurrency` | Maximum simultaneous network probes (`1`–`4096`) | `64` |
+| `--connect-timeout` | Per-connection timeout, such as `1500ms` or `2s` | `1500ms` |
+| `--request-timeout` | Per-request timeout | `5s` |
+| `--global-timeout` | Whole-scan timeout | `5m` |
+| `--format` | `terminal`, `json`, `html`, `sarif`, or `cyclonedx-json` | `terminal` |
+| `--output` | Write the selected report to a file instead of stdout | — |
+| `--ipv4-only` / `--ipv6-only` | Restrict future address discovery | — |
+| `--quiet` / `--verbose` | Suppress diagnostics / enable later-phase debug logging | — |
+
+`common` and `top-100` are supported names for the built-in preset for each
+transport; they currently select the same bounded list.
+
+Each active stage has bounded input, concurrency, timeouts, a shared deadline,
+and cancellation support. Press `Ctrl+C` to stop a scan while preserving useful
+partial observations.
+
+UDP silence is reported as `open|filtered`, never definitively open. Port-based
+service names are low-confidence hints until protocol evidence confirms them.
+
+### Output behavior
+
+Without `--output`, Surface prints the selected format to stdout. It also
+writes a complete, self-contained HTML report to
+`surface-<SCAN_ID>.html` in the current directory. Progress is shown on stderr
+only when it is enabled and stderr is a terminal; `--quiet` disables it.
+`RUST_LOG` can override the default log filter.
+
+## Report formats and diffs
+
+| Format | Use |
+| --- | --- |
+| `terminal` | Concise observations, open ports, findings, and counts |
+| `json` | Complete transport-aware observations, findings, errors, and score; schema `0.4.0` |
+| `html` | Self-contained, escaped, print-friendly report with no remote assets or scripts |
+| `sarif` | SARIF 2.1.0 finding projection for code-scanning integrations |
+| `cyclonedx-json` | CycloneDX 1.6 observed-service inventory and vulnerability projection |
+
+SARIF and CycloneDX are intentionally lossy projections. Use Surface JSON when
+complete observations and errors are required.
+
+```bash
+surface scan 127.0.0.1 --format json --output report.json
+surface scan 127.0.0.1 --format html --output report.html
+surface scan 127.0.0.1 --format sarif --output report.sarif.json
+surface scan 127.0.0.1 --format cyclonedx-json --output report.cdx.json
+
+surface scan 127.0.0.1 --format json --output old.json
+surface scan 127.0.0.1 --format json --output new.json
 surface diff old.json new.json --format html --output diff.html
 surface diff <OLD_SCAN_ID> <NEW_SCAN_ID> --database ./surface.db
+```
+
+`surface diff` compares report files or two persisted scan IDs. File inputs are
+Surface JSON reports; diff output can be `terminal`, `json`, or `html`.
+
+With an existing local report and 32-byte hexadecimal Ed25519 keys:
+
+```bash
+surface report sign report.json --key private-key.hex --signature report.sig.json
+surface report verify report.json --signature report.sig.json --public-key public-key.hex
+```
+
+## Persistence and recovery
+
+SQLite persistence is opt-in. A normal one-shot scan does not open or require a
+database. Supply both `--persist` and `--database PATH` to store the complete
+immutable report:
+
+```bash
 surface scan 127.0.0.1 --persist --database ./surface.db
 surface history list --database ./surface.db
 surface history show <SCAN_ID> --database ./surface.db
 surface history prune --database ./surface.db --older-than 180d --dry-run
-surface scan example.com --subdomain www.example.com --dkim-selector selector1 --intelligence-bundle intelligence.json
-SURFACE_CERTSPOTTER_API_KEY='…' surface scan example.com # optional higher API allowance
-SURFACE_WHOISXML_API_KEY='…' surface scan example.com   # enables reverse-NS correlation
-surface report sign report.json --key private-key.hex --signature report.sig.json
-surface report verify report.json --signature report.sig.json --public-key public-key.hex
-surface database backup --database ./surface.db --output ./surface.backup.db
-surface database verify --database ./surface.backup.db
-surface completion bash > surface.bash
 ```
 
-Defaults: `--ports common`, `--udp-ports common`, `--concurrency 64`, `--connect-timeout 1500ms`, `--request-timeout 5s`, `--global-timeout 5m`.
+Replace the scan-ID placeholders with values from `history list`.
+History also supports `delete`, retention by `--keep-last`, age-based
+`--older-than`, `--preserve-high`, and `--dry-run`. Reports retain their
+original schema version. Deletions record audit events, and foreign-key
+dependent metadata is removed with the scan.
 
-UDP silence is reported as `open|filtered`, never as definitively open. Port-based service names are low-confidence hints until a protocol response confirms them.
+Back up, verify, and restore a database with the recovery commands:
 
-A scan runs every applicable built-in check by default. `--only dns,http,tls` restricts work; prerequisites are added automatically. Interactive progress uses an `indicatif` spinner on stderr. Without `--output`, Surface prints the selected format and also writes `surface-<SCAN_ID>.html`; progress is hidden with `--quiet` or when stderr is not a terminal. `RUST_LOG` overrides the default log filter. SQLite persistence is optional: ordinary one-shot scans do not open or require a database.
+```bash
+surface database backup --database ./surface.db --output ./surface.backup.db
+surface database verify --database ./surface.backup.db
+surface database restore --database ./surface.db --input ./surface.backup.db
+```
 
-## Reports
+Backups are integrity-checked and published atomically. Close processes using a
+database before restoring it.
 
-- **terminal** — concise observations, open ports, findings, and counts
-- **json** — schema `0.4.0`, complete transport-aware observations/findings/errors/score
-- **html** — responsive, print-friendly, self-contained, no remote assets or scripts
-- **sarif** — SARIF 2.1.0 findings for code-scanning integrations
-- **cyclonedx-json** — CycloneDX 1.6 observed-service inventory and vulnerabilities
+## Optional intelligence inputs
 
-See [`docs/report-schema.md`](docs/report-schema.md) and [`docs/scoring.md`](docs/scoring.md).
+The full scan includes bounded passive intelligence where applicable. Operators
+can add explicitly supplied observations or an offline bundle:
+
+The example uses the reserved `.test` domain as a placeholder; use an
+authorized hostname for an actual intelligence run.
+
+```bash
+surface scan example.test \
+  --subdomain child.example.test \
+  --dkim-selector selector1 \
+  --intelligence-bundle intelligence.json
+```
+
+`SURFACE_CERTSPOTTER_API_KEY` is optional and can provide a higher CertSpotter
+API allowance. `SURFACE_WHOISXML_API_KEY` enables exact nameserver-pair reverse-
+NS correlation. Passive intelligence sends the target hostname to the
+configured third-party provider. Returned passive addresses and related names
+do not become active scan targets.
+
+## Exposure score
+
+Reports use deterministic score model `1.0` on a `0–100` scale. The score starts
+at 100 and deducts once for each unique finding rule ID and target:
+
+| Severity | Deduction |
+| --- | ---: |
+| Informational | 0 |
+| Low | 2 |
+| Medium | 7 |
+| High | 20 |
+| Critical | 35 |
+
+The result is clamped to `0–100` and classified as `Favorable` (85–100),
+`Review` (65–84), `Elevated` (35–64), or `Critical` (0–34). A score is not
+CVSS, a compromise probability, certification, or proof of security. Score
+completeness is independent of the numeric value: partial, interrupted,
+failed, and not-started scans are incomplete, and missing observations do not
+create deductions.
+
+## Safety boundaries and limitations
+
+> [!IMPORTANT]
+> Active targets are limited to explicit IPs and resolver-returned A/AAAA
+> addresses for the primary target. Resolver-observed CNAME edges may be
+> reported and already-resolved addresses may be deduplicated, but MX, NS, TXT,
+> redirects, page links, Certificate Transparency names, prefixes, and related
+> domains never expand the active target set.
+
+> [!CAUTION]
+> A clean report or a score of 100 does not prove that a target is secure.
+> Timeouts, uncertain service identification, CDN/reverse-proxy edges, and
+> application-context-dependent header recommendations require operator review.
+
+Important limits include:
+
+- DNSSEC uses local Hickory validation over selected primary-host A/AAAA
+  RRsets. Only cryptographic `Proof::Bogus` produces the high-severity DNSSEC
+  finding; resolver limitations and inconclusive results remain indeterminate.
+- Dangling-CNAME checks query selected A/AAAA records for at most 16 directly
+  observed primary-chain destinations. Only conclusive NXDOMAIN produces a
+  potential indicator; ownership, claimability, and takeover feasibility are
+  not tested.
+- Wildcard-DNS detection uses exactly two UUID-v4 child probes. Probe names and
+  raw answers are not retained or scanned, and detection is contextual routing
+  evidence rather than automatically a vulnerability.
+- AXFR is attempted only when primary-host SOA evidence and exact-owner NS
+  records establish one unambiguous zone. Transferred names and records are
+  never retained or scanned.
+- SSH selections are inferred from one bounded KEXINIT exchange before
+  completed key exchange. Surface performs no host-key retrieval,
+  authentication, channels, commands, or banner-based CVE inference.
+- TLS performs one normal validating handshake for each applicable implicit-TLS
+  endpoint. Certificate evidence is bounded; rejected certificates remain
+  rejected, and no broad cipher-weakness finding is inferred.
+- Offline CVE matches require exact recognized product/version evidence and are
+  candidates, not confirmed exploitable vulnerabilities. Surface does not
+  provide complete vulnerability coverage.
+
+See [`docs/limitations.md`](docs/limitations.md) for the full limitations and
+evidence rules.
 
 ## Exit codes
 
 | Code | Meaning |
-| --- | --- |
-| 0 | Report produced without high-severity findings |
-| 1 | Invalid CLI usage, target, or configuration |
-| 2 | Report produced with high-severity findings |
-| 3 | Scan/output failed without a meaningful report |
+| ---: | --- |
+| `0` | Command succeeded; a completed scan has no High or Critical findings |
+| `1` | Invalid CLI usage, target, or configuration |
+| `2` | Scan completed with a High or Critical finding |
+| `3` | Scan is incomplete/interrupted, or a scan/report/database/output operation failed; inspect any report that was written |
 
-## Architecture
+Help and version output also exit with `0`.
 
-```mermaid
-flowchart TD
-    A[Target Input] --> B[Target Normalization]
-    B --> C[DNS Analysis]
-    C --> D[IP Discovery]
-    D --> E[TCP Connect Scanner]
-    E --> F[Service Probes]
-    F --> G[HTTP Analysis]
-    F --> H[TLS Analysis]
-    F --> S[SSH Identification and KEXINIT Analysis]
-    C --> I[Mail Configuration Analysis]
-    G --> J[Finding Engine]
-    H --> J
-    S --> J
-    I --> J
-    J --> K[Scan Report]
-    K --> L[Terminal]
-    K --> M[JSON]
-    K --> N[HTML]
-```
+## Project documentation
 
-`surface-core` owns observations and orchestration, `surface-report` owns presentation and signing, `surface-storage` owns local SQLite history and recovery, and `surface-cli` owns process behavior. See [`docs/architecture.md`](docs/architecture.md) and [`docs/database-schema.md`](docs/database-schema.md).
+- [`docs/architecture.md`](docs/architecture.md) — crate responsibilities,
+  data flow, and active/passive boundaries.
+- [`docs/report-schema.md`](docs/report-schema.md) — JSON fields, schema
+  compatibility, and integration projections.
+- [`docs/scoring.md`](docs/scoring.md) — score calculation and completeness.
+- [`docs/database-schema.md`](docs/database-schema.md) — SQLite migrations,
+  history, retention, audit, backup, and restore behavior.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — development standards and required
+  checks.
 
-## Limitations
-
-TCP timeouts do not prove filtering. Service identification can be uncertain. SSH selections are inferred from one bounded KEXINIT exchange and are not completed negotiation; Surface performs no SSH key exchange, authentication, host-key retrieval, commands, or banner-based CVE inference. TLS uses one certificate-validating handshake per applicable implicit-TLS candidate; bounded presented-certificate evidence may remain visible after rejection, but validation stays failed and trust or hostname status stays unknown unless independently established. Certificate inspection is capped at 16 peer certificates, 1 MiB cumulative DER, and 128 normalized SAN entries, and no DER is retained. CDN/reverse-proxy observations may describe edge infrastructure. Header requirements depend on application context. DNSSEC uses Hickory local validation with built-in trust anchors for selected primary-host A/AAAA RRsets. System or upstream resolver limitations can make validation indeterminate; only cryptographic `Proof::Bogus` produces the high-severity DNSSEC finding. Dangling-CNAME checks query selected A/AAAA only for at most 16 resolver-observed primary-chain destinations; only conclusive NXDOMAIN produces a potential indicator, and ownership, claimability, and takeover feasibility are not tested. Destination answers are never scanned or propagated. Wildcard DNS detection compares selected A/AAAA and CNAME answers for exactly two random child names; mixed, rotating, incomplete, or errored answers remain indeterminate, and detection is contextual rather than automatically a vulnerability. Probe names and answers are never retained or scanned. AXFR runs only when primary-host SOA evidence and exact-owner NS records establish one zone; it retains bounded counts, never transferred owner names or records. DKIM is not inferred without selectors. No active exploitation or complete vulnerability coverage is provided. A clean report does not prove security.
-
-See [`docs/limitations.md`](docs/limitations.md).
-
-## Development
+## Development verification
 
 ```bash
 cargo fmt --all --check
@@ -155,12 +291,5 @@ cargo deny check
 cargo build --release
 ```
 
-Tests bind only local fixture servers and do not require public internet access. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
-
-## Roadmap
-
-Phases 0–12 are complete. Future work remains additive and will not introduce offensive scanning features.
-
-## License
-
-MIT — see [`LICENSE`](LICENSE).
+Keep changes within Surface's authorized defensive scope. CI must never scan
+external hosts; use deterministic local fixture servers and bounded test data.
