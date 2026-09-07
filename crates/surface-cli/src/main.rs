@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use clap_complete::Shell;
-use indicatif::{ProgressBar, ProgressDrawTarget};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use surface_core::{
     IntelligenceObservation, ScanConfiguration, ScanProgress, ScanReport, ScanSelection, ScanStage,
     ScanStatus, Severity, SkippedCheck, analyze_bgp_routes, analyze_certificate_transparency,
@@ -1151,13 +1151,18 @@ fn record_intelligence_skips(
     }
 }
 
+fn progress_visible(quiet: bool, stderr_is_terminal: bool) -> bool {
+    !quiet && stderr_is_terminal
+}
+
 fn progress_bar(quiet: bool) -> ProgressBar {
-    let draw_target = if !quiet && io::stderr().is_terminal() {
+    let draw_target = if progress_visible(quiet, io::stderr().is_terminal()) {
         ProgressDrawTarget::stderr_with_hz(15)
     } else {
         ProgressDrawTarget::hidden()
     };
     let progress = ProgressBar::with_draw_target(None, draw_target);
+    progress.set_style(ProgressStyle::default_spinner());
     progress.enable_steady_tick(Duration::from_millis(100));
     progress
 }
@@ -1220,15 +1225,87 @@ fn duration_millis(duration: Duration) -> Result<u64, AppError> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use clap::Parser;
+    use indicatif::{ProgressDrawTarget, TermLike};
 
     use super::{
         Cli, Command, EXIT_INVALID_INPUT, EXIT_SCAN_FAILED, ScanPart, mark_intelligence_partial,
         mark_intelligence_source_error, mark_intelligence_stopped, parse_duration,
-        parse_retention_duration, refresh_exposure_score, report_exit_error, run,
+        parse_retention_duration, progress_bar, progress_visible, refresh_exposure_score,
+        report_exit_error, run,
     };
+
+    #[derive(Debug)]
+    struct CaptureTerminal(Arc<Mutex<String>>);
+
+    impl TermLike for CaptureTerminal {
+        fn width(&self) -> u16 {
+            80
+        }
+
+        fn move_cursor_up(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_down(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_right(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_left(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn write_line(&self, value: &str) -> io::Result<()> {
+            self.0.lock().unwrap().push_str(value);
+            Ok(())
+        }
+
+        fn write_str(&self, value: &str) -> io::Result<()> {
+            self.0.lock().unwrap().push_str(value);
+            Ok(())
+        }
+
+        fn clear_line(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn phase_spinner_renders_message_without_length_denominator() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let progress = progress_bar(true);
+        progress.set_draw_target(ProgressDrawTarget::term_like_with_hz(
+            Box::new(CaptureTerminal(Arc::clone(&output))),
+            15,
+        ));
+        progress.set_message("DNS phase");
+        progress.force_draw();
+        progress.disable_steady_tick();
+
+        let rendered = output.lock().unwrap();
+        assert!(rendered.contains("DNS phase"));
+        assert!(!rendered.contains("0/0"));
+        assert!(progress.length().is_none());
+    }
+
+    #[test]
+    fn progress_visibility_policy_handles_quiet_and_terminal_modes() {
+        assert!(!progress_visible(true, true));
+        assert!(!progress_visible(false, false));
+        assert!(progress_visible(false, true));
+    }
 
     #[test]
     fn parses_phase_one_scan_options() {

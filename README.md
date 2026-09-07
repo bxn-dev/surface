@@ -106,7 +106,8 @@ service names are low-confidence hints until protocol evidence confirms them.
 Without `--output`, Surface prints the selected format to stdout. It also
 writes a complete, self-contained HTML report to
 `surface-<SCAN_ID>.html` in the current directory. Progress is shown on stderr
-only when it is enabled and stderr is a terminal; `--quiet` disables it.
+as an indeterminate phase spinner only when stderr is a terminal; totals are
+intentionally not shown, and `--quiet` disables it.
 `RUST_LOG` can override the default log filter.
 
 ## Report formats and diffs
