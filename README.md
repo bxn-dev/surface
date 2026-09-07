@@ -86,8 +86,7 @@ Useful scan options:
 | `--connect-timeout` | Per-connection timeout, such as `1500ms` or `2s` | `1500ms` |
 | `--request-timeout` | Per-request timeout | `5s` |
 | `--global-timeout` | Whole-scan timeout | `5m` |
-| `--format` | `terminal`, `json`, `html`, `sarif`, or `cyclonedx-json` | `terminal` |
-| `--output` | Write the selected report to a file instead of stdout | — |
+| `-o`, `--output` | Repeatable output path; format is inferred from its extension | — |
 | `--ipv4-only` / `--ipv6-only` | Restrict future address discovery | — |
 | `--quiet` / `--verbose` | Suppress diagnostics / enable later-phase debug logging | — |
 
@@ -103,11 +102,14 @@ service names are low-confidence hints until protocol evidence confirms them.
 
 ### Output behavior
 
-Without `--output`, Surface prints the selected format to stdout. It also
-writes a complete, self-contained HTML report to
-`surface-<SCAN_ID>.html` in the current directory. Progress is shown on stderr
-as an indeterminate phase spinner only when stderr is a terminal; totals are
-intentionally not shown, and `--quiet` disables it.
+Surface always prints the concise terminal report to stdout. Each `-o`/`--output`
+path additionally receives its inferred report. With no explicit output, Surface
+also writes a complete, self-contained HTML report using the local date:
+`<safe-host-or-ip>-YYYY-MM-DD.html` for scans, `diff-YYYY-MM-DD.html` for diffs,
+and `scan-<SCAN_ID>-YYYY-MM-DD.html` for history. Existing names receive a
+`-2`, `-3`, and so on suffix. Progress is shown on stderr as an indeterminate
+phase spinner only when stderr is a terminal; totals are intentionally not
+shown, and `--quiet` disables it.
 `RUST_LOG` can override the default log filter.
 
 ## Report formats and diffs
@@ -123,20 +125,27 @@ intentionally not shown, and `--quiet` disables it.
 SARIF and CycloneDX are intentionally lossy projections. Use Surface JSON when
 complete observations and errors are required.
 
-```bash
-surface scan 127.0.0.1 --format json --output report.json
-surface scan 127.0.0.1 --format html --output report.html
-surface scan 127.0.0.1 --format sarif --output report.sarif.json
-surface scan 127.0.0.1 --format cyclonedx-json --output report.cdx.json
+Output extensions are case-insensitive: `.html`/`.htm` selects HTML, `.json`
+selects complete Surface JSON, `.sarif`/`.sarif.json` selects SARIF, and
+`.cdx.json`, `.cyclonedx.json`, or `.cyclonedx` selects CycloneDX. A path with
+no extension gets `.html` appended. An unrecognized extension writes HTML to
+the requested path and emits a concise warning. `diff` supports only HTML and
+JSON files; SARIF and CycloneDX output paths are rejected.
 
-surface scan 127.0.0.1 --format json --output old.json
-surface scan 127.0.0.1 --format json --output new.json
-surface diff old.json new.json --format html --output diff.html
+```bash
+surface scan 127.0.0.1 -o report.json -o report.html
+surface scan 127.0.0.1 -o report.sarif.json -o report.cdx.json
+
+surface scan 127.0.0.1 -o old.json
+surface scan 127.0.0.1 -o new.json
+surface diff old.json new.json -o diff.html
 surface diff <OLD_SCAN_ID> <NEW_SCAN_ID> --database ./surface.db
+surface history show <SCAN_ID> --database ./surface.db -o show.json
 ```
 
 `surface diff` compares report files or two persisted scan IDs. File inputs are
-Surface JSON reports; diff output can be `terminal`, `json`, or `html`.
+Surface JSON reports. Its terminal diff is always printed to stdout, while
+explicit `.json` or `.html` paths receive additional diff output.
 
 With an existing local report and 32-byte hexadecimal Ed25519 keys:
 

@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ use surface_report::{
 use surface_storage::{
     HistoryFilter, RetentionPolicy, Storage, backup_database, restore_database, verify_database,
 };
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -99,12 +100,9 @@ struct ScanArgs {
     /// Whole-scan timeout, such as 5m.
     #[arg(long, default_value = "5m", value_parser = parse_duration)]
     global_timeout: Duration,
-    /// Report format.
-    #[arg(long, value_enum, default_value_t = ReportFormat::Terminal)]
-    format: ReportFormat,
-    /// Writes the report to a file instead of stdout.
-    #[arg(long)]
-    output: Option<PathBuf>,
+    /// Writes additional reports; format is inferred from each filename.
+    #[arg(short = 'o', long)]
+    output: Vec<PathBuf>,
     /// Enables diagnostic logging in later scanning phases.
     #[arg(long, conflicts_with = "quiet")]
     verbose: bool,
@@ -146,12 +144,9 @@ struct DiffArgs {
     /// Loads both arguments as scan identifiers from this `SQLite` database.
     #[arg(long)]
     database: Option<PathBuf>,
-    /// Diff output format.
-    #[arg(long, value_enum, default_value_t = DiffFormat::Terminal)]
-    format: DiffFormat,
-    /// Writes the diff to a file instead of stdout.
-    #[arg(long)]
-    output: Option<PathBuf>,
+    /// Writes additional diffs; format is inferred from each filename.
+    #[arg(short = 'o', long)]
+    output: Vec<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -236,9 +231,9 @@ enum HistoryCommand {
         /// `SQLite` database path.
         #[arg(long)]
         database: PathBuf,
-        /// Report format.
-        #[arg(long, value_enum, default_value_t = ReportFormat::Json)]
-        format: ReportFormat,
+        /// Writes additional reports; format is inferred from each filename.
+        #[arg(short = 'o', long)]
+        output: Vec<PathBuf>,
     },
     /// Deletes one persisted report and dependent metadata.
     Delete {
@@ -299,20 +294,12 @@ enum ScanPart {
     Intelligence,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReportFormat {
-    Terminal,
     Json,
     Html,
     Sarif,
     CyclonedxJson,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum DiffFormat {
-    Terminal,
-    Json,
-    Html,
 }
 
 #[derive(Debug)]
@@ -366,7 +353,7 @@ async fn run(command: Command) -> Result<(), AppError> {
     match command {
         Command::Scan(arguments) => run_scan_command(arguments).await,
         Command::Diff(arguments) => run_diff_command(arguments).await,
-        Command::History { command } => run_history_command(command),
+        Command::History { command } => run_history_command(command).await,
         Command::Report { command } => run_report_command(command).await,
         Command::Database { command } => run_database_command(command),
         Command::Version => {
@@ -385,6 +372,7 @@ async fn run(command: Command) -> Result<(), AppError> {
     reason = "linear CLI orchestration preserves cancellation, intelligence, and output ordering"
 )]
 async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
+    let output_specs = build_output_specs(&arguments.output, OutputCommand::Scan)?;
     let scan_deadline = tokio::time::Instant::now() + arguments.global_timeout;
     let target = normalize_target(&arguments.target)
         .map_err(|error| AppError::new(error.to_string(), EXIT_INVALID_INPUT))?;
@@ -682,28 +670,30 @@ async fn run_scan_command(arguments: ScanArgs) -> Result<(), AppError> {
         finding_count = report.findings.len(),
         "scan completed"
     );
-    let rendered = render_report(&report, arguments.format)?;
-
-    if let Some(path) = arguments.output {
-        tokio::fs::write(&path, rendered).await.map_err(|error| {
-            AppError::new(
-                format!("could not write '{}': {error}", path.display()),
-                EXIT_SCAN_FAILED,
-            )
-        })?;
+    let rendered_outputs = output_specs
+        .iter()
+        .map(|output| render_report(&report, output.format))
+        .collect::<Result<Vec<_>, _>>()?;
+    let default_html = if output_specs.is_empty() {
+        Some(render_html(&report))
     } else {
-        print!("{rendered}");
-        let html_path = PathBuf::from(format!("surface-{}.html", report.scan_id));
-        tokio::fs::write(&html_path, render_html(&report))
-            .await
-            .map_err(|error| {
-                AppError::new(
-                    format!("could not write '{}': {error}", html_path.display()),
-                    EXIT_SCAN_FAILED,
-                )
-            })?;
+        None
+    };
+    let terminal = render_terminal(&report);
+    print!("{terminal}");
+    if let Some(rendered) = default_html {
+        let path = write_default_html_file(
+            &safe_filename_component(&report.target.identity()),
+            rendered,
+        )
+        .await?;
         if !arguments.quiet {
-            eprintln!("HTML report: {}", html_path.display());
+            eprintln!("HTML report: {}", path.display());
+        }
+    } else {
+        for (output, rendered) in output_specs.iter().zip(rendered_outputs) {
+            warn_unrecognized_extension(output);
+            write_output_file(&output.path, rendered).await?;
         }
     }
 
@@ -822,7 +812,7 @@ fn ensure_private_key_permissions(_path: &PathBuf) -> Result<(), AppError> {
     clippy::too_many_lines,
     reason = "one match keeps each history subcommand's linear CLI behavior together"
 )]
-fn run_history_command(command: HistoryCommand) -> Result<(), AppError> {
+async fn run_history_command(command: HistoryCommand) -> Result<(), AppError> {
     match command {
         HistoryCommand::List {
             database,
@@ -873,8 +863,9 @@ fn run_history_command(command: HistoryCommand) -> Result<(), AppError> {
         HistoryCommand::Show {
             scan_id,
             database,
-            format,
+            output,
         } => {
+            let output_specs = build_output_specs(&output, OutputCommand::HistoryShow)?;
             let storage = open_storage(&database)?;
             let report = storage
                 .report(scan_id)
@@ -882,8 +873,25 @@ fn run_history_command(command: HistoryCommand) -> Result<(), AppError> {
                 .ok_or_else(|| {
                     AppError::new(format!("scan {scan_id} was not found"), EXIT_INVALID_INPUT)
                 })?;
-            let rendered = render_report(&report, format)?;
-            print!("{rendered}");
+            let rendered_outputs = output_specs
+                .iter()
+                .map(|output| render_report(&report, output.format))
+                .collect::<Result<Vec<_>, _>>()?;
+            let default_html = if output_specs.is_empty() {
+                Some(render_html(&report))
+            } else {
+                None
+            };
+            let terminal = render_terminal(&report);
+            print!("{terminal}");
+            if let Some(rendered) = default_html {
+                write_default_html_file(&format!("scan-{scan_id}"), rendered).await?;
+            } else {
+                for (output, rendered) in output_specs.iter().zip(rendered_outputs) {
+                    warn_unrecognized_extension(output);
+                    write_output_file(&output.path, rendered).await?;
+                }
+            }
             Ok(())
         }
         HistoryCommand::Delete { scan_id, database } => {
@@ -934,6 +942,7 @@ fn run_history_command(command: HistoryCommand) -> Result<(), AppError> {
 }
 
 async fn run_diff_command(arguments: DiffArgs) -> Result<(), AppError> {
+    let output_specs = build_output_specs(&arguments.output, OutputCommand::Diff)?;
     let (old, new) = if let Some(database) = &arguments.database {
         let old_id = Uuid::parse_str(&arguments.old)
             .map_err(|_| AppError::new("old scan ID is invalid", EXIT_INVALID_INPUT))?;
@@ -961,25 +970,24 @@ async fn run_diff_command(arguments: DiffArgs) -> Result<(), AppError> {
     };
     let diff = diff_reports(&old, &new)
         .map_err(|error| AppError::new(error.to_string(), EXIT_INVALID_INPUT))?;
-    let rendered = match arguments.format {
-        DiffFormat::Terminal => render_diff_terminal(&diff),
-        DiffFormat::Json => render_diff_json(&diff).map_err(|error| {
-            AppError::new(
-                format!("could not serialize diff: {error}"),
-                EXIT_SCAN_FAILED,
-            )
-        })?,
-        DiffFormat::Html => render_diff_html(&diff),
-    };
-    if let Some(path) = arguments.output {
-        tokio::fs::write(&path, rendered).await.map_err(|error| {
-            AppError::new(
-                format!("could not write '{}': {error}", path.display()),
-                EXIT_SCAN_FAILED,
-            )
-        })?;
+    let rendered_outputs = output_specs
+        .iter()
+        .map(|output| render_diff_output(&diff, output.format))
+        .collect::<Result<Vec<_>, _>>()?;
+    let default_html = if output_specs.is_empty() {
+        Some(render_diff_html(&diff))
     } else {
-        print!("{rendered}");
+        None
+    };
+    let terminal = render_diff_terminal(&diff);
+    print!("{terminal}");
+    if let Some(rendered) = default_html {
+        write_default_html_file("diff", rendered).await?;
+    } else {
+        for (output, rendered) in output_specs.iter().zip(rendered_outputs) {
+            warn_unrecognized_extension(output);
+            write_output_file(&output.path, rendered).await?;
+        }
     }
     Ok(())
 }
@@ -1014,7 +1022,6 @@ async fn load_report_file(path: PathBuf) -> Result<ScanReport, AppError> {
 
 fn render_report(report: &ScanReport, format: ReportFormat) -> Result<String, AppError> {
     match format {
-        ReportFormat::Terminal => Ok(render_terminal(report)),
         ReportFormat::Json => render_json(report),
         ReportFormat::Html => Ok(render_html(report)),
         ReportFormat::Sarif => render_sarif(report),
@@ -1026,6 +1033,232 @@ fn render_report(report: &ScanReport, format: ReportFormat) -> Result<String, Ap
             EXIT_SCAN_FAILED,
         )
     })
+}
+
+fn render_diff_output(
+    diff: &surface_report::ScanDiff,
+    format: ReportFormat,
+) -> Result<String, AppError> {
+    match format {
+        ReportFormat::Json => render_diff_json(diff).map_err(|error| {
+            AppError::new(
+                format!("could not serialize diff: {error}"),
+                EXIT_SCAN_FAILED,
+            )
+        }),
+        ReportFormat::Html => Ok(render_diff_html(diff)),
+        ReportFormat::Sarif | ReportFormat::CyclonedxJson => {
+            unreachable!("unsupported diff output was rejected while building output specs")
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OutputSpec {
+    path: PathBuf,
+    format: ReportFormat,
+    warn_unrecognized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputCommand {
+    Scan,
+    Diff,
+    HistoryShow,
+}
+
+fn build_output_specs(
+    paths: &[PathBuf],
+    command: OutputCommand,
+) -> Result<Vec<OutputSpec>, AppError> {
+    let specs = paths
+        .iter()
+        .map(|path| output_spec(path))
+        .collect::<Vec<_>>();
+    if matches!(command, OutputCommand::Diff) {
+        for output in &specs {
+            ensure_diff_output_format(output.format)?;
+        }
+    }
+    Ok(specs)
+}
+
+fn output_spec(path: &Path) -> OutputSpec {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let (format, path, warn_unrecognized) = if file_name.ends_with(".sarif.json") {
+        (ReportFormat::Sarif, path.to_owned(), false)
+    } else if file_name.ends_with(".cdx.json")
+        || file_name.ends_with(".cyclonedx.json")
+        || file_name.ends_with(".cyclonedx")
+    {
+        (ReportFormat::CyclonedxJson, path.to_owned(), false)
+    } else {
+        let extension = path
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+        match extension.as_deref() {
+            Some("html" | "htm") => (ReportFormat::Html, path.to_owned(), false),
+            Some("json") => (ReportFormat::Json, path.to_owned(), false),
+            Some("sarif") => (ReportFormat::Sarif, path.to_owned(), false),
+            None | Some("") => (ReportFormat::Html, path.with_extension("html"), false),
+            Some(_) => (ReportFormat::Html, path.to_owned(), true),
+        }
+    };
+    OutputSpec {
+        path,
+        format,
+        warn_unrecognized,
+    }
+}
+
+fn ensure_diff_output_format(format: ReportFormat) -> Result<(), AppError> {
+    if matches!(format, ReportFormat::Sarif | ReportFormat::CyclonedxJson) {
+        return Err(AppError::new(
+            format!(
+                "diff does not support {} output",
+                output_format_name(format)
+            ),
+            EXIT_INVALID_INPUT,
+        ));
+    }
+    Ok(())
+}
+
+const fn output_format_name(format: ReportFormat) -> &'static str {
+    match format {
+        ReportFormat::Json => "JSON",
+        ReportFormat::Html => "HTML",
+        ReportFormat::Sarif => "SARIF",
+        ReportFormat::CyclonedxJson => "CycloneDX",
+    }
+}
+
+fn warn_unrecognized_extension(output: &OutputSpec) {
+    if let Some(warning) = unrecognized_extension_warning(output) {
+        eprintln!("{warning}");
+    }
+}
+
+fn unrecognized_extension_warning(output: &OutputSpec) -> Option<String> {
+    output.warn_unrecognized.then(|| {
+        format!(
+            "surface: unrecognized output extension for '{}'; writing HTML",
+            output.path.display()
+        )
+    })
+}
+
+async fn write_output_file(path: &Path, rendered: String) -> Result<(), AppError> {
+    tokio::fs::write(path, rendered).await.map_err(|error| {
+        AppError::new(
+            format!("could not write '{}': {error}", path.display()),
+            EXIT_SCAN_FAILED,
+        )
+    })
+}
+
+fn safe_filename_component(value: &str) -> String {
+    let mut safe = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    safe = safe
+        .trim_matches(|character| character == '.' || character == ' ')
+        .to_owned();
+    if safe.is_empty() {
+        safe.push_str("target");
+    }
+    if is_windows_reserved_name(&safe) {
+        safe.push_str("-target");
+    }
+    safe
+}
+
+fn is_windows_reserved_name(value: &str) -> bool {
+    let base = value.split('.').next().unwrap_or_default();
+    let upper = base.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0')
+}
+
+fn local_date_string() -> String {
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    format!(
+        "{:04}-{:02}-{:02}",
+        now.year(),
+        now.month() as u8,
+        now.day()
+    )
+}
+
+fn default_html_path_for_suffix(
+    directory: &Path,
+    stem: &str,
+    date: &str,
+    suffix: usize,
+) -> PathBuf {
+    let suffix = if suffix == 0 {
+        String::new()
+    } else {
+        format!("-{}", suffix + 1)
+    };
+    directory.join(format!("{stem}-{date}{suffix}.html"))
+}
+
+async fn write_default_html_file(stem: &str, rendered: String) -> Result<PathBuf, AppError> {
+    write_default_html_file_at(Path::new("."), stem, &local_date_string(), rendered).await
+}
+
+async fn write_default_html_file_at(
+    directory: &Path,
+    stem: &str,
+    date: &str,
+    rendered: String,
+) -> Result<PathBuf, AppError> {
+    for suffix in 0.. {
+        let path = default_html_path_for_suffix(directory, stem, date, suffix);
+        let mut file = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(AppError::new(
+                    format!("could not create '{}': {error}", path.display()),
+                    EXIT_SCAN_FAILED,
+                ));
+            }
+        };
+        let write_error = match file.write_all(rendered.as_bytes()).await {
+            Ok(()) => file.flush().await.err(),
+            Err(error) => Some(error),
+        };
+        if let Some(error) = write_error {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(AppError::new(
+                format!("could not write '{}': {error}", path.display()),
+                EXIT_SCAN_FAILED,
+            ));
+        }
+        return Ok(path);
+    }
+    unreachable!("suffix range is unbounded")
 }
 
 fn open_storage(path: &PathBuf) -> Result<Storage, AppError> {
@@ -1225,7 +1458,9 @@ fn duration_millis(duration: Duration) -> Result<u64, AppError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::io;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1233,10 +1468,12 @@ mod tests {
     use indicatif::{ProgressDrawTarget, TermLike};
 
     use super::{
-        Cli, Command, EXIT_INVALID_INPUT, EXIT_SCAN_FAILED, ScanPart, mark_intelligence_partial,
-        mark_intelligence_source_error, mark_intelligence_stopped, parse_duration,
+        Cli, Command, EXIT_INVALID_INPUT, EXIT_SCAN_FAILED, HistoryCommand, OutputCommand,
+        OutputSpec, ReportFormat, ScanPart, build_output_specs, mark_intelligence_partial,
+        mark_intelligence_source_error, mark_intelligence_stopped, output_spec, parse_duration,
         parse_retention_duration, progress_bar, progress_visible, refresh_exposure_score,
-        report_exit_error, run,
+        report_exit_error, run, safe_filename_component, unrecognized_extension_warning,
+        write_default_html_file_at, write_output_file,
     };
 
     #[derive(Debug)]
@@ -1315,8 +1552,6 @@ mod tests {
             "example.com",
             "--ports",
             "22,80,443",
-            "--format",
-            "json",
             "--only",
             "dns,http",
         ])
@@ -1329,27 +1564,243 @@ mod tests {
     }
 
     #[test]
-    fn parses_diff_and_integration_formats() {
-        for format in ["sarif", "cyclonedx-json"] {
-            let cli = Cli::try_parse_from(["surface", "scan", "127.0.0.1", "--format", format])
-                .unwrap_or_else(|error| panic!("{error}"));
-            assert!(matches!(cli.command, Command::Scan(_)));
-        }
-        let files = Cli::try_parse_from([
-            "surface", "diff", "old.json", "new.json", "--format", "json",
+    fn parses_repeatable_outputs_and_removes_format_options() {
+        let scan = Cli::try_parse_from([
+            "surface",
+            "scan",
+            "127.0.0.1",
+            "-o",
+            "report.html",
+            "--output",
+            "report.json",
         ])
         .unwrap_or_else(|error| panic!("{error}"));
-        assert!(matches!(files.command, Command::Diff(_)));
-        let database = Cli::try_parse_from([
+        let Command::Scan(arguments) = scan.command else {
+            panic!("expected scan command");
+        };
+        assert_eq!(
+            arguments.output,
+            vec![PathBuf::from("report.html"), PathBuf::from("report.json")]
+        );
+        assert!(Cli::try_parse_from(["surface", "scan", "127.0.0.1", "--format", "json"]).is_err());
+
+        let files = Cli::try_parse_from([
             "surface",
             "diff",
-            "00000000-0000-0000-0000-000000000001",
-            "00000000-0000-0000-0000-000000000002",
-            "--database",
-            "surface.db",
+            "old.json",
+            "new.json",
+            "-o",
+            "diff.html",
+            "-o",
+            "diff.json",
         ])
         .unwrap_or_else(|error| panic!("{error}"));
-        assert!(matches!(database.command, Command::Diff(_)));
+        let Command::Diff(arguments) = files.command else {
+            panic!("expected diff command");
+        };
+        assert_eq!(arguments.output.len(), 2);
+        assert!(
+            Cli::try_parse_from([
+                "surface", "diff", "old.json", "new.json", "--format", "json"
+            ])
+            .is_err()
+        );
+
+        let database = Cli::try_parse_from([
+            "surface",
+            "history",
+            "show",
+            "00000000-0000-0000-0000-000000000001",
+            "--database",
+            "surface.db",
+            "-o",
+            "show.html",
+            "--output",
+            "show.json",
+        ])
+        .unwrap_or_else(|error| panic!("{error}"));
+        let Command::History {
+            command: HistoryCommand::Show { output, .. },
+        } = database.command
+        else {
+            panic!("expected history show command");
+        };
+        assert_eq!(output.len(), 2);
+        assert!(
+            Cli::try_parse_from([
+                "surface",
+                "history",
+                "show",
+                "00000000-0000-0000-0000-000000000001",
+                "--database",
+                "surface.db",
+                "--format",
+                "json",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn infers_all_filename_output_formats_and_fallbacks() {
+        let cases = [
+            ("report.HTML", ReportFormat::Html, "report.HTML", false),
+            ("report.htm", ReportFormat::Html, "report.htm", false),
+            ("report.JSON", ReportFormat::Json, "report.JSON", false),
+            ("report.sarif", ReportFormat::Sarif, "report.sarif", false),
+            (
+                "report.sarif.json",
+                ReportFormat::Sarif,
+                "report.sarif.json",
+                false,
+            ),
+            (
+                "report.cdx.json",
+                ReportFormat::CyclonedxJson,
+                "report.cdx.json",
+                false,
+            ),
+            (
+                "report.cyclonedx.json",
+                ReportFormat::CyclonedxJson,
+                "report.cyclonedx.json",
+                false,
+            ),
+            (
+                "report.cyclonedx",
+                ReportFormat::CyclonedxJson,
+                "report.cyclonedx",
+                false,
+            ),
+            ("report", ReportFormat::Html, "report.html", false),
+            ("report.txt", ReportFormat::Html, "report.txt", true),
+        ];
+        for (path, format, expected_path, warn_unrecognized) in cases {
+            assert_eq!(
+                output_spec(Path::new(path)),
+                OutputSpec {
+                    path: PathBuf::from(expected_path),
+                    format,
+                    warn_unrecognized,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn diff_rejects_projection_output_formats() {
+        let sarif = build_output_specs(&[PathBuf::from("diff.sarif")], OutputCommand::Diff)
+            .expect_err("diff must reject SARIF output");
+        assert!(sarif.message.contains("does not support SARIF"));
+        let cyclonedx = build_output_specs(&[PathBuf::from("diff.cdx.json")], OutputCommand::Diff)
+            .expect_err("diff must reject CycloneDX output");
+        assert!(cyclonedx.message.contains("does not support CycloneDX"));
+    }
+
+    #[test]
+    fn unknown_extension_warning_uses_production_warning_path() {
+        let unknown = output_spec(Path::new("report.txt"));
+        assert_eq!(
+            unrecognized_extension_warning(&unknown).as_deref(),
+            Some("surface: unrecognized output extension for 'report.txt'; writing HTML")
+        );
+        let known = output_spec(Path::new("report.html"));
+        assert!(unrecognized_extension_warning(&known).is_none());
+    }
+
+    #[tokio::test]
+    async fn default_html_names_are_safe_and_collision_resistant() {
+        assert_eq!(safe_filename_component("2001:db8::1"), "2001-db8--1");
+        assert_eq!(safe_filename_component("CON"), "CON-target");
+        let target = surface_core::normalize_target("https://Example.com/path?query=1")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(safe_filename_component(&target.identity()), "example.com");
+
+        let directory = std::env::temp_dir().join(format!("surface-cli-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap_or_else(|error| panic!("{error}"));
+        let first = write_default_html_file_at(
+            &directory,
+            "example.com",
+            "2026-09-07",
+            "existing".to_owned(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        let second = write_default_html_file_at(
+            &directory,
+            "example.com",
+            "2026-09-07",
+            "second".to_owned(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(first, directory.join("example.com-2026-09-07.html"));
+        assert_eq!(second, directory.join("example.com-2026-09-07-2.html"));
+        assert_eq!(std::fs::read_to_string(second).unwrap(), "second");
+        std::fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_default_html_writes_reserve_unique_complete_files() {
+        const WRITER_COUNT: usize = 8;
+
+        let directory = std::env::temp_dir().join(format!("surface-cli-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap_or_else(|error| panic!("{error}"));
+        let mut tasks = Vec::with_capacity(WRITER_COUNT);
+        for index in 0..WRITER_COUNT {
+            let directory = directory.clone();
+            let content = format!("concurrent-content-{index}");
+            tasks.push(tokio::spawn(async move {
+                let path = write_default_html_file_at(
+                    &directory,
+                    "example.com",
+                    "2026-09-07",
+                    content.clone(),
+                )
+                .await?;
+                Ok::<_, super::AppError>((path, content))
+            }));
+        }
+
+        let mut results = Vec::with_capacity(WRITER_COUNT);
+        for task in tasks {
+            results.push(
+                task.await
+                    .unwrap_or_else(|error| panic!("writer task failed: {error}"))
+                    .unwrap_or_else(|error| panic!("default HTML write failed: {error}")),
+            );
+        }
+        let unique_paths = results.iter().map(|(path, _)| path).collect::<HashSet<_>>();
+        assert_eq!(unique_paths.len(), WRITER_COUNT);
+        let expected_paths = std::iter::once(directory.join("example.com-2026-09-07.html"))
+            .chain(
+                (2..=WRITER_COUNT)
+                    .map(|suffix| directory.join(format!("example.com-2026-09-07-{suffix}.html"))),
+            )
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            unique_paths.into_iter().cloned().collect::<HashSet<_>>(),
+            expected_paths
+        );
+        for (path, content) in &results {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), content.as_str());
+        }
+        std::fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[tokio::test]
+    async fn explicit_output_write_preserves_overwrite_behavior() {
+        let directory = std::env::temp_dir().join(format!("surface-cli-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap_or_else(|error| panic!("{error}"));
+        let path = directory.join("report.json");
+        write_output_file(&path, "first".to_owned())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        write_output_file(&path, "second".to_owned())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        std::fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("{error}"));
     }
 
     #[test]
